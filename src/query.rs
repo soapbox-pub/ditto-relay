@@ -9,12 +9,16 @@
 //!
 //! A scan opens a cursor per key, each starting at `until` and walking back
 //! in time, and merges them newest first until `since` or the limit.
+//!
+//! A filter with a NIP-50 search goes to the [search index](crate::search)
+//! instead, unless it lists ids.
 
 use std::collections::{BinaryHeap, HashSet};
 
 use crate::filter::Filter;
 use crate::lmdb::{Cursor, Db, Result, Txn};
 use crate::record::EventView;
+use crate::search::SearchIndex;
 use crate::store::{CREATED, MAX_SEQ, Stamp, Store, stamp, stamp_created_at, stamp_seq};
 
 /// The most author × kind keys a filter may be planned over together.
@@ -37,13 +41,14 @@ pub struct Results {
 }
 
 /// Run a REQ's filters. Each one's limit defaults to `default_limit` and is
-/// capped at `max_limit`.
+/// capped at `max_limit`. Search filters find nothing without `search`.
 pub fn run(
     store: &Store,
+    search: Option<&SearchIndex>,
     filters: &[Filter],
     default_limit: u64,
     max_limit: u64,
-) -> Result<Results> {
+) -> anyhow::Result<Results> {
     let txn = store.read()?;
     let next_seq = store.next_seq(&txn)?;
     let mut seen = HashSet::new();
@@ -53,7 +58,14 @@ pub fn run(
         if filter.never || limit == 0 {
             continue;
         }
-        for (seq, view) in run_filter(store, &txn, filter, limit)? {
+        let found = match (&filter.search, &filter.ids) {
+            (Some(query), None) => match search {
+                Some(search) => search.run(store, &txn, filter, query, limit)?,
+                None => Vec::new(),
+            },
+            _ => run_filter(store, &txn, filter, limit)?,
+        };
+        for (seq, view) in found {
             if seen.insert(seq) {
                 events.push(view.to_json());
             }
@@ -286,7 +298,7 @@ mod tests {
 
     fn ids(store: &Store, filters: &[Value], max_limit: u64) -> Vec<String> {
         let filters: Vec<Filter> = filters.iter().map(|f| Filter::parse(f).unwrap()).collect();
-        let results = run(store, &filters, max_limit, max_limit).unwrap();
+        let results = run(store, None, &filters, max_limit, max_limit).unwrap();
         results
             .events
             .iter()

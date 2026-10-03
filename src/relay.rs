@@ -19,6 +19,7 @@ use crate::event::{Event, KindClass};
 use crate::filter::Filter;
 use crate::query;
 use crate::record::{self, EventView};
+use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
 
 #[derive(Clone)]
@@ -26,6 +27,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<Store>,
     pub writer: Writer,
+    /// For NIP-50 search, if it's on.
+    pub search: Option<Arc<SearchIndex>>,
     /// Every accepted event, for live subscriptions.
     pub live: broadcast::Sender<Arc<LiveEvent>>,
 }
@@ -39,11 +42,18 @@ pub struct LiveEvent {
 }
 
 impl AppState {
-    pub fn new(config: Config, store: Arc<Store>) -> Self {
+    /// With `search`, the index and the channel to its indexer.
+    pub fn new(
+        config: Config,
+        store: Arc<Store>,
+        search: Option<(Arc<SearchIndex>, std::sync::mpsc::Sender<Vec<u64>>)>,
+    ) -> Self {
+        let (search, indexer) = search.unzip();
         Self {
             config: Arc::new(config),
-            writer: Writer::spawn(store.clone()),
+            writer: Writer::spawn(store.clone(), indexer),
             store,
+            search,
             live: broadcast::channel(8192).0,
         }
     }
@@ -86,10 +96,14 @@ async fn root(
 }
 
 fn nip11(config: &Config) -> Value {
+    let mut nips = vec![1, 11];
+    if config.search {
+        nips.push(50);
+    }
     json!({
         "name": config.name,
         "description": config.description,
-        "supported_nips": [1, 11],
+        "supported_nips": nips,
         "software": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
         "limitation": {
@@ -290,7 +304,7 @@ impl Connection {
             return self.closed(sub_id, "invalid: bad subscription id").await;
         }
 
-        let filters = match args[1..]
+        let mut filters = match args[1..]
             .iter()
             .map(Filter::parse)
             .collect::<Result<Vec<_>, _>>()
@@ -301,6 +315,16 @@ impl Connection {
         if filters.len() > config.max_filters {
             return self.closed(sub_id, "invalid: too many filters").await;
         }
+        for filter in filters.iter_mut().filter(|f| f.search.is_some()) {
+            match &self.state.search {
+                Some(search) => search.restrict(filter),
+                None => {
+                    return self
+                        .closed(sub_id, "unsupported: search is not enabled")
+                        .await;
+                }
+            }
+        }
         if !self.subs.contains_key(sub_id) && self.subs.len() >= config.max_subscriptions {
             return self.closed(sub_id, "error: too many subscriptions").await;
         }
@@ -310,10 +334,12 @@ impl Connection {
         // Live events published while this runs wait in the broadcast
         // receiver, and are checked against the subscription after it's added.
         let store = self.state.store.clone();
+        let search = self.state.search.clone();
         let query_filters = filters.clone();
         let result = tokio::task::spawn_blocking(move || {
             query::run(
                 &store,
+                search.as_deref(),
                 &query_filters,
                 config.default_limit,
                 config.max_limit,
@@ -324,7 +350,7 @@ impl Connection {
         let results = match result {
             Ok(Ok(results)) => results,
             Ok(Err(err)) => {
-                tracing::error!("query failed: {err}");
+                tracing::error!("query failed: {err:#}");
                 return self.closed(sub_id, "error: query failed").await;
             }
             Err(err) => {

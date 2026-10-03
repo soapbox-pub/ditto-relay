@@ -83,6 +83,15 @@ pub fn stamp_seq(stamp: &[u8]) -> u64 {
     u64::from_be_bytes(seq)
 }
 
+/// What a write transaction did.
+#[derive(Debug, Default)]
+pub struct Batch {
+    /// What became of each event, in order.
+    pub outcomes: Vec<Outcome>,
+    /// The sequence numbers of events removed to make way for them.
+    pub removed: Vec<u64>,
+}
+
 /// What became of an event offered to the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -196,22 +205,25 @@ impl Store {
     }
 
     /// Store a batch of encoded records in one transaction.
-    pub fn write_batch<'a>(
-        &self,
-        records: impl IntoIterator<Item = &'a [u8]>,
-    ) -> Result<Vec<Outcome>> {
+    pub fn write_batch<'a>(&self, records: impl IntoIterator<Item = &'a [u8]>) -> Result<Batch> {
         let mut txn = self.write()?;
-        let outcomes = records
-            .into_iter()
-            .map(|record| self.insert(&mut txn, record))
-            .collect::<Result<_>>()?;
+        let mut batch = Batch::default();
+        for record in records {
+            let outcome = self.insert(&mut txn, record, &mut batch.removed)?;
+            batch.outcomes.push(outcome);
+        }
         txn.commit()?;
-        Ok(outcomes)
+        Ok(batch)
     }
 
-    /// Offer an encoded event to the store, applying replacement. The caller
-    /// has checked it's valid.
-    pub fn insert(&self, txn: &mut RwTxn, record: &[u8]) -> Result<Outcome> {
+    /// Offer an encoded event to the store, applying replacement, and note
+    /// in `removed` any event it replaces. The caller has checked it's valid.
+    pub fn insert(
+        &self,
+        txn: &mut RwTxn,
+        record: &[u8],
+        removed: &mut Vec<u64>,
+    ) -> Result<Outcome> {
         let view = EventView::new(record).expect("an encoded record");
         let t = self.tables;
         let (id, created_at) = (view.id(), view.created_at());
@@ -249,8 +261,10 @@ impl Store {
         }
         txn.put(t.meta, b"next_seq", &(seq + 1).to_be_bytes())?;
 
-        if let Some(old) = replaces {
-            self.remove(txn, old)?;
+        if let Some(old) = replaces
+            && self.remove(txn, old)?
+        {
+            removed.push(old);
         }
         Ok(Outcome::Stored(seq))
     }
@@ -347,7 +361,9 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub fn spawn(store: Arc<Store>) -> Self {
+    /// Start the writer. With `indexer`, the search indexer is told after
+    /// each write that changed anything, and what it removed.
+    pub fn spawn(store: Arc<Store>, indexer: Option<std::sync::mpsc::Sender<Vec<u64>>>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
 
         std::thread::Builder::new()
@@ -363,7 +379,13 @@ impl Writer {
                     }
 
                     match store.write_batch(batch.iter().map(|(record, _)| record.as_slice())) {
-                        Ok(outcomes) => {
+                        Ok(Batch { outcomes, removed }) => {
+                            if let Some(indexer) = &indexer
+                                && (!removed.is_empty()
+                                    || outcomes.iter().any(|o| matches!(o, Outcome::Stored(_))))
+                            {
+                                let _ = indexer.send(removed);
+                            }
                             for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
                                 let _ = reply.send(Ok(outcome));
                             }
@@ -413,7 +435,8 @@ pub mod tests {
     pub fn put(store: &Store, event: &Event) -> Outcome {
         store
             .write_batch([record::encode(event).as_slice()])
-            .unwrap()[0]
+            .unwrap()
+            .outcomes[0]
     }
 
     fn has(store: &Store, event: &Event) -> bool {

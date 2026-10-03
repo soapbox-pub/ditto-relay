@@ -341,12 +341,16 @@ impl<'t> Cursor<'t> {
         self.op(Some(key), Some(value), ffi::MDB_GET_BOTH_RANGE)
     }
 
+    /// The first entry whose key is at least `key`.
+    pub fn set_range(&mut self, key: &[u8]) -> Result<Option<Entry<'t>>> {
+        self.op(Some(key), None, ffi::MDB_SET_RANGE)
+    }
+
     #[cfg(test)]
     pub fn first(&mut self) -> Result<Option<Entry<'t>>> {
         self.op(None, None, ffi::MDB_FIRST)
     }
 
-    #[cfg(test)]
     pub fn next(&mut self) -> Result<Option<Entry<'t>>> {
         self.op(None, None, ffi::MDB_NEXT)
     }
@@ -472,5 +476,7 @@ mod tests {
         assert_eq!(key(cursor.next().unwrap()), 256);
         assert_eq!(key(cursor.next().unwrap()), 65536);
         assert!(cursor.next().unwrap().is_none());
+        assert_eq!(key(cursor.set_range(&2u64.to_ne_bytes()).unwrap()), 256);
+        assert!(cursor.set_range(&65537u64.to_ne_bytes()).unwrap().is_none());
     }
 }

@@ -197,7 +197,6 @@ impl<'a> EventView<'a> {
         self.expiration
     }
 
-    #[cfg(test)]
     pub fn content(&self) -> Content<'a> {
         self.content
     }

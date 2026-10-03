@@ -7,11 +7,15 @@ use serde_json::Value;
 
 use crate::event::is_hex64;
 use crate::record::{Element, EventView, tag_value};
+use crate::search;
 use crate::store::MAX_INDEXED_TAG;
 
 /// The most values one field of a filter may list. Generous enough for a
 /// big follow list.
 pub const MAX_VALUES: usize = 5000;
+
+/// The most terms a search may have.
+pub const MAX_SEARCH_TERMS: usize = 32;
 
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
@@ -23,14 +27,24 @@ pub struct Filter {
     pub since: u32,
     pub until: u32,
     pub limit: Option<u64>,
+    pub search: Option<Search>,
     /// Some field can match nothing (an empty list, say), so neither can
     /// the filter.
     pub never: bool,
 }
 
+/// A NIP-50 search.
+#[derive(Debug, Clone, Default)]
+pub struct Search {
+    /// What an event must have all of, as [`search::tokens`]. Sorted.
+    pub terms: Vec<String>,
+    /// `sort:new`: the newest matches rather than the most relevant.
+    pub sort_new: bool,
+}
+
 impl Filter {
     /// Parse a filter. Errors are NIP-01 machine-readable messages. Fields
-    /// NIP-01 doesn't define (`search`, say) are ignored.
+    /// neither NIP-01 nor NIP-50 defines are ignored.
     pub fn parse(value: &Value) -> Result<Filter, String> {
         let Value::Object(fields) = value else {
             return Err("invalid: a filter must be an object".into());
@@ -61,6 +75,7 @@ impl Filter {
                 }
                 "since" => filter.since = timestamp(name, value)?,
                 "until" => filter.until = timestamp(name, value)?,
+                "search" => filter.search = parse_search(value)?,
                 "limit" => {
                     filter.limit = Some(
                         value
@@ -104,6 +119,15 @@ impl Filter {
     }
 
     pub fn matches(&self, event: &EventView) -> bool {
+        self.matches_fields(event)
+            && self
+                .search
+                .as_ref()
+                .is_none_or(|search| search::matches(&search.terms, event))
+    }
+
+    /// Whether an event matches, its search aside.
+    pub fn matches_fields(&self, event: &EventView) -> bool {
         if self.never || !self.matches_time(event.created_at()) {
             return false;
         }
@@ -138,6 +162,41 @@ impl Filter {
     pub fn matches_time(&self, created_at: u32) -> bool {
         self.since <= created_at && created_at <= self.until
     }
+}
+
+/// A search's terms and the extensions it understands. Any other `key:value`
+/// is an extension it doesn't, which NIP-50 says to ignore. With no terms
+/// left, it's no search at all.
+fn parse_search(value: &Value) -> Result<Option<Search>, String> {
+    let text = value.as_str().ok_or("invalid: search must be a string")?;
+    let mut sort_new = false;
+    let mut words = Vec::new();
+    for word in text.split_whitespace() {
+        match extension(word) {
+            Some(("sort", "new")) => sort_new = true,
+            Some(_) => {}
+            None => words.push(word),
+        }
+    }
+    let mut terms = search::tokens(&words.join(" "));
+    terms.sort_unstable();
+    terms.dedup();
+    if terms.len() > MAX_SEARCH_TERMS {
+        return Err(format!(
+            "invalid: search has more than {MAX_SEARCH_TERMS} terms"
+        ));
+    }
+    Ok((!terms.is_empty()).then_some(Search { terms, sort_new }))
+}
+
+/// A NIP-50 extension's key and value. Not a URL's scheme and the rest.
+fn extension(word: &str) -> Option<(&str, &str)> {
+    let (key, value) = word.split_once(':')?;
+    let key_ok = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'-');
+    (key_ok && !value.is_empty() && !value.starts_with("//")).then_some((key, value))
 }
 
 /// Compare an encoded tag value with an element, as if it were encoded too.
@@ -237,7 +296,31 @@ mod tests {
         assert!(!matches(json!({"since": 101}), &event));
         assert!(!matches(json!({"until": 99}), &event));
         // Only single-letter tags are filters; anything else is ignored.
-        assert!(matches(json!({"#title": ["y"], "search": "z"}), &event));
+        assert!(matches(json!({"#title": ["y"], "foo": "z"}), &event));
+    }
+
+    #[test]
+    fn matches_every_search_term() {
+        let event = signed(1, 100, 1, vec![vec!["title", "Café"]], "Hello, World");
+        assert!(matches(json!({"search": "world HELLO"}), &event));
+        assert!(matches(json!({"search": "cafe"}), &event));
+        assert!(!matches(json!({"search": "hello there"}), &event));
+        assert!(!matches(json!({"search": "hello", "kinds": [7]}), &event));
+    }
+
+    #[test]
+    fn parses_search_extensions() {
+        let search = |text: &str| Filter::parse(&json!({"search": text})).unwrap().search;
+        let parsed = search("Nostr sort:new include:spam https://x.com nostr").unwrap();
+        assert_eq!(parsed.terms, ["com", "https", "nostr", "x"]);
+        assert!(parsed.sort_new);
+        assert!(!search("rust").unwrap().sort_new);
+        // Only extensions, or only punctuation: no search.
+        assert!(search("sort:new language:en").is_none());
+        assert!(search("  !! ").is_none());
+        assert!(Filter::parse(&json!({"search": 1})).is_err());
+        let many: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
+        assert!(Filter::parse(&json!({"search": many.join(" ")})).is_err());
     }
 
     #[test]

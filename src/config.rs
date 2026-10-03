@@ -20,6 +20,13 @@ pub struct Config {
     pub max_limit: u64,
     /// Reject events with `created_at` further than this many seconds in the future.
     pub max_future_seconds: u64,
+    /// Whether NIP-50 search is on.
+    pub search: bool,
+    pub search_path: PathBuf,
+    /// The kinds searchable.
+    pub search_kinds: Vec<u16>,
+    /// How often, at most, new events become searchable.
+    pub search_commit_ms: u64,
 }
 
 impl Config {
@@ -37,6 +44,10 @@ impl Config {
             default_limit: env("RELAY_DEFAULT_LIMIT", 500)?,
             max_limit: env("RELAY_MAX_LIMIT", 500)?,
             max_future_seconds: env("RELAY_MAX_FUTURE_SECONDS", 900)?,
+            search: env("RELAY_SEARCH", true)?,
+            search_path: env("RELAY_SEARCH_PATH", PathBuf::from("./data/search"))?,
+            search_kinds: kinds("RELAY_SEARCH_KINDS", &[0, 1, 20, 1111, 9802, 30023])?,
+            search_commit_ms: env("RELAY_SEARCH_COMMIT_MS", 1000)?,
         })
     }
 }
@@ -50,5 +61,17 @@ where
             .parse()
             .with_context(|| format!("invalid value for {key}: {v:?}")),
         Err(_) => Ok(default),
+    }
+}
+
+/// A comma-separated list of kinds.
+fn kinds(key: &str, default: &[u16]) -> anyhow::Result<Vec<u16>> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .split(',')
+            .map(|kind| kind.trim().parse())
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("invalid value for {key}: {v:?}")),
+        Err(_) => Ok(default.to_vec()),
     }
 }
