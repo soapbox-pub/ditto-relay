@@ -10,6 +10,8 @@ pub struct Config {
     pub db_path: PathBuf,
     /// LMDB map size in bytes. This is virtual address space, not disk usage.
     pub map_size: usize,
+    /// The relay's own URL, which NIP-62 requests to vanish name it by.
+    pub url: Option<String>,
     pub name: String,
     pub description: String,
     pub max_message_size: usize,
@@ -42,6 +44,9 @@ impl Config {
             bind: env("RELAY_BIND", "127.0.0.1:7777".to_string())?,
             db_path: env("RELAY_DB_PATH", PathBuf::from("./data/db"))?,
             map_size: env("RELAY_MAP_SIZE", 1 << 40)?,
+            url: std::env::var("RELAY_URL")
+                .ok()
+                .filter(|url| !url.is_empty()),
             name: env("RELAY_NAME", "ditto-relay-rs".to_string())?,
             description: env("RELAY_DESCRIPTION", String::new())?,
             max_message_size: env("RELAY_MAX_MESSAGE_SIZE", 128 * 1024)?,

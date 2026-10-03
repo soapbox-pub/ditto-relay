@@ -53,6 +53,11 @@
 //! lookup or two of `tags` under kind 5. Deleting an address's current
 //! version by id makes the newest version left in its history current.
 //!
+//! A NIP-62 request to vanish removes everything its author published up
+//! to it, history and all, and the gift wraps addressed to them; kept, it
+//! refuses those again, by one lookup of `author_kinds` under kind 62. The
+//! relay only stores the requests addressed to it.
+//!
 //! A tag key is name length ‖ name ‖ value length ‖ value ‖ kind, so a tag
 //! is counted per kind — followers, reactions — by LMDB for free, and all
 //! of one value's kinds sit together. Every single-letter tag is indexed,
@@ -247,7 +252,7 @@ pub enum Outcome {
     Replaced,
     /// Its NIP-40 expiration has passed.
     Expired,
-    /// A NIP-09 deletion of it is here.
+    /// A NIP-09 deletion or NIP-62 request to vanish covering it is here.
     Deleted,
 }
 
@@ -458,16 +463,94 @@ impl Store {
                 removed.push(old);
             }
         }
-        if view.kind() == DELETION {
-            self.delete(txn, &view, now, removed)?;
+        match view.kind() {
+            DELETION => self.delete(txn, &view, now, removed)?,
+            VANISH => self.vanish(txn, &view, seq, removed)?,
+            _ => {}
         }
         Ok(Outcome::Stored(seq))
     }
 
+    /// The `created_at` of the newest NIP-62 request to vanish by `pubkey`.
+    fn vanished_at(&self, txn: &Txn, pubkey: &[u8; 32]) -> Result<Option<u32>> {
+        let key = [&pubkey[..], &VANISH.to_be_bytes()].concat();
+        let mut cursor = txn.cursor(self.tables.author_kinds)?;
+        if cursor.set(&key)?.is_none() {
+            return Ok(None);
+        }
+        Ok(cursor.last_dup()?.map(|(_, stamp)| stamp_created_at(stamp)))
+    }
+
+    /// Carry out a NIP-62 request to vanish, stored under `seq`: remove
+    /// every other event by its author up to its `created_at`, history too,
+    /// and the gift wraps addressed to them.
+    fn vanish(
+        &self,
+        txn: &mut RwTxn,
+        request: &EventView,
+        seq: u64,
+        removed: &mut Vec<u64>,
+    ) -> Result<()> {
+        let t = self.tables;
+        let (pubkey, until) = (request.pubkey(), request.created_at());
+        let mut seqs = Vec::new();
+        let mut push = |stamp: &[u8]| {
+            seqs.push(stamp_seq(stamp));
+            true
+        };
+        each_stamp(txn, t.authors, pubkey, 0, until, &mut push)?;
+        let mut recipient = Vec::with_capacity(33);
+        Element::Hex(pubkey).encode(&mut recipient);
+        let wraps = tag_key("p", &recipient, Some(GIFT_WRAP));
+        each_stamp(txn, t.tags, &wraps, 0, until, &mut push)?;
+        // Every address starts with its author.
+        let mut cursor = txn.cursor(t.history)?;
+        let mut entry = cursor.set_range(pubkey)?;
+        while let Some((key, stamp)) = entry
+            && key.starts_with(pubkey)
+        {
+            if stamp_created_at(stamp) <= until {
+                seqs.push(stamp_seq(stamp));
+            }
+            entry = cursor.next()?;
+        }
+        drop(cursor);
+
+        seqs.sort_unstable();
+        seqs.dedup();
+        for old in seqs {
+            if old != seq && self.remove(txn, old)? {
+                removed.push(old);
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a stored NIP-09 deletion covers an event: one that names its
     /// id, by someone who [may delete](may_delete) it, or that names its
-    /// address, by its author, at or after its `created_at`.
+    /// address, by its author, at or after its `created_at`. Or whether a
+    /// NIP-62 request to vanish does: its author's, or for a gift wrap, a
+    /// recipient's, at or after its `created_at`.
     fn is_deleted(&self, txn: &Txn, view: &EventView) -> Result<bool> {
+        let created_at = view.created_at();
+        if self
+            .vanished_at(txn, view.pubkey())?
+            .is_some_and(|at| created_at <= at)
+        {
+            return Ok(true);
+        }
+        if view.kind() == GIFT_WRAP {
+            for (name, value) in view.tag_values() {
+                if let ("p", Element::Hex(recipient)) = (name, value)
+                    && self
+                        .vanished_at(txn, recipient)?
+                        .is_some_and(|at| created_at <= at)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+
         let mut id = Vec::with_capacity(33);
         Element::Hex(view.id()).encode(&mut id);
         let key = tag_key("e", &id, Some(DELETION));
@@ -1441,6 +1524,51 @@ pub mod tests {
         // With nothing left, the address is empty.
         put(&store, &signed(1, 300, 5, vec![vec!["e", &old.id]], ""));
         assert_eq!(current(&store, &old), None);
+    }
+
+    #[test]
+    fn vanishes() {
+        let (_dir, store) = open();
+        let alice = signed(1, 0, 1, vec![], "").pubkey;
+        let note = signed(1, 100, 1, vec![], "note");
+        let old_profile = signed(1, 100, 0, vec![], "old");
+        let profile = signed(1, 150, 0, vec![], "profile");
+        let article = signed(1, 100, 30_023, vec![vec!["d", "x"]], "");
+        let wrap = signed(9, 100, 1059, vec![vec!["p", &alice]], "to alice");
+        let others = signed(2, 100, 1, vec![], "others");
+        let later = signed(1, 300, 1, vec![], "later");
+        let later_wrap = signed(9, 300, 1059, vec![vec!["p", &alice]], "later");
+        let gone = [&note, &old_profile, &profile, &article, &wrap];
+        for event in gone.iter().chain(&[&others, &later, &later_wrap]) {
+            assert!(matches!(put(&store, event), Outcome::Stored(_)));
+        }
+
+        let request = signed(1, 200, 62, vec![vec!["relay", "ALL_RELAYS"]], "");
+        let batch = store
+            .write_batch([record::encode(&request).as_slice()], 0)
+            .unwrap();
+        assert_eq!(batch.removed, [1, 2, 3, 4, 5]);
+        assert!(gone.iter().all(|event| !has(&store, event)));
+        for event in [&others, &later, &later_wrap, &request] {
+            assert!(has(&store, event));
+        }
+        assert_eq!(current(&store, &profile), None);
+
+        // Refused from now on.
+        for event in gone {
+            assert_eq!(put(&store, event), Outcome::Deleted);
+        }
+        let wrap_again = signed(8, 150, 1059, vec![vec!["p", &alice]], "again");
+        assert_eq!(put(&store, &wrap_again), Outcome::Deleted);
+        let older_request = signed(1, 150, 62, vec![vec!["relay", "ALL_RELAYS"]], "");
+        assert_eq!(put(&store, &older_request), Outcome::Deleted);
+        // But not what's newer.
+        let newer = signed(1, 250, 1, vec![], "newer");
+        assert!(matches!(put(&store, &newer), Outcome::Stored(_)));
+
+        // A deletion can't bring it all back.
+        put(&store, &signed(1, 300, 5, vec![vec!["e", &request.id]], ""));
+        assert!(has(&store, &request));
     }
 
     /// How big the database is, compacted, against the events' JSON. Slow,

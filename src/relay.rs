@@ -95,7 +95,7 @@ async fn root(
 }
 
 fn nip11(config: &Config) -> Value {
-    let mut nips = vec![1, 9, 11, 40, 45];
+    let mut nips = vec![1, 9, 11, 40, 45, 62];
     if config.search {
         nips.push(50);
     }
@@ -118,6 +118,22 @@ fn nip11(config: &Config) -> Value {
 }
 
 const EXPIRED: &str = "invalid: event has expired";
+
+/// NIP-62 requests to vanish.
+const VANISH: u16 = 62;
+
+/// Whether a NIP-62 request to vanish is addressed to this relay, which is
+/// at `url` if it knows: to every relay, or to that one.
+fn addressed_to(ev: &Event, url: Option<&str>) -> bool {
+    let normalize = |url: &str| url.trim().trim_end_matches('/').to_ascii_lowercase();
+    let url = url.map(normalize);
+    ev.tags
+        .iter()
+        .filter(|tag| tag.len() >= 2 && tag[0] == "relay")
+        .any(|tag| {
+            tag[1] == "ALL_RELAYS" || url.as_ref().is_some_and(|url| *url == normalize(&tag[1]))
+        })
+}
 
 /// Outgoing queue depth per connection before we apply backpressure.
 const OUTBOX_SIZE: usize = 1024;
@@ -256,6 +272,16 @@ impl Connection {
         if ev.created_at > u64::from(now) + self.state.config.max_future_seconds {
             return self
                 .ok(&id, false, "invalid: created_at is too far in the future")
+                .await;
+        }
+
+        if ev.kind == VANISH && !addressed_to(&ev, self.state.config.url.as_deref()) {
+            return self
+                .ok(
+                    &id,
+                    false,
+                    "invalid: this request to vanish is for other relays",
+                )
                 .await;
         }
 
@@ -438,5 +464,23 @@ impl Connection {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::tests::signed;
+
+    #[test]
+    fn knows_which_vanish_requests_are_its_own() {
+        let to = |relay: &str| signed(1, 100, VANISH, vec![vec!["relay", relay]], "");
+        let url = Some("wss://relay.example.com");
+        assert!(addressed_to(&to("ALL_RELAYS"), None));
+        assert!(addressed_to(&to("wss://relay.example.com"), url));
+        assert!(addressed_to(&to("WSS://Relay.Example.com/"), url));
+        assert!(!addressed_to(&to("wss://other.example.com"), url));
+        assert!(!addressed_to(&to("wss://relay.example.com"), None));
+        assert!(!addressed_to(&signed(1, 100, VANISH, vec![], ""), url));
     }
 }
