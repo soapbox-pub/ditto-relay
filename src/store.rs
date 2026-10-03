@@ -19,6 +19,7 @@
 //! | `author_kinds`  | pubkey ‖ kind                | stamps                 |
 //! | `tags`          | tag key (below)              | stamps                 |
 //! | `hll`           | tag key                      | HLL registers          |
+//! | `facets`        | facet key (see [`facets`])   | stamps                 |
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `history`       | address                      | stamps                 |
 //! | `expiring`      | `EXPIRING`                   | expiry stamps          |
@@ -66,6 +67,9 @@
 //! of one value's kinds sit together. Every single-letter tag is indexed,
 //! and the longer names [`IndexedTags`] lists.
 //!
+//! What NIP-50 search extensions look up — proof of work, media, and the
+//! like — is filed in `facets`, keyed much like tags.
+//!
 //! Each tag key with at least [`HLL_THRESHOLD`] events has a NIP-45
 //! [HyperLogLog](crate::hll) sketch of their authors in `hll`, kept up as
 //! events arrive; smaller ones are sketched when asked. Sketches can't
@@ -82,12 +86,13 @@ use tokio::sync::oneshot;
 
 use crate::event::KindClass;
 use crate::event::decode_hex;
+use crate::facets;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn};
 use crate::record::{Element, EventView, tag_value};
 
 /// Bumped when the layout changes incompatibly.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 pub const STAMP_LEN: usize = 10;
 pub type Stamp = [u8; STAMP_LEN];
@@ -283,6 +288,7 @@ pub struct Tables {
     pub author_kinds: Db,
     pub tags: Db,
     pub hll: Db,
+    pub facets: Db,
     pub replaceable: Db,
     pub history: Db,
     pub expiring: Db,
@@ -317,6 +323,7 @@ impl Store {
             author_kinds: env.create_db("author_kinds", DbFlags::DUP_FIXED)?,
             tags: env.create_db("tags", DbFlags::DUP_FIXED)?,
             hll: env.create_db("hll", DbFlags::PLAIN)?,
+            facets: env.create_db("facets", DbFlags::DUP_FIXED)?,
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
             history: env.create_db("history", DbFlags::DUP_FIXED)?,
             expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,
@@ -857,6 +864,11 @@ impl Store {
                 .into_iter()
                 .map(|(key, _)| (t.tags, key)),
         );
+        keys.extend(
+            facets::keys(view, &self.indexed_tags)
+                .into_iter()
+                .map(|key| (t.facets, key)),
+        );
         keys
     }
 
@@ -1258,6 +1270,7 @@ pub mod tests {
             t.author_kinds,
             t.tags,
             t.hll,
+            t.facets,
             t.replaceable,
             t.history,
             t.expiring,
@@ -1287,8 +1300,9 @@ pub mod tests {
         );
         assert_eq!(put(&store, &event), Outcome::Stored(1));
         assert_eq!(put(&store, &event), Outcome::Duplicate);
-        // events, ids, created, kinds, authors, author_kinds, three tags.
-        assert_eq!(entries(&store), 9);
+        // events, ids, created, kinds, authors, author_kinds, three tags,
+        // and the names of those three as facets.
+        assert_eq!(entries(&store), 12);
 
         let mut txn = store.write().unwrap();
         assert!(store.remove(&mut txn, 1).unwrap());

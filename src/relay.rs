@@ -453,7 +453,12 @@ impl Connection {
         for filter in &mut filters {
             self.state.access.hide(filter, &self.authed);
         }
-        for filter in filters.iter_mut().filter(|f| f.search.is_some()) {
+        // Only text needs the search index: extensions are looked up in
+        // the LMDB.
+        for filter in filters
+            .iter_mut()
+            .filter(|f| f.search.as_ref().is_some_and(|s| s.has_text()))
+        {
             match &self.state.search {
                 Some(search) => search.restrict(filter),
                 None => return Err("unsupported: search is not enabled".into()),

@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use serde_json::Value;
 
 use crate::event::is_hex64;
+use crate::facets::Condition;
 use crate::record::{Element, EventView, tag_value};
 use crate::search;
 use crate::store::{IndexedTags, MAX_INDEXED_TAG};
@@ -49,6 +50,18 @@ pub struct Search {
     pub sort_new: bool,
     /// `autocomplete:true`: the terms are prefixes of names and titles.
     pub autocomplete: bool,
+    /// The other extensions, which an event must meet all of. Sorted.
+    pub conditions: Vec<Condition>,
+    /// `distinct:author`: only the first event found of each author.
+    pub distinct_author: bool,
+}
+
+impl Search {
+    /// Whether the search has text to look up or exclude, rather than
+    /// only extensions.
+    pub fn has_text(&self) -> bool {
+        !self.terms.is_empty() || !self.excluded.is_empty()
+    }
 }
 
 impl Filter {
@@ -149,9 +162,17 @@ impl Filter {
                 })
     }
 
-    /// Whether an event matches, its search aside.
+    /// Whether an event matches, its search's text aside.
     pub fn matches_fields(&self, event: &EventView) -> bool {
         if self.never || !self.matches_time(event.created_at()) {
+            return false;
+        }
+        if self.search.as_ref().is_some_and(|search| {
+            !search
+                .conditions
+                .iter()
+                .all(|condition| condition.matches(event))
+        }) {
             return false;
         }
         if self
@@ -193,19 +214,22 @@ impl Filter {
 
 /// A search's terms, the words it excludes, and the extensions it
 /// understands. Any other `key:value` is an extension it doesn't, which
-/// NIP-50 says to ignore. With no terms or exclusions left, it's no search
-/// at all.
+/// NIP-50 says to ignore. With nothing left to look up or check, it's no
+/// search at all.
 fn parse_search(value: &Value) -> Result<Option<Search>, String> {
     let text = value.as_str().ok_or("invalid: search must be a string")?;
     let mut sort_new = false;
     let mut autocomplete = false;
+    let mut distinct_author = false;
+    let mut conditions = Vec::new();
     let mut words = Vec::new();
     let mut excluded = Vec::new();
     for word in text.split_whitespace() {
         match extension(word) {
             Some(("sort", "new")) => sort_new = true,
             Some(("autocomplete", "true")) => autocomplete = true,
-            Some(_) => {}
+            Some(("distinct", "author")) => distinct_author = true,
+            Some((key, value)) => conditions.extend(Condition::parse(key, value)),
             None => match word.strip_prefix('-') {
                 Some(negated) => {
                     let mut group = search::tokens(negated);
@@ -224,6 +248,8 @@ fn parse_search(value: &Value) -> Result<Option<Search>, String> {
     }
     excluded.sort_unstable();
     excluded.dedup();
+    conditions.sort_unstable();
+    conditions.dedup();
     let mut terms = search::tokens(&words.join(" "));
     terms.sort_unstable();
     terms.dedup();
@@ -232,14 +258,15 @@ fn parse_search(value: &Value) -> Result<Option<Search>, String> {
             "invalid: search has more than {MAX_SEARCH_TERMS} terms"
         ));
     }
-    Ok(
-        (!terms.is_empty() || !excluded.is_empty()).then_some(Search {
-            terms,
-            excluded,
-            sort_new,
-            autocomplete,
-        }),
-    )
+    let search = Search {
+        terms,
+        excluded,
+        sort_new,
+        autocomplete,
+        conditions,
+        distinct_author,
+    };
+    Ok((search.has_text() || !search.conditions.is_empty() || distinct_author).then_some(search))
 }
 
 /// A NIP-50 extension's key and value. Not a URL's scheme and the rest.
@@ -415,12 +442,58 @@ mod tests {
         let parsed = search("jac -dorsey autocomplete:true").unwrap();
         assert!(parsed.excluded.is_empty());
         assert!(search("-dorsey autocomplete:true").is_none());
-        // Only extensions, or only punctuation: no search.
-        assert!(search("sort:new language:en").is_none());
+        // Only extensions that change nothing, or only punctuation: no
+        // search.
+        assert!(search("sort:new include:spam").is_none());
         assert!(search("  !! ").is_none());
         assert!(parse(&json!({"search": 1})).is_err());
         let many: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
         assert!(parse(&json!({"search": many.join(" ")})).is_err());
+    }
+
+    #[test]
+    fn parses_conditions_without_text() {
+        let search = |text: &str| parse(&json!({"search": text})).unwrap().search;
+        let parsed = search("media:true -tag:content-warning pow:8 media:true").unwrap();
+        assert!(!parsed.has_text());
+        assert_eq!(
+            parsed.conditions,
+            [
+                Condition::Pow {
+                    min: 8,
+                    negated: false
+                },
+                Condition::Media(true),
+                Condition::Tag {
+                    name: "content-warning".into(),
+                    negated: true
+                },
+            ]
+        );
+        assert!(search("distinct:author").unwrap().distinct_author);
+        assert!(search("media:maybe").is_none());
+    }
+
+    #[test]
+    fn matches_conditions() {
+        let pic = signed(
+            1,
+            100,
+            1,
+            vec![vec!["content-warning", "spiders"]],
+            "https://x.com/spider.png",
+        );
+        assert!(matches(json!({"search": "media:true"}), &pic));
+        assert!(!matches(json!({"search": "-media:true"}), &pic));
+        assert!(!matches(json!({"search": "video:true"}), &pic));
+        assert!(!matches(json!({"search": "-tag:content-warning"}), &pic));
+        assert!(matches(
+            json!({"search": "spider tag:content-warning"}),
+            &pic
+        ));
+        assert!(!matches(json!({"search": "spider media:false"}), &pic));
+        // Every condition, even on the same key.
+        assert!(!matches(json!({"search": "media:true media:false"}), &pic));
     }
 
     #[test]

@@ -234,6 +234,30 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             disjoint: values.len() == 1,
         });
     }
+    // A search's extensions, those that can be looked up. Each event has
+    // one value of each facet, so one key per kind.
+    for condition in filter.search.iter().flat_map(|s| &s.conditions) {
+        let Some((start, prefix)) = condition.lookup(&store.indexed_tags) else {
+            continue;
+        };
+        let mut keys = Vec::new();
+        let mut cursor = txn.cursor(t.facets)?;
+        let mut entry = cursor.set_range(&start)?;
+        while let Some((key, _)) = entry
+            && key.starts_with(&prefix)
+        {
+            if filter.wants_kind(tag_key_kind(key)) {
+                keys.push(key.to_vec());
+            }
+            entry = cursor.next_nodup()?;
+        }
+        candidates.push(Plan {
+            db: t.facets,
+            keys,
+            exact: false,
+            disjoint: true,
+        });
+    }
     if let Some(kinds) = &filter.kinds {
         let keys = kinds.iter().map(|k| k.to_be_bytes().to_vec()).collect();
         candidates.push(Plan {
@@ -324,6 +348,8 @@ fn scan<'t>(
         }
     }
 
+    let distinct = filter.search.as_ref().is_some_and(|s| s.distinct_author);
+    let mut authors = HashSet::new();
     let mut last = None;
     let mut examined = 0;
     while let Some((stamp, i)) = heap.pop() {
@@ -358,7 +384,7 @@ fn scan<'t>(
         let Some(view) = store.load(txn, seq)? else {
             continue;
         };
-        if plan.exact || filter.matches(&view) {
+        if (plan.exact || filter.matches(&view)) && (!distinct || authors.insert(*view.pubkey())) {
             found.push((seq, view));
         }
     }
@@ -651,6 +677,17 @@ mod tests {
         // A search is checked whatever the index.
         assert!(!plan_for(json!({"kinds": [1], "search": "-x"})).exact);
         assert!(!plan_for(json!({"search": "-x"})).exact);
+        // Its extensions are looked up when that's cheapest.
+        assert_eq!(plan_for(json!({"search": "tag:t"})).db, store.tables.facets);
+        let p = plan_for(json!({"search": "tag:t", "#t": ["common"]}));
+        assert_eq!(p.db, store.tables.tags);
+        let p = plan_for(json!({"search": "media:true", "kinds": [1]}));
+        assert!(p.db == store.tables.facets && p.keys.is_empty());
+        assert!(!p.exact);
+        assert_eq!(
+            plan_for(json!({"search": "-media:true"})).db,
+            store.tables.created
+        );
     }
 
     #[test]
@@ -708,7 +745,33 @@ mod tests {
             if rng.random_bool(0.3) {
                 tags.push(vec!["title", topics[rng.random_range(0..4)]]);
             }
-            let event = signed(seed, rng.random_range(100..160), kind, tags, &i.to_string());
+            // What search extensions look for.
+            if rng.random_bool(0.3) {
+                let m = ["m image/png", "m video/mp4"][rng.random_range(0..2)];
+                tags.push(vec!["imeta", "url https://x.com/a", m]);
+            }
+            if rng.random_bool(0.1) {
+                tags.push(vec!["t", "nsfw"]);
+            }
+            if rng.random_bool(0.2) {
+                tags.push(vec!["content-warning"]);
+            }
+            if rng.random_bool(0.2) {
+                tags.push(vec![
+                    "proxy",
+                    "x",
+                    ["rss", "activitypub"][rng.random_range(0..2)],
+                ]);
+            }
+            // Ids start with as many zeros as they happen to.
+            if rng.random_bool(0.5) {
+                tags.push(vec!["nonce", "1"]);
+            }
+            let content = match rng.random_bool(0.2) {
+                true => format!("{i} https://x.com/{i}.mp4"),
+                false => i.to_string(),
+            };
+            let event = signed(seed, rng.random_range(100..160), kind, tags, &content);
             put(&store, &event);
             all.push(event);
         }
@@ -736,6 +799,29 @@ mod tests {
             }
             if rng.random_bool(0.3) {
                 filter.insert("until".into(), json!(rng.random_range(100..160)));
+            }
+            if rng.random_bool(0.5) {
+                let extensions = [
+                    "media:true",
+                    "-media:true",
+                    "video:true",
+                    "-video:true",
+                    "pow:1",
+                    "pow:2",
+                    "-pow:1",
+                    "tag:title",
+                    "-tag:t",
+                    "tag:content-warning",
+                    "protocol:nostr",
+                    "protocol:rss",
+                    "-protocol:nostr",
+                    "nsfw:false",
+                    "-mp4",
+                ];
+                let search: Vec<&str> = (0..rng.random_range(1..3))
+                    .map(|_| extensions[rng.random_range(0..extensions.len())])
+                    .collect();
+                filter.insert("search".into(), json!(search.join(" ")));
             }
             let limit = rng.random_range(1..40);
             filter.insert("limit".into(), json!(limit));

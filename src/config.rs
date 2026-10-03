@@ -4,6 +4,7 @@ use std::str::FromStr;
 use anyhow::Context;
 
 use crate::event::decode_hex;
+use crate::facets;
 
 /// Relay configuration, read from `RELAY_*` environment variables.
 #[derive(Debug, Clone)]
@@ -54,6 +55,8 @@ pub struct Config {
     pub search_kinds: Vec<u16>,
     /// How often, at most, new events become searchable.
     pub search_commit_ms: u64,
+    /// Hashtags that mark media as adult, for the `nsfw:` search extension.
+    pub nsfw_hashtags: Vec<String>,
 }
 
 impl Config {
@@ -76,10 +79,13 @@ impl Config {
             // Generous enough for a big follow list.
             max_filter_values: env("RELAY_MAX_FILTER_VALUES", 20_000)?,
             max_future_seconds: env("RELAY_MAX_FUTURE_SECONDS", 900)?,
-            // NIP-48 proxies and NIP-89 clients.
-            indexed_tags: items(&env("RELAY_INDEXED_TAGS", "proxy,client".to_string())?)
-                .map(String::from)
-                .collect(),
+            // NIP-48 proxies, NIP-89 clients, and NIP-36 content warnings.
+            indexed_tags: items(&env(
+                "RELAY_INDEXED_TAGS",
+                "proxy,client,content-warning".to_string(),
+            )?)
+            .map(String::from)
+            .collect(),
             history: env("RELAY_HISTORY", true)?,
             // NIP-85 assertions, which change constantly.
             history_excluded_kinds: kinds(
@@ -97,6 +103,13 @@ impl Config {
             search_path: env("RELAY_SEARCH_PATH", PathBuf::from("./data/search"))?,
             search_kinds: kinds("RELAY_SEARCH_KINDS", &[0, 1, 20, 1111, 9802, 30023])?,
             search_commit_ms: env("RELAY_SEARCH_COMMIT_MS", 1000)?,
+            nsfw_hashtags: match std::env::var("RELAY_NSFW_HASHTAGS") {
+                Ok(v) => items(&v).map(String::from).collect(),
+                Err(_) => facets::DEFAULT_NSFW_HASHTAGS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            },
         })
     }
 }

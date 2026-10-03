@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod event;
+mod facets;
 mod filter;
 mod hll;
 mod lmdb;
@@ -30,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    facets::set_nsfw_hashtags(config.nsfw_hashtags.clone());
     let indexed_tags = IndexedTags::new(config.indexed_tags.clone())?;
     let history = History::new(
         config.history,

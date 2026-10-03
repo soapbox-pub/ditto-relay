@@ -25,6 +25,13 @@
 //! look up, so it's no use here: it's answered like any other filter, from
 //! the LMDB's indexes newest first, with the exclusions checked by hand.
 //!
+//! The other extensions, like `pow:` and `media:`, are [conditions] on the
+//! event rather than its text, which the index doesn't hold: hits are
+//! checked against them. A search with only those, too, is answered from
+//! the LMDB, which indexes them for every kind.
+//!
+//! [conditions]: crate::facets
+//!
 //! With `autocomplete:true`, a search looks instead at the names people
 //! look things up by — a profile's name, display name, and NIP-05, and any
 //! event's title — and its terms are prefixes. Those are indexed in a field
@@ -362,12 +369,13 @@ impl SearchIndex {
     }
 
     /// Limit a search filter to the kinds indexed, so it matches the same
-    /// events live as it finds stored. Autocomplete has every kind.
+    /// events live as it finds stored. Autocomplete has every kind, and so
+    /// does a search with only extensions, which the LMDB answers.
     pub fn restrict(&self, filter: &mut Filter) {
         if filter
             .search
             .as_ref()
-            .is_none_or(|search| search.autocomplete)
+            .is_none_or(|search| search.autocomplete || !search.has_text())
         {
             return;
         }
@@ -483,6 +491,12 @@ impl SearchIndex {
         // The searcher may have some of those too.
         let mut seen: HashSet<u64> = unindexed.iter().map(|(seq, _)| *seq).collect();
         unindexed.sort_unstable_by(|(_, a), (_, b)| newest_first(a, b));
+        // With `distinct:author`, how many authors have been found, which
+        // is how many events there are to return.
+        let mut authors: HashSet<[u8; 32]> = HashSet::new();
+        if search.distinct_author {
+            authors.extend(unindexed.iter().map(|(_, view)| *view.pubkey()));
+        }
 
         let query = self.query(filter, search);
         let mut columns: HashMap<u32, Column<u64>> = HashMap::new();
@@ -515,11 +529,18 @@ impl SearchIndex {
                 };
                 // Replaced since, and the index not told yet.
                 if hit_matches(filter, search, &view) && store.is_current(txn, seq, &view)? {
+                    if search.distinct_author {
+                        authors.insert(*view.pubkey());
+                    }
                     hits.push((score, seq, view));
                 }
             }
             offset += count;
-            if hits.len() + unindexed.len() >= limit || count < page || offset >= MAX_HITS {
+            let enough = match search.distinct_author {
+                true => authors.len() >= limit,
+                false => hits.len() + unindexed.len() >= limit,
+            };
+            if enough || count < page || offset >= MAX_HITS {
                 break;
             }
             page = (page * 2).min(MAX_HITS - offset);
@@ -533,6 +554,10 @@ impl SearchIndex {
             // Not yet indexed means new, and they have every term: first.
             hits.sort_by(|(x, _, a), (y, _, b)| y.total_cmp(x).then_with(|| newest_first(a, b)));
             found.extend(hits.into_iter().map(|(_, seq, view)| (seq, view)));
+        }
+        if search.distinct_author {
+            let mut authors = HashSet::new();
+            found.retain(|(_, view)| authors.insert(*view.pubkey()));
         }
         found.truncate(limit);
         Ok(found)
@@ -888,6 +913,55 @@ mod tests {
         assert_eq!(
             f.search(json!({"search": "nostr -bitcoin -e-cash"})),
             ids(&[&late, &plain])
+        );
+    }
+
+    #[test]
+    fn checks_extensions() {
+        let mut f = fixture();
+        let pic = |seed, at, kind, content| {
+            let tags = vec![vec!["imeta", "url https://x.com/a.png", "m image/png"]];
+            signed(seed, at, kind, tags, content)
+        };
+        let cat = pic(1, 100, 1, "my cat");
+        let words = signed(2, 200, 1, vec![], "my cat in words");
+        let dog = pic(2, 300, 1, "my dog");
+        let reaction = pic(3, 400, 7, "+");
+        let newer_cat = pic(1, 500, 1, "cat again");
+        for event in [&cat, &words, &dog, &reaction] {
+            put(&f.store, event);
+        }
+        f.index_all();
+        // Not yet indexed.
+        put(&f.store, &newer_cat);
+        let ids =
+            |events: &[&Event]| -> Vec<String> { events.iter().map(|e| e.id.clone()).collect() };
+
+        assert_eq!(
+            f.search(json!({"search": "cat media:true sort:new"})),
+            ids(&[&newer_cat, &cat])
+        );
+        assert_eq!(
+            f.search(json!({"search": "cat -media:true"})),
+            ids(&[&words])
+        );
+        // Without text: from the LMDB, newest first, of any kind.
+        assert_eq!(
+            f.search(json!({"search": "media:true"})),
+            ids(&[&newer_cat, &reaction, &dog, &cat])
+        );
+        assert_eq!(
+            f.search(json!({"search": "media:true", "kinds": [1], "limit": 2})),
+            ids(&[&newer_cat, &dog])
+        );
+        // The newest of each author.
+        assert_eq!(
+            f.search(json!({"search": "media:true distinct:author", "kinds": [1]})),
+            ids(&[&newer_cat, &dog])
+        );
+        assert_eq!(
+            f.search(json!({"search": "my distinct:author sort:new"})),
+            ids(&[&dog, &cat])
         );
     }
 
