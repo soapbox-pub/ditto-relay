@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::State;
@@ -15,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::config::Config;
-use crate::event::{Event, KindClass};
+use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
 use crate::query::{self, TooExpensive};
 use crate::record::{self, EventView};
@@ -96,7 +95,7 @@ async fn root(
 }
 
 fn nip11(config: &Config) -> Value {
-    let mut nips = vec![1, 11, 45];
+    let mut nips = vec![1, 11, 40, 45];
     if config.search {
         nips.push(50);
     }
@@ -117,6 +116,8 @@ fn nip11(config: &Config) -> Value {
         },
     })
 }
+
+const EXPIRED: &str = "invalid: event has expired";
 
 /// Outgoing queue depth per connection before we apply backpressure.
 const OUTBOX_SIZE: usize = 1024;
@@ -251,16 +252,19 @@ impl Connection {
         if let Err(msg) = ev.verify() {
             return self.ok(&id, false, &msg).await;
         }
-        if ev.created_at > now() + self.state.config.max_future_seconds {
+        let now = event::now();
+        if ev.created_at > u64::from(now) + self.state.config.max_future_seconds {
             return self
                 .ok(&id, false, "invalid: created_at is too far in the future")
                 .await;
         }
 
         let record = Arc::new(record::encode(&ev));
-        let json = EventView::new(&record)
-            .expect("an encoded record")
-            .to_json();
+        let view = EventView::new(&record).expect("an encoded record");
+        if view.is_expired(now) {
+            return self.ok(&id, false, EXPIRED).await;
+        }
+        let json = view.to_json();
         if ev.kind_class() == KindClass::Ephemeral {
             let _ = self.state.live.send(Arc::new(LiveEvent {
                 seq: None,
@@ -286,6 +290,7 @@ impl Connection {
                 self.ok(&id, true, "duplicate: already have this event")
                     .await
             }
+            Ok(Outcome::Expired) => self.ok(&id, false, EXPIRED).await,
             Ok(Outcome::Replaced) => {
                 self.ok(&id, false, "duplicate: have a newer version of this event")
                     .await
@@ -430,11 +435,4 @@ impl Connection {
         }
         Ok(())
     }
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

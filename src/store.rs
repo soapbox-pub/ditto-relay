@@ -21,6 +21,7 @@
 //! | `hll`           | tag key                      | HLL registers          |
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `history`       | address                      | stamps                 |
+//! | `expiring`      | `EXPIRING`                   | expiry stamps          |
 //! | `meta`          | name                         | value                  |
 //!
 //! `ids` is keyed by a prefix of the id, a quarter its size; the record has
@@ -39,6 +40,13 @@
 //! so that queries, counts, and search see only the current one. A version
 //! older than the current one when it arrives goes straight to history.
 //!
+//! An event with a NIP-40 expiration is refused once it has expired, and
+//! [`Store::load`] treats a stored one as gone from then on, so no query
+//! returns it. `expiring` files each such event under one key by a stamp
+//! of its expiration rather than its `created_at`, so the [`Writer`] can
+//! sweep away those that have expired, oldest first. Until it does, counts
+//! that need no events loaded still include them.
+//!
 //! A tag key is name length ‖ name ‖ value length ‖ value ‖ kind, so a tag
 //! is counted per kind — followers, reactions — by LMDB for free, and all
 //! of one value's kinds sit together. Every single-letter tag is indexed,
@@ -51,6 +59,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use sha2::{Digest, Sha256};
@@ -62,7 +72,7 @@ use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn};
 use crate::record::{Element, EventView};
 
 /// Bumped when the layout changes incompatibly.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 pub const STAMP_LEN: usize = 10;
 pub type Stamp = [u8; STAMP_LEN];
@@ -85,6 +95,12 @@ const MAX_ADDRESS_D: usize = 256;
 
 /// The one key of the `created` table.
 pub const CREATED: &[u8] = &[0];
+
+/// The one key of the `expiring` table.
+const EXPIRING: &[u8] = &[0];
+
+/// How often the writer sweeps away expired events.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The bytes of an id the `ids` table is keyed by.
 const ID_PREFIX: usize = 8;
@@ -213,6 +229,8 @@ pub enum Outcome {
     Duplicate,
     /// A newer version of it is already here, and history isn't kept.
     Replaced,
+    /// Its NIP-40 expiration has passed.
+    Expired,
 }
 
 #[derive(Clone, Copy)]
@@ -227,6 +245,7 @@ pub struct Tables {
     pub hll: Db,
     pub replaceable: Db,
     pub history: Db,
+    pub expiring: Db,
     pub meta: Db,
 }
 
@@ -260,6 +279,7 @@ impl Store {
             hll: env.create_db("hll", DbFlags::PLAIN)?,
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
             history: env.create_db("history", DbFlags::DUP_FIXED)?,
+            expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         };
 
@@ -320,10 +340,13 @@ impl Store {
         Ok(None)
     }
 
+    /// A stored event, unless it has expired.
     pub fn load<'t>(&self, txn: &'t Txn, seq: u64) -> Result<Option<EventView<'t>>> {
+        let now = crate::event::now();
         Ok(txn
             .get(self.tables.events, &seq.to_ne_bytes())?
-            .and_then(EventView::new))
+            .and_then(EventView::new)
+            .filter(|view| !view.is_expired(now)))
     }
 
     /// How many events are stored.
@@ -332,29 +355,39 @@ impl Store {
         txn.len(self.tables.events)
     }
 
-    /// Store a batch of encoded records in one transaction.
-    pub fn write_batch<'a>(&self, records: impl IntoIterator<Item = &'a [u8]>) -> Result<Batch> {
+    /// Store a batch of encoded records in one transaction, as of `now`.
+    pub fn write_batch<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a [u8]>,
+        now: u32,
+    ) -> Result<Batch> {
         let mut txn = self.write()?;
         let mut batch = Batch::default();
         for record in records {
-            let outcome = self.insert(&mut txn, record, &mut batch.removed)?;
+            let outcome = self.insert(&mut txn, record, now, &mut batch.removed)?;
             batch.outcomes.push(outcome);
         }
         txn.commit()?;
         Ok(batch)
     }
 
-    /// Offer an encoded event to the store, applying replacement, and note
-    /// in `removed` any event it replaces. The caller has checked it's valid.
+    /// Offer an encoded event to the store at `now`, applying replacement,
+    /// and note in `removed` any event it replaces. The caller has checked
+    /// it's valid.
     pub fn insert(
         &self,
         txn: &mut RwTxn,
         record: &[u8],
+        now: u32,
         removed: &mut Vec<u64>,
     ) -> Result<Outcome> {
         let view = EventView::new(record).expect("an encoded record");
         let t = self.tables;
         let (id, created_at) = (view.id(), view.created_at());
+
+        if view.is_expired(now) {
+            return Ok(Outcome::Expired);
+        }
 
         if self.contains(txn, id)? {
             return Ok(Outcome::Duplicate);
@@ -414,8 +447,25 @@ impl Store {
         assert!(seq <= MAX_SEQ, "the relay has run out of sequence numbers");
         txn.put(t.events, &seq.to_ne_bytes(), record)?;
         txn.put_dup(t.ids, &view.id()[..ID_PREFIX], &seq.to_be_bytes())?;
+        if let Some(expiration) = view.expiration() {
+            txn.put_dup(t.expiring, EXPIRING, &stamp(expiration, seq))?;
+        }
         txn.put(t.meta, b"next_seq", &(seq + 1).to_be_bytes())?;
         Ok(seq)
+    }
+
+    /// Remove up to `max` events that have expired by `now`, the earliest
+    /// to expire first, returning their sequence numbers.
+    pub fn expire(&self, txn: &mut RwTxn, now: u32, max: usize) -> Result<Vec<u64>> {
+        let mut seqs = Vec::new();
+        each_stamp(txn, self.tables.expiring, EXPIRING, 0, now, |stamp| {
+            seqs.push(stamp_seq(stamp));
+            seqs.len() < max
+        })?;
+        for &seq in &seqs {
+            self.remove(txn, seq)?;
+        }
+        Ok(seqs)
     }
 
     fn replaceable_seq(&self, txn: &Txn, address: &[u8]) -> Result<Option<u64>> {
@@ -533,6 +583,9 @@ impl Store {
         if let Some(address) = address_of(&view) {
             txn.del(t.history, &address, Some(&stamp(view.created_at(), seq)))?;
         }
+        if let Some(expiration) = view.expiration() {
+            txn.del(t.expiring, EXPIRING, Some(&stamp(expiration, seq)))?;
+        }
         txn.del(t.ids, &view.id()[..ID_PREFIX], Some(&seq.to_be_bytes()))?;
         txn.del(t.events, &seq.to_ne_bytes(), None)?;
         Ok(true)
@@ -642,8 +695,28 @@ pub fn address(pubkey: &[u8; 32], kind: u16, d: &[u8]) -> Vec<u8> {
 
 type WriteJob = (Arc<Vec<u8>>, oneshot::Sender<anyhow::Result<Outcome>>);
 
+/// Remove every event that has expired, a transaction at a time, returning
+/// their sequence numbers.
+fn sweep(store: &Store) -> Result<Vec<u64>> {
+    let mut removed = Vec::new();
+    loop {
+        let mut txn = store.write()?;
+        let seqs = store.expire(&mut txn, crate::event::now(), MAX_SWEEP)?;
+        txn.commit()?;
+        let done = seqs.len() < MAX_SWEEP;
+        removed.extend(seqs);
+        if done {
+            return Ok(removed);
+        }
+    }
+}
+
+/// The most expired events removed in one write transaction.
+const MAX_SWEEP: usize = 10_000;
+
 /// LMDB allows one writer at a time, so all writes go through a dedicated
-/// thread that batches whatever is queued into a single transaction.
+/// thread that batches whatever is queued into a single transaction. Every
+/// [`SWEEP_INTERVAL`] it also removes the events that have expired.
 #[derive(Clone)]
 pub struct Writer {
     tx: std::sync::mpsc::Sender<WriteJob>,
@@ -654,11 +727,33 @@ impl Writer {
     /// each write that changed anything, and what it removed.
     pub fn spawn(store: Arc<Store>, indexer: Option<std::sync::mpsc::Sender<Vec<u64>>>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
+        let tell = move |removed: Vec<u64>, stored: bool| {
+            if let Some(indexer) = &indexer
+                && (stored || !removed.is_empty())
+            {
+                let _ = indexer.send(removed);
+            }
+        };
 
         std::thread::Builder::new()
             .name("lmdb-writer".into())
             .spawn(move || {
-                while let Ok(first) = rx.recv() {
+                let mut next_sweep = Instant::now();
+                loop {
+                    if Instant::now() >= next_sweep {
+                        match sweep(&store) {
+                            Ok(removed) => tell(removed, false),
+                            Err(err) => tracing::error!("sweeping expired events failed: {err}"),
+                        }
+                        next_sweep = Instant::now() + SWEEP_INTERVAL;
+                    }
+                    let first = match rx
+                        .recv_timeout(next_sweep.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(job) => job,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
                     let mut batch = vec![first];
                     while batch.len() < MAX_WRITE_BATCH {
                         match rx.try_recv() {
@@ -667,14 +762,11 @@ impl Writer {
                         }
                     }
 
-                    match store.write_batch(batch.iter().map(|(record, _)| record.as_slice())) {
+                    let records = batch.iter().map(|(record, _)| record.as_slice());
+                    match store.write_batch(records, crate::event::now()) {
                         Ok(Batch { outcomes, removed }) => {
-                            if let Some(indexer) = &indexer
-                                && (!removed.is_empty()
-                                    || outcomes.iter().any(|o| matches!(o, Outcome::Stored(_))))
-                            {
-                                let _ = indexer.send(removed);
-                            }
+                            let stored = outcomes.iter().any(|o| matches!(o, Outcome::Stored(_)));
+                            tell(removed, stored);
                             for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
                                 let _ = reply.send(Ok(outcome));
                             }
@@ -728,8 +820,13 @@ pub mod tests {
     }
 
     pub fn put(store: &Store, event: &Event) -> Outcome {
+        put_at(store, event, crate::event::now())
+    }
+
+    /// Offer an event as if it were `now`.
+    pub fn put_at(store: &Store, event: &Event, now: u32) -> Outcome {
         store
-            .write_batch([record::encode(event).as_slice()])
+            .write_batch([record::encode(event).as_slice()], now)
             .unwrap()
             .outcomes[0]
     }
@@ -755,6 +852,7 @@ pub mod tests {
             t.hll,
             t.replaceable,
             t.history,
+            t.expiring,
         ]
         .iter()
         .map(|&db| txn.len(db).unwrap())
@@ -970,6 +1068,53 @@ pub mod tests {
         assert_eq!(store.len(&store.read().unwrap()).unwrap(), 3);
     }
 
+    #[test]
+    fn expires_events() {
+        let (_dir, store) = open();
+        let now = crate::event::now();
+        let expiring = |at: u32, content: &str| {
+            signed(
+                1,
+                100,
+                1,
+                vec![vec!["expiration", &at.to_string()]],
+                content,
+            )
+        };
+        assert_eq!(put(&store, &expiring(now - 10, "late")), Outcome::Expired);
+        assert_eq!(put(&store, &expiring(now, "now")), Outcome::Expired);
+
+        // Stored before they expired, they're gone once they have.
+        let stale: Vec<Event> = (0..3)
+            .map(|i| expiring(now - 10 + i, &i.to_string()))
+            .collect();
+        for event in &stale {
+            assert!(matches!(
+                put_at(&store, event, now - 20),
+                Outcome::Stored(_)
+            ));
+        }
+        let fresh = signed(
+            1,
+            100,
+            0,
+            vec![vec!["expiration", &(now + 1000).to_string()]],
+            "",
+        );
+        assert_eq!(put(&store, &fresh), Outcome::Stored(4));
+        assert!(stale.iter().all(|event| !has(&store, event)));
+        assert!(has(&store, &fresh));
+
+        // Swept away, the earliest to expire first.
+        let mut txn = store.write().unwrap();
+        assert_eq!(store.expire(&mut txn, now, 2).unwrap(), [1, 2]);
+        assert_eq!(store.expire(&mut txn, now, 100).unwrap(), [3]);
+        assert!(store.expire(&mut txn, now, 100).unwrap().is_empty());
+        assert_eq!(store.expire(&mut txn, now + 1000, 100).unwrap(), [4]);
+        txn.commit().unwrap();
+        assert_eq!(entries(&store), 0);
+    }
+
     /// How big the database is, compacted, against the events' JSON. Slow,
     /// so run by hand: `cargo test --release disk_usage -- --ignored --nocapture`.
     #[test]
@@ -984,7 +1129,7 @@ pub mod tests {
         for chunk in events.chunks(10_000) {
             let records: Vec<_> = chunk.iter().map(record::encode).collect();
             store
-                .write_batch(records.iter().map(Vec::as_slice))
+                .write_batch(records.iter().map(Vec::as_slice), 0)
                 .unwrap();
         }
         let compact = tempfile::tempdir().unwrap();

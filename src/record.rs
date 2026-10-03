@@ -23,7 +23,8 @@
 //! only applies when the text written back is exactly what was signed.
 //! Nothing is kept twice: the JSON is written from the record when it's sent.
 //!
-//! The NIP-40 expiration is recorded but not yet acted on.
+//! The NIP-40 expiration is in the header so that checking it, which every
+//! read does, needn't walk the tags.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -130,7 +131,6 @@ fn get_varint(buf: &mut &[u8]) -> Option<u64> {
 #[derive(Clone, Copy, Debug)]
 pub struct EventView<'a> {
     fixed: &'a [u8; FIXED],
-    #[cfg_attr(not(test), expect(dead_code, reason = "read once NIP-40 is enforced"))]
     expiration: Option<u32>,
     tags: &'a [u8],
     content: Content<'a>,
@@ -192,9 +192,14 @@ impl<'a> EventView<'a> {
         u16::from_le_bytes(self.fixed[133..135].try_into().unwrap())
     }
 
-    #[cfg(test)]
+    /// The NIP-40 expiration.
     pub fn expiration(&self) -> Option<u32> {
         self.expiration
+    }
+
+    /// Whether the event has expired by `now`.
+    pub fn is_expired(&self, now: u32) -> bool {
+        self.expiration.is_some_and(|at| at <= now)
     }
 
     pub fn content(&self) -> Content<'a> {

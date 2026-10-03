@@ -565,7 +565,7 @@ mod tests {
     use super::*;
     use crate::event::Event;
     use crate::event::tests::signed;
-    use crate::store::tests::{open, put, test_tags};
+    use crate::store::tests::{open, put, put_at, test_tags};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
     use serde_json::{Value, json};
@@ -871,7 +871,10 @@ mod tests {
 
         // Every version of the address, newest first.
         let address = json!({"kinds": [0], "authors": [alice]});
-        assert_eq!(ids(&store, std::slice::from_ref(&address), 100), [p300, p200, p100]);
+        assert_eq!(
+            ids(&store, std::slice::from_ref(&address), 100),
+            [p300, p200, p100]
+        );
         assert_eq!(count_of(&store, address).count, 3);
         let limited = json!({"kinds": [0], "authors": [alice], "limit": 1});
         assert_eq!(ids(&store, &[limited], 100), [p300]);
@@ -899,6 +902,29 @@ mod tests {
         let by_id = json!({"ids": [p100]});
         assert_eq!(ids(&store, std::slice::from_ref(&by_id), 100), [p100]);
         assert_eq!(count_of(&store, by_id).count, 1);
+    }
+
+    #[test]
+    fn hides_expired_events() {
+        let (_dir, store) = open();
+        let now = crate::event::now();
+        let past = (now - 10).to_string();
+        let expired = signed(1, 100, 1, vec![vec!["expiration", &past]], "");
+        let kept = signed(1, 200, 1, vec![], "");
+        put_at(&store, &expired, now - 20);
+        put(&store, &kept);
+        assert_eq!(
+            ids(&store, &[json!({"kinds": [1]})], 100),
+            [kept.id.as_str()]
+        );
+        assert!(ids(&store, &[json!({"ids": [expired.id]})], 100).is_empty());
+
+        // A count from the index alone includes it until it's swept.
+        assert_eq!(count_of(&store, json!({"kinds": [1]})).count, 2);
+        let mut txn = store.write().unwrap();
+        store.expire(&mut txn, now, 100).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(count_of(&store, json!({"kinds": [1]})).count, 1);
     }
 
     #[test]

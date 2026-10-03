@@ -568,8 +568,8 @@ impl SearchIndex {
     }
 }
 
-/// The current events stored since the index was last committed that a
-/// filter matches, checked by hand. Only the newest [`MAX_UNINDEXED`].
+/// The current, unexpired events stored since the index was last committed
+/// that a filter matches, checked by hand. Only the newest [`MAX_UNINDEXED`].
 fn unindexed<'t>(
     store: &Store,
     txn: &'t Txn,
@@ -580,10 +580,12 @@ fn unindexed<'t>(
     let mut found = Vec::new();
     let mut cursor = txn.cursor(store.tables.events)?;
     let start = indexed.max(next_seq.saturating_sub(MAX_UNINDEXED));
+    let now = crate::event::now();
     let mut entry = cursor.set_range(&start.to_ne_bytes())?;
     while let Some((key, record)) = entry {
         let seq = u64::from_ne_bytes(key.try_into()?);
-        if let Some(view) = EventView::new(record).filter(|view| filter.matches(view))
+        if let Some(view) =
+            EventView::new(record).filter(|view| !view.is_expired(now) && filter.matches(view))
             && store.is_current(txn, seq, &view)?
         {
             found.push((seq, view));
@@ -970,7 +972,7 @@ mod tests {
         let new = signed(1, 200, 0, vec![], &json!({"name": "new"}).to_string());
         let batch = f
             .store
-            .write_batch([record::encode(&new).as_slice()])
+            .write_batch([record::encode(&new).as_slice()], 0)
             .unwrap();
         // History now, so gone from results before the index hears of it.
         assert!(f.search(json!({"search": "old"})).is_empty());

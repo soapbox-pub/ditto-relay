@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use secp256k1::XOnlyPublicKey;
 use secp256k1::schnorr::Signature;
 use serde::{Deserialize, Serialize};
@@ -84,6 +86,14 @@ impl Event {
             .verify(&id, &pubkey)
             .map_err(|_| "invalid: bad signature".to_string())
     }
+}
+
+/// The current Unix time, as event timestamps are stored.
+pub fn now() -> u32 {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    u32::try_from(secs).unwrap_or(u32::MAX)
 }
 
 /// Decode a lowercase hex string of exactly `N` bytes.
