@@ -4,12 +4,15 @@
 //! ```text
 //! flags      u8         bit 0: an expiration follows the fixed header
 //!                       bit 1: the content is base64, kept as its bytes
+//!                       bit 2: an analysis follows the fixed header
 //! id         [u8; 32]
 //! pubkey     [u8; 32]
 //! sig        [u8; 64]
 //! created_at u32 LE
 //! kind       u16 LE
 //! expiration u32 LE     if flagged
+//! analysis   [u8; 3]    if flagged: language (ISO 639-1, or zeros), then
+//!                       sentiment (see `Sentiment::to_byte`, or 0)
 //! tags_len   varint     bytes of tags that follow
 //! tags       varint count, then per tag: varint count, then per element
 //!            varint (len << 1 | hex), then the bytes
@@ -24,30 +27,46 @@
 //! Nothing is kept twice: the JSON is written from the record when it's sent.
 //!
 //! The NIP-40 expiration is in the header so that checking it, which every
-//! read does, needn't walk the tags.
+//! read does, needn't walk the tags. So is the event's [analysis], guessed
+//! once when it's encoded, so it's the same guess every time it's read.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
+use crate::analysis::{self, Analysis, Sentiment};
 use crate::event::{Event, is_hex64};
 
 const FLAG_EXPIRATION: u8 = 1;
 const FLAG_BASE64: u8 = 2;
+const FLAG_ANALYSIS: u8 = 4;
 const FIXED: usize = 1 + 32 + 32 + 64 + 4 + 2;
 
-/// Encode an event. It must already be valid: ids and keys hex, numbers in
-/// range (see [`Event::verify`]).
+/// Encode an event, with its [analysis]. It must already be valid: ids and
+/// keys hex, numbers in range (see [`Event::verify`]).
 pub fn encode(event: &Event) -> Vec<u8> {
+    let plain = encode_with(event, Analysis::default());
+    let analysis = analysis::analyze(&EventView::new(&plain).expect("an encoded record"));
+    match analysis.is_empty() {
+        true => plain,
+        false => encode_with(event, analysis),
+    }
+}
+
+fn encode_with(event: &Event, analysis: Analysis) -> Vec<u8> {
     let expiration = expiration(event);
     let mut out = Vec::with_capacity(FIXED + 8 + event.content.len() + event.tags.len() * 40);
     let base64 = decode_base64(&event.content);
-    out.push(
-        if expiration.is_some() {
-            FLAG_EXPIRATION
-        } else {
-            0
-        } | if base64.is_some() { FLAG_BASE64 } else { 0 },
-    );
+    let mut flags = 0;
+    if expiration.is_some() {
+        flags |= FLAG_EXPIRATION;
+    }
+    if base64.is_some() {
+        flags |= FLAG_BASE64;
+    }
+    if !analysis.is_empty() {
+        flags |= FLAG_ANALYSIS;
+    }
+    out.push(flags);
     push_hex(&mut out, &event.id);
     push_hex(&mut out, &event.pubkey);
     push_hex(&mut out, &event.sig);
@@ -55,6 +74,10 @@ pub fn encode(event: &Event) -> Vec<u8> {
     out.extend_from_slice(&event.kind.to_le_bytes());
     if let Some(expiration) = expiration {
         out.extend_from_slice(&expiration.to_le_bytes());
+    }
+    if !analysis.is_empty() {
+        out.extend_from_slice(&analysis.language.unwrap_or_default());
+        out.push(analysis.sentiment.map_or(0, Sentiment::to_byte));
     }
 
     let mut tags = Vec::new();
@@ -132,6 +155,7 @@ fn get_varint(buf: &mut &[u8]) -> Option<u64> {
 pub struct EventView<'a> {
     fixed: &'a [u8; FIXED],
     expiration: Option<u32>,
+    analysis: Analysis,
     tags: &'a [u8],
     content: Content<'a>,
 }
@@ -156,6 +180,16 @@ impl<'a> EventView<'a> {
         } else {
             None
         };
+        let analysis = if fixed[0] & FLAG_ANALYSIS != 0 {
+            let (&[a, b, sentiment], tail) = rest.split_first_chunk::<3>()?;
+            rest = tail;
+            Analysis {
+                language: (a != 0).then_some([a, b]),
+                sentiment: Sentiment::from_byte(sentiment),
+            }
+        } else {
+            Analysis::default()
+        };
         let tags_len = usize::try_from(get_varint(&mut rest)?).ok()?;
         let tags = rest.get(..tags_len)?;
         let content = &rest[tags_len..];
@@ -167,6 +201,7 @@ impl<'a> EventView<'a> {
         Some(EventView {
             fixed,
             expiration,
+            analysis,
             tags,
             content,
         })
@@ -195,6 +230,11 @@ impl<'a> EventView<'a> {
     /// The NIP-40 expiration.
     pub fn expiration(&self) -> Option<u32> {
         self.expiration
+    }
+
+    /// Its language and sentiment, as guessed when it was encoded.
+    pub fn analysis(&self) -> Analysis {
+        self.analysis
     }
 
     /// Whether the event has expired by `now`.

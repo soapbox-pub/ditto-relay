@@ -323,13 +323,22 @@ impl Connection {
                 .await;
         }
 
-        let record = Arc::new(record::encode(&ev));
+        let ephemeral = ev.kind_class() == KindClass::Ephemeral;
+        // Encoding guesses the event's language and sentiment, which takes
+        // a while for long text.
+        let record = match tokio::task::spawn_blocking(move || record::encode(&ev)).await {
+            Ok(record) => Arc::new(record),
+            Err(err) => {
+                tracing::error!("encoding event {id} panicked: {err}");
+                return self.ok(&id, false, "error: failed to store event").await;
+            }
+        };
         let view = EventView::new(&record).expect("an encoded record");
         if view.is_expired(now) {
             return self.ok(&id, false, EXPIRED).await;
         }
         let json = view.to_json();
-        if ev.kind_class() == KindClass::Ephemeral {
+        if ephemeral {
             let _ = self.state.live.send(Arc::new(LiveEvent {
                 seq: None,
                 record,

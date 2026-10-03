@@ -1293,7 +1293,7 @@ pub mod tests {
                 vec!["t", "x"],
                 vec!["p", &hex],
                 vec!["title", "T"],
-                vec!["alt", "not indexed"],
+                vec!["alt", "no"],
                 vec!["7", "nor this"],
             ],
             "hi",

@@ -1280,6 +1280,7 @@ mod tests {
         let pubkeys: Vec<String> = (1..4)
             .map(|seed| signed(seed, 0, 1, vec![], "").pubkey)
             .collect();
+        let records: Vec<Vec<u8>> = all.iter().map(record::encode).collect();
 
         for _ in 0..200 {
             let autocomplete = rng.random_bool(0.5);
@@ -1301,10 +1302,22 @@ mod tests {
                     terms.push(format!("-{}", words[rng.random_range(0..words.len())]));
                 }
             }
-            let extensions = match autocomplete {
-                true => "sort:new autocomplete:true",
-                false => "sort:new",
+            let mut extensions = match autocomplete {
+                true => "sort:new autocomplete:true".to_string(),
+                false => "sort:new".to_string(),
             };
+            if rng.random_bool(0.3) {
+                let conditions = [
+                    "tag:t",
+                    "-tag:title",
+                    "sentiment:neutral",
+                    "-sentiment:neutral",
+                    "language:en",
+                    "distinct:author",
+                ];
+                extensions.push(' ');
+                extensions.push_str(conditions[rng.random_range(0..conditions.len())]);
+            }
             let mut filter = serde_json::Map::new();
             filter.insert(
                 "search".into(),
@@ -1330,16 +1343,19 @@ mod tests {
             f.index.restrict(&mut parsed);
             let mut expected: Vec<&Event> = all
                 .iter()
-                .filter(|e| {
-                    let record = record::encode(e);
-                    parsed.matches(&EventView::new(&record).unwrap())
-                })
+                .zip(&records)
+                .filter(|(_, record)| parsed.matches(&EventView::new(record).unwrap()))
+                .map(|(e, _)| e)
                 .collect();
             expected.sort_by(|a, b| {
                 b.created_at
                     .cmp(&a.created_at)
                     .then_with(|| a.id.cmp(&b.id))
             });
+            if parsed.search.as_ref().unwrap().distinct_author {
+                let mut authors = HashSet::new();
+                expected.retain(|e| authors.insert(e.pubkey.clone()));
+            }
             let expected: Vec<&str> = expected.iter().take(limit).map(|e| e.id.as_str()).collect();
             assert_eq!(f.search(filter.clone()), expected, "{filter}");
         }

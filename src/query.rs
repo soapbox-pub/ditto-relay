@@ -834,13 +834,13 @@ mod tests {
             }
             parsed
         };
+        let records: Vec<Vec<u8>> = all.iter().map(crate::record::encode).collect();
         let matching = |filter: &Value, hide: bool| -> Vec<&Event> {
             let parsed = parse(filter, hide);
             all.iter()
-                .filter(|e| {
-                    let record = crate::record::encode(e);
-                    parsed.matches(&EventView::new(&record).unwrap())
-                })
+                .zip(&records)
+                .filter(|(_, record)| parsed.matches(&EventView::new(record).unwrap()))
+                .map(|(e, _)| e)
                 .collect()
         };
 
@@ -1072,6 +1072,43 @@ mod tests {
             1
         );
         assert_eq!(count(&store, None, &filters, visible).unwrap().count, 1);
+    }
+
+    #[test]
+    fn finds_by_language_and_sentiment() {
+        let (_dir, store) = open();
+        let happy = signed(
+            1,
+            100,
+            1,
+            vec![],
+            "I love this, what a wonderful and happy day!",
+        );
+        let sad = signed(
+            2,
+            200,
+            1,
+            vec![],
+            "This is terrible, I hate it and feel awful.",
+        );
+        let spanish = signed(1, 300, 1, vec![], "Buenos días, ¿cómo están todos?");
+        let like = signed(3, 400, 7, vec![], "🤙");
+        for event in [&happy, &sad, &spanish, &like] {
+            put(&store, event);
+        }
+        let search = |text: &str| ids(&store, &[json!({"search": text})], 100);
+        assert_eq!(search("language:es"), [spanish.id.as_str()]);
+        assert_eq!(search("language:EN"), [sad.id.as_str(), &happy.id]);
+        assert_eq!(search("sentiment:positive"), [like.id.as_str(), &happy.id]);
+        assert_eq!(
+            search("sentiment:positive language:en"),
+            [happy.id.as_str()]
+        );
+        assert_eq!(
+            search("-sentiment:positive"),
+            [spanish.id.as_str(), &sad.id]
+        );
+        assert_eq!(count_of(&store, json!({"search": "-language:en"})).count, 2);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! NIP-50 search extensions: `key:value` conditions on what an event is
 //! rather than on its text, like `pow:20` or `media:true`.
 //!
-//! Each is derived from the event alone, the same way when it's stored as
-//! when a live event or a search hit is checked, so the two never disagree.
+//! Each is derived from the event alone — `language:` and `sentiment:`
+//! from a [guess](crate::analysis) kept with it — the same way when it's
+//! stored as when a live event or a search hit is checked, so the two
+//! never disagree.
 //! Those selective enough to look up are indexed in the `facets` table,
 //! keyed like tags: facet ‖ value length ‖ value ‖ kind. Only what narrows
 //! a search down is filed there — a proof of work, media, a protocol — and
@@ -14,6 +16,7 @@
 
 use std::sync::OnceLock;
 
+use crate::analysis::Sentiment;
 use crate::record::{Content, Element, EventView};
 use crate::store::{IndexedTags, MAX_INDEXED_TAG};
 
@@ -29,6 +32,10 @@ pub const PROTOCOL: u8 = 3;
 pub const CLIENT: u8 = 4;
 /// The name of an indexed tag an event has.
 pub const TAG: u8 = 5;
+/// The ISO 639-1 code of the language an event is in.
+pub const LANGUAGE: u8 = 6;
+/// What an event's sentiment is: see [`Sentiment::as_str`].
+pub const SENTIMENT: u8 = 7;
 
 /// The most bytes of a note's content scanned for media links.
 const MAX_CONTENT_SCAN: usize = 32 * 1024;
@@ -127,6 +134,13 @@ pub fn keys(view: &EventView, indexed: &IndexedTags) -> Vec<Vec<u8>> {
         {
             keys.push(key(TAG, name.as_bytes(), kind));
         }
+    }
+    let analysis = view.analysis();
+    if let Some(language) = analysis.language {
+        keys.push(key(LANGUAGE, &language, kind));
+    }
+    if let Some(sentiment) = analysis.sentiment {
+        keys.push(key(SENTIMENT, sentiment.as_str().as_bytes(), kind));
     }
     keys.sort_unstable();
     keys.dedup();
@@ -292,6 +306,11 @@ pub enum Condition {
     Client { address: String, negated: bool },
     /// Has a tag with this name, or not.
     Tag { name: String, negated: bool },
+    /// In this language (ISO 639-1), or not. An event whose language
+    /// can't be told is in none.
+    Language { code: String, negated: bool },
+    /// Of this sentiment, or not. Likewise.
+    Sentiment { sentiment: Sentiment, negated: bool },
 }
 
 /// A `bool` extension's value.
@@ -334,6 +353,14 @@ impl Condition {
                 name: value.to_string(),
                 negated,
             },
+            "language" => Condition::Language {
+                code: value.to_ascii_lowercase(),
+                negated,
+            },
+            "sentiment" => Condition::Sentiment {
+                sentiment: Sentiment::parse(value)?,
+                negated,
+            },
             _ => return None,
         };
         Some(condition)
@@ -360,6 +387,13 @@ impl Condition {
                 (client(view) == Some(address.as_str())) != *negated
             }
             Condition::Tag { name, negated } => has_tag(view, name) != *negated,
+            Condition::Language { code, negated } => {
+                let language = view.analysis().language;
+                (language.is_some_and(|l| l == code.as_bytes())) != *negated
+            }
+            Condition::Sentiment { sentiment, negated } => {
+                (view.analysis().sentiment == Some(*sentiment)) != *negated
+            }
         }
     }
 
@@ -397,6 +431,14 @@ impl Condition {
                 name,
                 negated: false,
             } if indexed.contains(name) => exact(TAG, name.as_bytes()),
+            Condition::Language {
+                code,
+                negated: false,
+            } if code.len() <= MAX_INDEXED_TAG => exact(LANGUAGE, code.as_bytes()),
+            Condition::Sentiment {
+                sentiment,
+                negated: false,
+            } => exact(SENTIMENT, sentiment.as_str().as_bytes()),
             _ => None,
         }
     }
