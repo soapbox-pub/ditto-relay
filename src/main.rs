@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::Config;
 use crate::relay::AppState;
 use crate::search::SearchIndex;
-use crate::store::{IndexedTags, Store};
+use crate::store::{History, IndexedTags, Store};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,7 +30,13 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let indexed_tags = IndexedTags::new(config.indexed_tags.clone())?;
-    let store = Arc::new(Store::open(&config.db_path, config.map_size, indexed_tags)?);
+    let history = History::new(config.history, config.history_excluded_kinds.clone());
+    let store = Arc::new(Store::open(
+        &config.db_path,
+        config.map_size,
+        indexed_tags,
+        history,
+    )?);
     tracing::info!("opened LMDB at {}", config.db_path.display());
 
     let search = if config.search {

@@ -22,6 +22,11 @@ pub struct Config {
     pub max_future_seconds: u64,
     /// Tags with longer names than a letter to index, so filter by.
     pub indexed_tags: Vec<String>,
+    /// Whether replaceable and addressable events keep the versions they
+    /// replace, fetchable by id or by address.
+    pub history: bool,
+    /// Kinds whose old versions aren't kept.
+    pub history_excluded_kinds: Vec<u16>,
     /// Whether NIP-50 search is on.
     pub search: bool,
     pub search_path: PathBuf,
@@ -52,6 +57,12 @@ impl Config {
                 .filter(|name| !name.is_empty())
                 .map(String::from)
                 .collect(),
+            history: env("RELAY_HISTORY", true)?,
+            // NIP-85 assertions, which change constantly.
+            history_excluded_kinds: kinds(
+                "RELAY_HISTORY_EXCLUDED_KINDS",
+                &[30382, 30383, 30384, 30385],
+            )?,
             search: env("RELAY_SEARCH", true)?,
             search_path: env("RELAY_SEARCH_PATH", PathBuf::from("./data/search"))?,
             search_kinds: kinds("RELAY_SEARCH_KINDS", &[0, 1, 20, 1111, 9802, 30023])?,

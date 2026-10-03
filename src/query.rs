@@ -10,6 +10,11 @@
 //! A scan opens a cursor per key, each starting at `until` and walking back
 //! in time, and merges them newest first until `since` or the limit.
 //!
+//! The indexes hold only the current version of a replaceable event, but a
+//! filter shaped like an address — one kind, one author, and one `d` tag if
+//! the kind is addressable — scans that address's history instead, and so
+//! finds every version kept. So do `ids`, which look events up directly.
+//!
 //! A filter with a NIP-50 search goes to the [search index](crate::search)
 //! instead, unless it lists ids or its search only excludes words. Those
 //! are planned like any other, and checked by hand.
@@ -22,14 +27,15 @@
 
 use std::collections::{BinaryHeap, HashSet};
 
+use crate::event::KindClass;
 use crate::filter::Filter;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Cursor, Db, Result, Txn};
 use crate::record::EventView;
 use crate::search::SearchIndex;
 use crate::store::{
-    CREATED, MAX_SEQ, Stamp, Store, each_stamp, stamp, stamp_created_at, stamp_seq, tag_key,
-    tag_key_kind,
+    CREATED, MAX_SEQ, Stamp, Store, address, each_stamp, stamp, stamp_created_at, stamp_seq,
+    tag_key, tag_key_kind,
 };
 
 /// The most author × kind keys a filter may be planned over together.
@@ -131,8 +137,41 @@ struct Plan {
     disjoint: bool,
 }
 
+/// The address an address-shaped filter asks for every version of: one
+/// replaceable or addressable kind, one author, and for an addressable
+/// kind, one `d` tag and no other. With it, whether every version there
+/// matches: one with no `d` tag is at the address of an empty one, but
+/// doesn't match `#d: [""]`.
+fn history_address(filter: &Filter) -> Option<(Vec<u8>, bool)> {
+    if filter.ids.is_some() || filter.search.is_some() {
+        return None;
+    }
+    let ([author], [kind]) = (filter.authors.as_deref()?, filter.kinds.as_deref()?) else {
+        return None;
+    };
+    // The empty `d` tag, in tag value form.
+    const EMPTY: &[u8] = &[0];
+    let (d, exact) = match (KindClass::of(*kind), filter.tags.as_slice()) {
+        (KindClass::Replaceable, []) => (EMPTY, true),
+        (KindClass::Addressable, [(name, values)]) if name == "d" => match values.as_slice() {
+            [d] => (d.as_slice(), d != EMPTY),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((address(author, *kind, d), exact))
+}
+
 fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
     let t = store.tables;
+    if let Some((address, exact)) = history_address(filter) {
+        return Ok(Plan {
+            db: t.history,
+            keys: vec![address],
+            exact,
+            disjoint: true,
+        });
+    }
     let mut candidates = Vec::new();
     // A search is never pinned down by an index.
     let no_tags = filter.tags.is_empty() && filter.search.is_none();
@@ -810,6 +849,56 @@ mod tests {
             100,
         );
         assert_eq!(found, vec![note.id.clone()]);
+    }
+
+    #[test]
+    fn finds_history_by_address_or_id() {
+        let (_dir, store) = open();
+        let profiles: Vec<Event> = [100, 300, 200]
+            .iter()
+            .map(|&at| signed(1, at, 0, vec![vec!["t", "x"]], &at.to_string()))
+            .collect();
+        let articles: Vec<Event> = [100, 200]
+            .iter()
+            .map(|&at| signed(1, at, 30_023, vec![vec!["d", "a"]], &at.to_string()))
+            .collect();
+        let other = signed(1, 150, 30_023, vec![vec!["d", "b"]], "");
+        for event in profiles.iter().chain(&articles).chain([&other]) {
+            put(&store, event);
+        }
+        let alice = &profiles[0].pubkey;
+        let [p100, p300, p200] = [0, 1, 2].map(|i| profiles[i].id.as_str());
+
+        // Every version of the address, newest first.
+        let address = json!({"kinds": [0], "authors": [alice]});
+        assert_eq!(ids(&store, std::slice::from_ref(&address), 100), [p300, p200, p100]);
+        assert_eq!(count_of(&store, address).count, 3);
+        let limited = json!({"kinds": [0], "authors": [alice], "limit": 1});
+        assert_eq!(ids(&store, &[limited], 100), [p300]);
+        let since = json!({"kinds": [0], "authors": [alice], "since": 200});
+        assert_eq!(ids(&store, &[since], 100), [p300, p200]);
+        let article = json!({"kinds": [30_023], "authors": [alice], "#d": ["a"]});
+        assert_eq!(
+            ids(&store, &[article], 100),
+            [articles[1].id.as_str(), &articles[0].id]
+        );
+
+        // Anything else sees the current versions only.
+        assert_eq!(ids(&store, &[json!({"kinds": [0]})], 100), [p300]);
+        assert_eq!(ids(&store, &[json!({"#t": ["x"]})], 100), [p300]);
+        assert_eq!(count_of(&store, json!({"#t": ["x"]})).count, 1);
+        let both = json!({"kinds": [30_023], "authors": [alice], "#d": ["a", "b"]});
+        assert_eq!(
+            ids(&store, &[both], 100),
+            [articles[1].id.as_str(), &other.id]
+        );
+        let kinds = json!({"kinds": [0, 30_023], "authors": [alice]});
+        assert_eq!(ids(&store, &[kinds], 100).len(), 3);
+
+        // An old version by id.
+        let by_id = json!({"ids": [p100]});
+        assert_eq!(ids(&store, std::slice::from_ref(&by_id), 100), [p100]);
+        assert_eq!(count_of(&store, by_id).count, 1);
     }
 
     #[test]

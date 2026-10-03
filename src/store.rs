@@ -20,6 +20,7 @@
 //! | `tags`          | tag key (below)              | stamps                 |
 //! | `hll`           | tag key                      | HLL registers          |
 //! | `replaceable`   | address                      | seq (u64 BE)           |
+//! | `history`       | address                      | stamps                 |
 //! | `meta`          | name                         | value                  |
 //!
 //! `ids` is keyed by a prefix of the id, a quarter its size; the record has
@@ -30,6 +31,13 @@
 //! Tag values are indexed in [`record::tag_value`] form; an *address* is
 //! pubkey ‖ kind ‖ the `d` tag in that form (always empty for replaceable
 //! kinds).
+//!
+//! An address's current version is in `replaceable`. The versions it
+//! replaced are kept as *history*, for the kinds [`History`] keeps: in
+//! `events` and `ids`, so they can be fetched by id, and with every version
+//! of the address, current too, in `history`, but out of every other index,
+//! so that queries, counts, and search see only the current one. A version
+//! older than the current one when it arrives goes straight to history.
 //!
 //! A tag key is name length ‖ name ‖ value length ‖ value ‖ kind, so a tag
 //! is counted per kind — followers, reactions — by LMDB for free, and all
@@ -54,7 +62,7 @@ use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn};
 use crate::record::{Element, EventView};
 
 /// Bumped when the layout changes incompatibly.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 pub const STAMP_LEN: usize = 10;
 pub type Stamp = [u8; STAMP_LEN];
@@ -164,12 +172,33 @@ impl IndexedTags {
     }
 }
 
+/// Which replaceable and addressable kinds keep the versions they replace.
+#[derive(Debug, Clone, Default)]
+pub struct History {
+    enabled: bool,
+    /// Sorted.
+    excluded: Vec<u16>,
+}
+
+impl History {
+    pub fn new(enabled: bool, mut excluded: Vec<u16>) -> History {
+        excluded.sort_unstable();
+        excluded.dedup();
+        History { enabled, excluded }
+    }
+
+    pub fn keeps(&self, kind: u16) -> bool {
+        self.enabled && self.excluded.binary_search(&kind).is_err()
+    }
+}
+
 /// What a write transaction did.
 #[derive(Debug, Default)]
 pub struct Batch {
     /// What became of each event, in order.
     pub outcomes: Vec<Outcome>,
-    /// The sequence numbers of events removed to make way for them.
+    /// The sequence numbers of events no longer searchable: removed, or
+    /// replaced and kept as history.
     pub removed: Vec<u64>,
 }
 
@@ -178,9 +207,11 @@ pub struct Batch {
 pub enum Outcome {
     /// Stored, under this sequence number.
     Stored(u64),
+    /// Older than the version already here, so kept as history only.
+    Archived(u64),
     /// Already here.
     Duplicate,
-    /// A newer version of it is already here.
+    /// A newer version of it is already here, and history isn't kept.
     Replaced,
 }
 
@@ -195,6 +226,7 @@ pub struct Tables {
     pub tags: Db,
     pub hll: Db,
     pub replaceable: Db,
+    pub history: Db,
     pub meta: Db,
 }
 
@@ -202,10 +234,16 @@ pub struct Store {
     env: Env,
     pub tables: Tables,
     pub indexed_tags: IndexedTags,
+    history: History,
 }
 
 impl Store {
-    pub fn open(dir: &Path, map_size: usize, indexed_tags: IndexedTags) -> anyhow::Result<Store> {
+    pub fn open(
+        dir: &Path,
+        map_size: usize,
+        indexed_tags: IndexedTags,
+        history: History,
+    ) -> anyhow::Result<Store> {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("Could not create the database directory {}", dir.display())
         })?;
@@ -221,6 +259,7 @@ impl Store {
             tags: env.create_db("tags", DbFlags::DUP_FIXED)?,
             hll: env.create_db("hll", DbFlags::PLAIN)?,
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
+            history: env.create_db("history", DbFlags::DUP_FIXED)?,
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         };
 
@@ -240,6 +279,7 @@ impl Store {
             env,
             tables,
             indexed_tags,
+            history,
         })
     }
 
@@ -321,6 +361,7 @@ impl Store {
         }
 
         let address = address_of(&view);
+        let keeps = self.history.keeps(view.kind());
         let mut replaces = None;
         if let Some(address) = &address
             && let Some(seq) = self.replaceable_seq(txn, address)?
@@ -330,16 +371,18 @@ impl Store {
                 && (old.created_at(), std::cmp::Reverse(old.id()))
                     >= (created_at, std::cmp::Reverse(id))
             {
-                return Ok(Outcome::Replaced);
+                if !keeps {
+                    return Ok(Outcome::Replaced);
+                }
+                let seq = self.put_record(txn, &view, record)?;
+                txn.put_dup(t.history, address, &stamp(created_at, seq))?;
+                return Ok(Outcome::Archived(seq));
             }
             replaces = Some(seq);
         }
 
-        let seq = self.next_seq(txn)?;
-        assert!(seq <= MAX_SEQ, "the relay has run out of sequence numbers");
+        let seq = self.put_record(txn, &view, record)?;
         let stamp = stamp(created_at, seq);
-        txn.put(t.events, &seq.to_ne_bytes(), record)?;
-        txn.put_dup(t.ids, &id[..ID_PREFIX], &seq.to_be_bytes())?;
         txn.put_dup(t.created, CREATED, &stamp)?;
         for (db, key) in self.index_keys(&view) {
             txn.put_dup(db, &key, &stamp)?;
@@ -349,21 +392,45 @@ impl Store {
         }
         if let Some(address) = &address {
             txn.put(t.replaceable, address, &seq.to_be_bytes())?;
+            txn.put_dup(t.history, address, &stamp)?;
         }
-        txn.put(t.meta, b"next_seq", &(seq + 1).to_be_bytes())?;
 
-        if let Some(old) = replaces
-            && self.remove(txn, old)?
-        {
-            removed.push(old);
+        if let Some(old) = replaces {
+            let gone = match keeps {
+                true => self.unindex(txn, old)?,
+                false => self.remove(txn, old)?,
+            };
+            if gone {
+                removed.push(old);
+            }
         }
         Ok(Outcome::Stored(seq))
+    }
+
+    /// Keep a record under the next sequence number, findable by id.
+    fn put_record(&self, txn: &mut RwTxn, view: &EventView, record: &[u8]) -> Result<u64> {
+        let t = self.tables;
+        let seq = self.next_seq(txn)?;
+        assert!(seq <= MAX_SEQ, "the relay has run out of sequence numbers");
+        txn.put(t.events, &seq.to_ne_bytes(), record)?;
+        txn.put_dup(t.ids, &view.id()[..ID_PREFIX], &seq.to_be_bytes())?;
+        txn.put(t.meta, b"next_seq", &(seq + 1).to_be_bytes())?;
+        Ok(seq)
     }
 
     fn replaceable_seq(&self, txn: &Txn, address: &[u8]) -> Result<Option<u64>> {
         Ok(txn
             .get(self.tables.replaceable, address)?
             .map(|v| u64::from_be_bytes(v.try_into().unwrap_or_default())))
+    }
+
+    /// Whether a stored event is its address's current version, or has no
+    /// address: not an old version kept as history.
+    pub fn is_current(&self, txn: &Txn, seq: u64, view: &EventView) -> Result<bool> {
+        match address_of(view) {
+            None => Ok(true),
+            Some(address) => Ok(self.replaceable_seq(txn, &address)? == Some(seq)),
+        }
     }
 
     /// Every (index, key) an event's stamp is filed under, besides
@@ -454,33 +521,59 @@ impl Store {
         }
     }
 
-    /// Delete a stored event and every index entry pointing at it.
+    /// Delete a stored event, current or history, and every index entry
+    /// pointing at it.
     pub fn remove(&self, txn: &mut RwTxn, seq: u64) -> Result<bool> {
         let t = self.tables;
-        let Some(record) = txn.get(t.events, &seq.to_ne_bytes())?.map(<[u8]>::to_vec) else {
+        let Some(record) = self.record(txn, seq)? else {
             return Ok(false);
         };
         let view = EventView::new(&record).expect("a stored record");
-        let stamp = stamp(view.created_at(), seq);
+        self.unindex_view(txn, seq, &view)?;
+        if let Some(address) = address_of(&view) {
+            txn.del(t.history, &address, Some(&stamp(view.created_at(), seq)))?;
+        }
+        txn.del(t.ids, &view.id()[..ID_PREFIX], Some(&seq.to_be_bytes()))?;
+        txn.del(t.events, &seq.to_ne_bytes(), None)?;
+        Ok(true)
+    }
 
-        for (db, key) in self.index_keys(&view) {
+    /// Take a stored event out of the indexes queries use, keeping it by id
+    /// and in its address's history.
+    fn unindex(&self, txn: &mut RwTxn, seq: u64) -> Result<bool> {
+        let Some(record) = self.record(txn, seq)? else {
+            return Ok(false);
+        };
+        let view = EventView::new(&record).expect("a stored record");
+        self.unindex_view(txn, seq, &view)?;
+        Ok(true)
+    }
+
+    fn record(&self, txn: &Txn, seq: u64) -> Result<Option<Vec<u8>>> {
+        Ok(txn
+            .get(self.tables.events, &seq.to_ne_bytes())?
+            .map(<[u8]>::to_vec))
+    }
+
+    fn unindex_view(&self, txn: &mut RwTxn, seq: u64, view: &EventView) -> Result<()> {
+        let t = self.tables;
+        let stamp = stamp(view.created_at(), seq);
+        for (db, key) in self.index_keys(view) {
             txn.del(db, &key, Some(&stamp))?;
         }
         // A sketch outlives its events, but not its key.
-        for (key, _) in self.tag_keys(&view) {
+        for (key, _) in self.tag_keys(view) {
             if txn.cursor(t.tags)?.set(&key)?.is_none() {
                 txn.del(t.hll, &key, None)?;
             }
         }
-        if let Some(address) = address_of(&view)
+        if let Some(address) = address_of(view)
             && self.replaceable_seq(txn, &address)? == Some(seq)
         {
             txn.del(t.replaceable, &address, None)?;
         }
         txn.del(t.created, CREATED, Some(&stamp))?;
-        txn.del(t.ids, &view.id()[..ID_PREFIX], Some(&seq.to_be_bytes()))?;
-        txn.del(t.events, &seq.to_ne_bytes(), None)?;
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -531,7 +624,9 @@ fn address_of(view: &EventView) -> Option<Vec<u8>> {
     Some(address(view.pubkey(), kind, &d))
 }
 
-fn address(pubkey: &[u8; 32], kind: u16, d: &[u8]) -> Vec<u8> {
+/// The address of `kind` by `pubkey` with the `d` tag `d`, in
+/// [`record::tag_value`] form (empty, `[0]`, for replaceable kinds).
+pub fn address(pubkey: &[u8; 32], kind: u16, d: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + 2 + 33);
     out.extend_from_slice(pubkey);
     out.extend_from_slice(&kind.to_be_bytes());
@@ -621,13 +716,14 @@ pub mod tests {
         IndexedTags::new(["title".to_string()]).unwrap()
     }
 
+    /// A store keeping every kind's history.
     pub fn open() -> (tempfile::TempDir, Store) {
-        open_sized(1 << 26)
+        open_with(1 << 26, History::new(true, vec![]))
     }
 
-    fn open_sized(map_size: usize) -> (tempfile::TempDir, Store) {
+    fn open_with(map_size: usize, history: History) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), map_size, test_tags()).unwrap();
+        let store = Store::open(dir.path(), map_size, test_tags(), history).unwrap();
         (dir, store)
     }
 
@@ -658,6 +754,7 @@ pub mod tests {
             t.tags,
             t.hll,
             t.replaceable,
+            t.history,
         ]
         .iter()
         .map(|&db| txn.len(db).unwrap())
@@ -759,9 +856,23 @@ pub mod tests {
         assert!(!stored(&store));
     }
 
+    fn open_without_history() -> (tempfile::TempDir, Store) {
+        open_with(1 << 26, History::new(false, vec![]))
+    }
+
+    /// The sequence number of an event's address's current version.
+    fn current(store: &Store, event: &Event) -> Option<u64> {
+        let record = record::encode(event);
+        let view = EventView::new(&record).unwrap();
+        let txn = store.read().unwrap();
+        store
+            .replaceable_seq(&txn, &address_of(&view).unwrap())
+            .unwrap()
+    }
+
     #[test]
     fn keeps_the_newest_replaceable() {
-        let (_dir, store) = open();
+        let (_dir, store) = open_without_history();
         let old = signed(1, 100, 0, vec![], "old");
         let new = signed(1, 200, 0, vec![], "new");
         put(&store, &old);
@@ -786,7 +897,7 @@ pub mod tests {
 
     #[test]
     fn keeps_the_newest_addressable_per_d_tag() {
-        let (_dir, store) = open();
+        let (_dir, store) = open_without_history();
         let one = signed(1, 100, 30_000, vec![vec!["d", "one"]], "");
         let two = signed(1, 100, 30_000, vec![vec!["d", "two"]], "");
         let none = signed(1, 100, 30_000, vec![], "");
@@ -807,12 +918,64 @@ pub mod tests {
         assert!(!has(&store, &v1) && has(&store, &v2));
     }
 
+    #[test]
+    fn keeps_replaced_versions_as_history() {
+        let (_dir, store) = open();
+        let v1 = signed(1, 100, 30_000, vec![vec!["d", "x"], vec!["t", "a"]], "v1");
+        let v2 = signed(1, 200, 30_000, vec![vec!["d", "x"], vec!["t", "b"]], "v2");
+        let v3 = signed(1, 300, 30_000, vec![vec!["d", "x"], vec!["t", "c"]], "v3");
+        assert_eq!(put(&store, &v1), Outcome::Stored(1));
+        assert_eq!(put(&store, &v3), Outcome::Stored(2));
+        // Older than the current version: straight to history.
+        assert_eq!(put(&store, &v2), Outcome::Archived(3));
+        assert_eq!(put(&store, &v2), Outcome::Duplicate);
+        assert!(has(&store, &v1) && has(&store, &v2) && has(&store, &v3));
+        assert_eq!(current(&store, &v3), Some(2));
+
+        let t = store.tables;
+        let txn = store.read().unwrap();
+        // Only the current version is indexed, but every one has history.
+        assert_eq!(txn.len(t.created).unwrap(), 1);
+        assert_eq!(txn.len(t.kinds).unwrap(), 1);
+        // d and t, of the current version.
+        assert_eq!(txn.len(t.tags).unwrap(), 2);
+        assert_eq!(txn.len(t.history).unwrap(), 3);
+        for (seq, current) in [(1, false), (2, true), (3, false)] {
+            let view = store.load(&txn, seq).unwrap().unwrap();
+            assert_eq!(store.is_current(&txn, seq, &view).unwrap(), current);
+        }
+        drop(txn);
+
+        // Removing the lot leaves nothing behind.
+        let mut txn = store.write().unwrap();
+        for seq in 1..=3 {
+            assert!(store.remove(&mut txn, seq).unwrap());
+        }
+        txn.commit().unwrap();
+        assert_eq!(entries(&store), 0);
+    }
+
+    #[test]
+    fn keeps_no_history_of_excluded_kinds() {
+        let (_dir, store) = open_with(1 << 26, History::new(true, vec![30_382]));
+        let old = signed(1, 100, 30_382, vec![vec!["d", "x"]], "");
+        let new = signed(1, 200, 30_382, vec![vec!["d", "x"]], "");
+        put(&store, &old);
+        put(&store, &new);
+        assert!(!has(&store, &old));
+        assert_eq!(put(&store, &old), Outcome::Replaced);
+        // History is still kept of other kinds.
+        put(&store, &signed(1, 100, 0, vec![], "old"));
+        put(&store, &signed(1, 200, 0, vec![], "new"));
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), 3);
+    }
+
     /// How big the database is, compacted, against the events' JSON. Slow,
     /// so run by hand: `cargo test --release disk_usage -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn disk_usage() {
-        let (_dir, store) = open_sized(1 << 32);
+        let (_dir, store) = open_with(1 << 32, History::new(true, vec![]));
         let events = crate::event::tests::feed(100_000);
         let json: usize = events
             .iter()

@@ -4,8 +4,9 @@
 //! searchable kind, its sequence number, kind, author, `created_at`, and
 //! text; a search finds sequence numbers there and loads the events from
 //! the LMDB. Sequence numbers are never reused, so a hit whose event is no
-//! longer stored is simply skipped: deleting replaced events from the index
-//! keeps it small, but nothing depends on it.
+//! longer stored, or has been replaced and kept only as history, is simply
+//! skipped: deleting those from the index keeps it small, but nothing
+//! depends on it. Old versions are never indexed.
 //!
 //! One thread, the [`Indexer`], writes the index. It reads what's been
 //! stored since it last looked straight from the LMDB, so catching up after
@@ -500,7 +501,8 @@ impl SearchIndex {
                 let Some(view) = store.load(txn, seq)? else {
                     continue;
                 };
-                if hit_matches(filter, search, &view) {
+                // Replaced since, and the index not told yet.
+                if hit_matches(filter, search, &view) && store.is_current(txn, seq, &view)? {
                     hits.push((score, seq, view));
                 }
             }
@@ -552,10 +554,12 @@ impl SearchIndex {
             let Some(seq) = seq_of(&searcher, &mut columns, address)? else {
                 continue;
             };
-            if !out.contains(&seq)
-                && store
-                    .load(txn, seq)?
-                    .is_some_and(|view| hit_matches(filter, search, &view))
+            if out.contains(&seq) {
+                continue;
+            }
+            if let Some(view) = store.load(txn, seq)?
+                && hit_matches(filter, search, &view)
+                && store.is_current(txn, seq, &view)?
             {
                 out.insert(seq);
             }
@@ -564,8 +568,8 @@ impl SearchIndex {
     }
 }
 
-/// The events stored since the index was last committed that a filter
-/// matches, checked by hand. Only the newest [`MAX_UNINDEXED`].
+/// The current events stored since the index was last committed that a
+/// filter matches, checked by hand. Only the newest [`MAX_UNINDEXED`].
 fn unindexed<'t>(
     store: &Store,
     txn: &'t Txn,
@@ -579,7 +583,9 @@ fn unindexed<'t>(
     let mut entry = cursor.set_range(&start.to_ne_bytes())?;
     while let Some((key, record)) = entry {
         let seq = u64::from_ne_bytes(key.try_into()?);
-        if let Some(view) = EventView::new(record).filter(|view| filter.matches(view)) {
+        if let Some(view) = EventView::new(record).filter(|view| filter.matches(view))
+            && store.is_current(txn, seq, &view)?
+        {
             found.push((seq, view));
         }
         entry = cursor.next()?;
@@ -646,7 +652,11 @@ impl Indexer {
                 self.next_seq = seq;
                 return Ok(true);
             }
-            if let Some(doc) = EventView::new(record).and_then(|v| self.search.document(seq, &v)) {
+            // Old versions, kept as history, aren't searchable.
+            if let Some(view) = EventView::new(record)
+                && store.is_current(&txn, seq, &view)?
+                && let Some(doc) = self.search.document(seq, &view)
+            {
                 self.writer.add_document(doc)?;
             }
             count += 1;
@@ -962,7 +972,7 @@ mod tests {
             .store
             .write_batch([record::encode(&new).as_slice()])
             .unwrap();
-        // Gone from the LMDB, so from results, before the index hears of it.
+        // History now, so gone from results before the index hears of it.
         assert!(f.search(json!({"search": "old"})).is_empty());
         assert_eq!(batch.removed, [1]);
         f.indexer.remove(&batch.removed);
@@ -971,6 +981,15 @@ mod tests {
         assert_eq!(f.search(json!({"search": "new"})), [new.id.as_str()]);
         let searcher = f.index.reader.searcher();
         assert_eq!(searcher.num_docs(), 1);
+
+        // An older version arriving late is history from the start: never
+        // searchable, indexed or not.
+        let older = signed(1, 50, 0, vec![], &json!({"name": "older"}).to_string());
+        assert_eq!(put(&f.store, &older), crate::store::Outcome::Archived(3));
+        assert!(f.search(json!({"search": "older"})).is_empty());
+        f.index_all();
+        assert!(f.search(json!({"search": "older"})).is_empty());
+        assert_eq!(f.index.reader.searcher().num_docs(), 1);
     }
 
     #[test]

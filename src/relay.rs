@@ -280,6 +280,8 @@ impl Connection {
                 let _ = self.state.live.send(Arc::new(live));
                 self.ok(&id, true, "").await
             }
+            // Kept, but old news: not sent to live subscriptions.
+            Ok(Outcome::Archived(_)) => self.ok(&id, true, "").await,
             Ok(Outcome::Duplicate) => {
                 self.ok(&id, true, "duplicate: already have this event")
                     .await
