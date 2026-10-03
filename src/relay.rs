@@ -13,10 +13,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::auth::{self, Access, Authed, Refusal};
 use crate::config::Config;
 use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
-use crate::query::{self, TooExpensive};
+use crate::query::{self, Restricted, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
@@ -24,6 +25,8 @@ use crate::store::{Outcome, Store, Writer};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    /// Who may read what.
+    pub access: Arc<Access>,
     pub store: Arc<Store>,
     pub writer: Writer,
     /// For NIP-50 search, if it's on.
@@ -49,6 +52,7 @@ impl AppState {
     ) -> Self {
         let (search, indexer) = search.unzip();
         Self {
+            access: Arc::new(Access::new(&config)),
             config: Arc::new(config),
             writer: Writer::spawn(store.clone(), indexer),
             store,
@@ -95,9 +99,10 @@ async fn root(
 }
 
 fn nip11(config: &Config) -> Value {
-    let mut nips = vec![1, 9, 11, 40, 45, 62];
+    let mut nips = vec![1, 9, 11, 40, 42, 45, 62, 70];
     if config.search {
         nips.push(50);
+        nips.sort_unstable();
     }
     let mut info = json!({
         "name": config.name,
@@ -135,16 +140,19 @@ const EXPIRED: &str = "invalid: event has expired";
 const VANISH: u16 = 62;
 
 /// Whether a NIP-62 request to vanish is addressed to this relay, which is
-/// at `url` if it knows: to every relay, or to that one.
-fn addressed_to(ev: &Event, url: Option<&str>) -> bool {
-    let normalize = |url: &str| url.trim().trim_end_matches('/').to_ascii_lowercase();
-    let url = url.map(normalize);
+/// at `url`: to every relay, or to this one.
+fn addressed_to(ev: &Event, url: &str) -> bool {
     ev.tags
         .iter()
         .filter(|tag| tag.len() >= 2 && tag[0] == "relay")
-        .any(|tag| {
-            tag[1] == "ALL_RELAYS" || url.as_ref().is_some_and(|url| *url == normalize(&tag[1]))
-        })
+        .any(|tag| tag[1] == "ALL_RELAYS" || auth::same_relay(&tag[1], url))
+}
+
+/// Whether an event is NIP-70 protected: only its author may publish it.
+fn is_protected(ev: &Event) -> bool {
+    ev.tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|name| name == "-"))
 }
 
 /// Outgoing queue depth per connection before we apply backpressure.
@@ -161,6 +169,9 @@ struct Connection {
     state: AppState,
     subs: HashMap<String, Subscription>,
     outbox: mpsc::Sender<String>,
+    /// What this connection signs to authenticate (NIP-42).
+    challenge: String,
+    authed: Authed,
 }
 
 /// The connection should be torn down.
@@ -185,7 +196,12 @@ impl Connection {
             state,
             subs: HashMap::new(),
             outbox,
+            challenge: auth::challenge(),
+            authed: Authed::new(),
         };
+        if conn.send(&("AUTH", &conn.challenge)).await.is_err() {
+            return;
+        }
 
         loop {
             let result = tokio::select! {
@@ -249,6 +265,7 @@ impl Connection {
             Some("EVENT") => self.on_event(msg.get(1)).await,
             Some("REQ") => self.on_req(&msg[1..]).await,
             Some("COUNT") => self.on_count(&msg[1..]).await,
+            Some("AUTH") => self.on_auth(msg.get(1)).await,
             Some("CLOSE") => match msg.get(1).and_then(Value::as_str) {
                 Some(sub_id) => {
                     self.subs.remove(sub_id);
@@ -284,6 +301,11 @@ impl Connection {
             let msg = format!("blocked: kind {} is not relayed", ev.kind);
             return self.ok(&id, false, &msg).await;
         }
+        let author = event::decode_hex(&ev.pubkey).expect("verified");
+        if is_protected(&ev) && !self.authed.contains(&author) {
+            let msg = "auth-required: this event may only be published by its author";
+            return self.ok(&id, false, msg).await;
+        }
         let now = event::now();
         if ev.created_at > u64::from(now) + self.state.config.max_future_seconds {
             return self
@@ -291,7 +313,7 @@ impl Connection {
                 .await;
         }
 
-        if ev.kind == VANISH && !addressed_to(&ev, self.state.config.url.as_deref()) {
+        if ev.kind == VANISH && !addressed_to(&ev, &self.state.config.url) {
             return self
                 .ok(
                     &id,
@@ -362,6 +384,9 @@ impl Connection {
             Ok(filters) => filters,
             Err(msg) => return self.closed(sub_id, &msg).await,
         };
+        if let Err(refusal) = self.check(&filters) {
+            return self.refuse(sub_id, refusal).await;
+        }
         if !self.subs.contains_key(sub_id) && self.subs.len() >= config.max_subscriptions {
             return self.closed(sub_id, "error: too many subscriptions").await;
         }
@@ -373,6 +398,7 @@ impl Connection {
         let store = self.state.store.clone();
         let search = self.state.search.clone();
         let query_filters = filters.clone();
+        let visible = self.visible();
         let result = tokio::task::spawn_blocking(move || {
             query::run(
                 &store,
@@ -380,12 +406,16 @@ impl Connection {
                 &query_filters,
                 config.default_limit,
                 config.max_limit,
+                visible,
             )
         })
         .await;
 
         let results = match result {
             Ok(Ok(results)) => results,
+            Ok(Err(err)) if err.is::<Restricted>() => {
+                return self.refuse(sub_id, Refusal::Results).await;
+            }
             Ok(Err(err)) => {
                 tracing::error!("query failed: {err:#}");
                 return self.closed(sub_id, "error: query failed").await;
@@ -420,6 +450,9 @@ impl Connection {
         if filters.len() > self.state.config.max_filters {
             return Err("invalid: too many filters".into());
         }
+        for filter in &mut filters {
+            self.state.access.hide(filter, &self.authed);
+        }
         for filter in filters.iter_mut().filter(|f| f.search.is_some()) {
             match &self.state.search {
                 Some(search) => search.restrict(filter),
@@ -427,6 +460,48 @@ impl Connection {
             }
         }
         Ok(filters)
+    }
+
+    /// Whether the connection may run some filters.
+    fn check(&self, filters: &[Filter]) -> Result<(), Refusal> {
+        filters
+            .iter()
+            .try_for_each(|filter| self.state.access.check(filter, &self.authed))
+    }
+
+    /// Which events the connection may see, for a query.
+    fn visible(&self) -> impl Fn(&EventView) -> bool + Send + 'static {
+        let access = self.state.access.clone();
+        let authed = self.authed.clone();
+        move |event| access.may_see(event, &authed)
+    }
+
+    /// Refuse a REQ or COUNT.
+    async fn refuse(&self, id: &str, refusal: Refusal) -> Result<(), Disconnect> {
+        self.closed(id, refusal.message(&self.authed)).await
+    }
+
+    /// NIP-42: `["AUTH", event]`.
+    async fn on_auth(&mut self, value: Option<&Value>) -> Result<(), Disconnect> {
+        let Some(value) = value else {
+            return self.notice("invalid: AUTH requires an event").await;
+        };
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let ev: Event = match serde_json::from_value(value.clone()) {
+            Ok(ev) => ev,
+            Err(err) => return self.ok(&id, false, &format!("invalid: {err}")).await,
+        };
+        match auth::verify(&ev, &self.challenge, &self.state.config.url, event::now()) {
+            Ok(pubkey) => {
+                self.authed.insert(pubkey);
+                self.ok(&id, true, "").await
+            }
+            Err(msg) => self.ok(&id, false, &msg).await,
+        }
     }
 
     /// NIP-45: `["COUNT", id, filters...]`.
@@ -441,12 +516,17 @@ impl Connection {
             Ok(filters) => filters,
             Err(msg) => return self.closed(id, &msg).await,
         };
+        if let Err(refusal) = self.check(&filters) {
+            return self.refuse(id, refusal).await;
+        }
 
         let store = self.state.store.clone();
         let search = self.state.search.clone();
-        let result =
-            tokio::task::spawn_blocking(move || query::count(&store, search.as_deref(), &filters))
-                .await;
+        let visible = self.visible();
+        let result = tokio::task::spawn_blocking(move || {
+            query::count(&store, search.as_deref(), &filters, visible)
+        })
+        .await;
         match result {
             Ok(Ok(count)) => {
                 let mut body = json!({"count": count.count});
@@ -455,6 +535,7 @@ impl Connection {
                 }
                 self.send(&("COUNT", id, body)).await
             }
+            Ok(Err(err)) if err.is::<Restricted>() => self.refuse(id, Refusal::Results).await,
             Ok(Err(err)) if err.is::<TooExpensive>() => {
                 self.closed(id, "unsupported: too expensive to count").await
             }
@@ -471,6 +552,9 @@ impl Connection {
 
     async fn on_live_event(&self, ev: &LiveEvent) -> Result<(), Disconnect> {
         let view = EventView::new(&ev.record).expect("an encoded record");
+        if !self.state.access.may_see(&view, &self.authed) {
+            return Ok(());
+        }
         for (sub_id, sub) in &self.subs {
             // Already covered by the subscription's initial query.
             if ev.seq.is_some_and(|seq| seq < sub.next_seq) {
@@ -492,12 +576,11 @@ mod tests {
     #[test]
     fn knows_which_vanish_requests_are_its_own() {
         let to = |relay: &str| signed(1, 100, VANISH, vec![vec!["relay", relay]], "");
-        let url = Some("wss://relay.example.com");
-        assert!(addressed_to(&to("ALL_RELAYS"), None));
+        let url = "wss://relay.example.com";
+        assert!(addressed_to(&to("ALL_RELAYS"), url));
         assert!(addressed_to(&to("wss://relay.example.com"), url));
         assert!(addressed_to(&to("WSS://Relay.Example.com/"), url));
         assert!(!addressed_to(&to("wss://other.example.com"), url));
-        assert!(!addressed_to(&to("wss://relay.example.com"), None));
         assert!(!addressed_to(&signed(1, 100, VANISH, vec![], ""), url));
     }
 }

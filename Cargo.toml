@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 futures-util = "0.3.34"
+getrandom = "0.4"
 hex = "0.4.3"
 libc = "0.2.190"
 # Raw LMDB, wrapped in src/lmdb.rs. heed can't seek or count within a key's

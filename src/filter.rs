@@ -27,6 +27,9 @@ pub struct Filter {
     pub until: u32,
     pub limit: Option<u64>,
     pub search: Option<Search>,
+    /// Kinds the filter doesn't match though it doesn't name its kinds:
+    /// those the connection may not read (see [`crate::auth`]). Sorted.
+    pub hidden_kinds: Vec<u16>,
     /// Some field can match nothing (an empty list, say), so neither can
     /// the filter.
     pub never: bool,
@@ -165,11 +168,7 @@ impl Filter {
         {
             return false;
         }
-        if self
-            .kinds
-            .as_ref()
-            .is_some_and(|kinds| kinds.binary_search(&event.kind()).is_err())
-        {
+        if !self.wants_kind(event.kind()) {
             return false;
         }
         self.tags.iter().all(|(name, values)| {
@@ -177,6 +176,14 @@ impl Filter {
                 n == name && values.binary_search_by(|v| compare(v, &value)).is_ok()
             })
         })
+    }
+
+    /// Whether events of a kind can match.
+    pub fn wants_kind(&self, kind: u16) -> bool {
+        self.kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.binary_search(&kind).is_ok())
+            && self.hidden_kinds.binary_search(&kind).is_err()
     }
 
     pub fn matches_time(&self, created_at: u32) -> bool {

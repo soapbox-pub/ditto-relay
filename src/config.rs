@@ -3,6 +3,8 @@ use std::str::FromStr;
 
 use anyhow::Context;
 
+use crate::event::decode_hex;
+
 /// Relay configuration, read from `RELAY_*` environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -10,8 +12,9 @@ pub struct Config {
     pub db_path: PathBuf,
     /// LMDB map size in bytes. This is virtual address space, not disk usage.
     pub map_size: usize,
-    /// The relay's own URL, which NIP-62 requests to vanish name it by.
-    pub url: Option<String>,
+    /// The relay's own URL, which NIP-42 authentication and NIP-62 requests
+    /// to vanish name it by.
+    pub url: String,
     pub name: String,
     pub description: String,
     /// The operator's pubkey, for NIP-11.
@@ -37,6 +40,13 @@ pub struct Config {
     pub history_excluded_kinds: Vec<u16>,
     /// The most versions of an address kept, current included.
     pub history_max_versions: usize,
+    /// Kinds only parties to an event may read, once they've authenticated
+    /// (NIP-42): its author, or a pubkey it tags.
+    pub auth_kinds: Vec<u16>,
+    /// Auth kinds anyone may read by naming their authors.
+    pub auth_author_exempt_kinds: Vec<u16>,
+    /// Pubkeys that, once authenticated, may read anything.
+    pub master_pubkeys: Vec<[u8; 32]>,
     /// Whether NIP-50 search is on.
     pub search: bool,
     pub search_path: PathBuf,
@@ -52,7 +62,7 @@ impl Config {
             bind: env("RELAY_BIND", "127.0.0.1:13131".to_string())?,
             db_path: env("RELAY_DB_PATH", PathBuf::from("./data/db"))?,
             map_size: env("RELAY_MAP_SIZE", 1 << 40)?,
-            url: optional("RELAY_URL"),
+            url: optional("RELAY_URL").context("RELAY_URL is required")?,
             name: env("RELAY_NAME", "Ditto Relay".to_string())?,
             description: env("RELAY_DESCRIPTION", String::new())?,
             pubkey: optional("RELAY_PUBKEY"),
@@ -67,10 +77,7 @@ impl Config {
             max_filter_values: env("RELAY_MAX_FILTER_VALUES", 20_000)?,
             max_future_seconds: env("RELAY_MAX_FUTURE_SECONDS", 900)?,
             // NIP-48 proxies and NIP-89 clients.
-            indexed_tags: env("RELAY_INDEXED_TAGS", "proxy,client".to_string())?
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
+            indexed_tags: items(&env("RELAY_INDEXED_TAGS", "proxy,client".to_string())?)
                 .map(String::from)
                 .collect(),
             history: env("RELAY_HISTORY", true)?,
@@ -80,6 +87,12 @@ impl Config {
                 &[30382, 30383, 30384, 30385],
             )?,
             history_max_versions: env("RELAY_HISTORY_MAX_VERSIONS", 20)?,
+            // DMs, app data, and gift wraps.
+            auth_kinds: kinds("RELAY_AUTH_KINDS", &[4, 78, 1059, 30078])?,
+            // Gift wraps are signed by throwaway keys, so naming the author
+            // gives nothing away.
+            auth_author_exempt_kinds: kinds("RELAY_AUTH_AUTHOR_EXEMPT_KINDS", &[1059])?,
+            master_pubkeys: pubkeys("RELAY_MASTER_PUBKEYS")?,
             search: env("RELAY_SEARCH", true)?,
             search_path: env("RELAY_SEARCH_PATH", PathBuf::from("./data/search"))?,
             search_kinds: kinds("RELAY_SEARCH_KINDS", &[0, 1, 20, 1111, 9802, 30023])?,
@@ -105,14 +118,29 @@ fn optional(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// A comma-separated list of kinds.
+/// A comma-separated list of kinds. Empty for none.
 fn kinds(key: &str, default: &[u16]) -> anyhow::Result<Vec<u16>> {
     match std::env::var(key) {
-        Ok(v) => v
-            .split(',')
-            .map(|kind| kind.trim().parse())
+        Ok(v) => items(&v)
+            .map(str::parse)
             .collect::<Result<_, _>>()
             .with_context(|| format!("invalid value for {key}: {v:?}")),
         Err(_) => Ok(default.to_vec()),
     }
+}
+
+/// A comma-separated list of hex pubkeys.
+fn pubkeys(key: &str) -> anyhow::Result<Vec<[u8; 32]>> {
+    let v = std::env::var(key).unwrap_or_default();
+    items(&v)
+        .map(|pubkey| {
+            decode_hex(pubkey).with_context(|| format!("invalid pubkey in {key}: {pubkey:?}"))
+        })
+        .collect()
+}
+
+fn items(list: &str) -> impl Iterator<Item = &str> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
 }

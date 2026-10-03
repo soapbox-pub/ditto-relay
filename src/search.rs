@@ -376,7 +376,12 @@ impl SearchIndex {
                 .into_iter()
                 .filter(|kind| self.kinds.binary_search(kind).is_ok())
                 .collect(),
-            None => self.kinds.clone(),
+            None => self
+                .kinds
+                .iter()
+                .copied()
+                .filter(|&kind| filter.wants_kind(kind))
+                .collect(),
         };
         filter.never |= kinds.is_empty();
         filter.kinds = Some(kinds);
@@ -439,6 +444,13 @@ impl SearchIndex {
                 .iter()
                 .map(|&k| Term::from_field_u64(f.kind, k.into()));
             clauses.push((Occur::Must, Box::new(TermSetQuery::new(terms))));
+        }
+        if !filter.hidden_kinds.is_empty() {
+            let terms = filter
+                .hidden_kinds
+                .iter()
+                .map(|&k| Term::from_field_u64(f.kind, k.into()));
+            clauses.push((Occur::MustNot, Box::new(TermSetQuery::new(terms))));
         }
         if let Some(authors) = &filter.authors {
             let terms = authors.iter().map(|a| Term::from_field_bytes(f.pubkey, a));
@@ -807,15 +819,25 @@ mod tests {
 
         /// Run a search filter as a REQ would.
         fn search(&self, filter: serde_json::Value) -> Vec<String> {
+            self.search_hiding(filter, &[])
+        }
+
+        /// Run a search filter, with some kinds hidden if it names none.
+        fn search_hiding(&self, filter: serde_json::Value, hidden: &[u16]) -> Vec<String> {
             let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             assert!(filter.search.is_some());
+            if filter.kinds.is_none() {
+                filter.hidden_kinds = hidden.to_vec();
+            }
             self.index.restrict(&mut filter);
-            crate::query::run(&self.store, Some(&self.index), &[filter], 100, 500)
-                .unwrap()
-                .events
-                .iter()
-                .map(|json| serde_json::from_str::<Event>(json).unwrap().id)
-                .collect()
+            crate::query::run(&self.store, Some(&self.index), &[filter], 100, 500, |_| {
+                true
+            })
+            .unwrap()
+            .events
+            .iter()
+            .map(|json| serde_json::from_str::<Event>(json).unwrap().id)
+            .collect()
         }
     }
 
@@ -883,7 +905,7 @@ mod tests {
         let count = |filter: serde_json::Value| {
             let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             f.index.restrict(&mut filter);
-            crate::query::count(&f.store, Some(&f.index), &[filter])
+            crate::query::count(&f.store, Some(&f.index), &[filter], |_| true)
                 .unwrap()
                 .count
         };
@@ -1114,6 +1136,23 @@ mod tests {
             [long.id.as_str()]
         );
         assert!(f.search(autocomplete("supercalifragilisticky")).is_empty());
+
+        // Not hidden kinds, indexed or not yet.
+        let settings = signed(
+            6,
+            100,
+            30078,
+            vec![vec!["d", "c"], vec!["title", "Bicycles"]],
+            "",
+        );
+        put(&f.store, &settings);
+        let bicy = |f: &Fixture| f.search_hiding(autocomplete("bicy"), &[30078]);
+        assert_eq!(bicy(&f), [listing.id.as_str()]);
+        f.index_all();
+        assert_eq!(bicy(&f), [listing.id.as_str()]);
+        assert_eq!(f.search(autocomplete("bicy")).len(), 2);
+        let both = json!({"search": "bicy autocomplete:true", "kinds": [30078, 30402]});
+        assert_eq!(f.search_hiding(both, &[30078]).len(), 2);
     }
 
     /// Random events and `sort:new` searches, plain and autocomplete, some
