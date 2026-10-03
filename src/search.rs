@@ -749,7 +749,7 @@ mod tests {
     use crate::event::Event;
     use crate::event::tests::signed;
     use crate::record;
-    use crate::store::tests::{open, put, test_tags};
+    use crate::store::tests::{MAX_VALUES, open, put, test_tags};
     use serde_json::json;
 
     fn view_text(event: &Event) -> Vec<String> {
@@ -807,7 +807,7 @@ mod tests {
 
         /// Run a search filter as a REQ would.
         fn search(&self, filter: serde_json::Value) -> Vec<String> {
-            let mut filter = Filter::parse(&filter, &test_tags()).unwrap();
+            let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             assert!(filter.search.is_some());
             self.index.restrict(&mut filter);
             crate::query::run(&self.store, Some(&self.index), &[filter], 100, 500)
@@ -881,7 +881,7 @@ mod tests {
         f.index_all();
         put(&f.store, &signed(3, 300, 1, vec![], "hello again"));
         let count = |filter: serde_json::Value| {
-            let mut filter = Filter::parse(&filter, &test_tags()).unwrap();
+            let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             f.index.restrict(&mut filter);
             crate::query::count(&f.store, Some(&f.index), &[filter])
                 .unwrap()
@@ -1213,7 +1213,7 @@ mod tests {
             filter.insert("limit".into(), json!(limit));
             let filter = serde_json::Value::Object(filter);
 
-            let mut parsed = Filter::parse(&filter, &test_tags()).unwrap();
+            let mut parsed = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             f.index.restrict(&mut parsed);
             let mut expected: Vec<&Event> = all
                 .iter()

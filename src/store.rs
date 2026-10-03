@@ -1213,6 +1213,9 @@ pub mod tests {
         IndexedTags::new(["title".to_string()]).unwrap()
     }
 
+    /// The most values a filter field may list in tests.
+    pub const MAX_VALUES: usize = 20_000;
+
     /// A store keeping every kind's history.
     pub fn open() -> (tempfile::TempDir, Store) {
         open_with(1 << 26, History::new(true, vec![], 20))

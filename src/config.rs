@@ -14,12 +14,18 @@ pub struct Config {
     pub url: Option<String>,
     pub name: String,
     pub description: String,
+    /// The operator's pubkey, for NIP-11.
+    pub pubkey: Option<String>,
+    /// How to reach the operator, for NIP-11.
+    pub contact: Option<String>,
     pub max_message_size: usize,
     pub max_subscriptions: usize,
     pub max_filters: usize,
     pub max_subid_length: usize,
     pub default_limit: u64,
     pub max_limit: u64,
+    /// The most values one field of a filter may list.
+    pub max_filter_values: usize,
     /// Reject events with `created_at` further than this many seconds in the future.
     pub max_future_seconds: u64,
     /// Tags with longer names than a letter to index, so filter by.
@@ -43,22 +49,25 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
-            bind: env("RELAY_BIND", "127.0.0.1:7777".to_string())?,
+            bind: env("RELAY_BIND", "127.0.0.1:13131".to_string())?,
             db_path: env("RELAY_DB_PATH", PathBuf::from("./data/db"))?,
             map_size: env("RELAY_MAP_SIZE", 1 << 40)?,
-            url: std::env::var("RELAY_URL")
-                .ok()
-                .filter(|url| !url.is_empty()),
-            name: env("RELAY_NAME", "ditto-relay-rs".to_string())?,
+            url: optional("RELAY_URL"),
+            name: env("RELAY_NAME", "Ditto Relay".to_string())?,
             description: env("RELAY_DESCRIPTION", String::new())?,
-            max_message_size: env("RELAY_MAX_MESSAGE_SIZE", 128 * 1024)?,
+            pubkey: optional("RELAY_PUBKEY"),
+            contact: optional("RELAY_CONTACT"),
+            max_message_size: env("RELAY_MAX_MESSAGE_SIZE", 4_000_000)?,
             max_subscriptions: env("RELAY_MAX_SUBSCRIPTIONS", 20)?,
-            max_filters: env("RELAY_MAX_FILTERS", 10)?,
-            max_subid_length: env("RELAY_MAX_SUBID_LENGTH", 64)?,
-            default_limit: env("RELAY_DEFAULT_LIMIT", 500)?,
-            max_limit: env("RELAY_MAX_LIMIT", 500)?,
+            max_filters: env("RELAY_MAX_FILTERS", 100)?,
+            max_subid_length: env("RELAY_MAX_SUBID_LENGTH", 100)?,
+            default_limit: env("RELAY_DEFAULT_LIMIT", 100)?,
+            max_limit: env("RELAY_MAX_LIMIT", 1000)?,
+            // Generous enough for a big follow list.
+            max_filter_values: env("RELAY_MAX_FILTER_VALUES", 20_000)?,
             max_future_seconds: env("RELAY_MAX_FUTURE_SECONDS", 900)?,
-            indexed_tags: env("RELAY_INDEXED_TAGS", String::new())?
+            // NIP-48 proxies and NIP-89 clients.
+            indexed_tags: env("RELAY_INDEXED_TAGS", "proxy,client".to_string())?
                 .split(',')
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
@@ -89,6 +98,11 @@ where
             .with_context(|| format!("invalid value for {key}: {v:?}")),
         Err(_) => Ok(default),
     }
+}
+
+/// A variable that's unset when empty.
+fn optional(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 /// A comma-separated list of kinds.

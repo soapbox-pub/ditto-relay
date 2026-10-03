@@ -99,7 +99,7 @@ fn nip11(config: &Config) -> Value {
     if config.search {
         nips.push(50);
     }
-    json!({
+    let mut info = json!({
         "name": config.name,
         "description": config.description,
         "supported_nips": nips,
@@ -113,8 +113,20 @@ fn nip11(config: &Config) -> Value {
             "max_limit": config.max_limit,
             "default_limit": config.default_limit,
             "created_at_upper_limit": config.max_future_seconds,
+            "min_pow_difficulty": 0,
+            "auth_required": false,
+            "payment_required": false,
+            // Not standard: so clients can split big filters before sending.
+            "max_filter_values": config.max_filter_values,
         },
-    })
+    });
+    if let Some(pubkey) = &config.pubkey {
+        info["pubkey"] = pubkey.as_str().into();
+    }
+    if let Some(contact) = &config.contact {
+        info["contact"] = contact.as_str().into();
+    }
+    info
 }
 
 const EXPIRED: &str = "invalid: event has expired";
@@ -268,6 +280,10 @@ impl Connection {
         if let Err(msg) = ev.verify() {
             return self.ok(&id, false, &msg).await;
         }
+        if !event::is_relayed(ev.kind) {
+            let msg = format!("blocked: kind {} is not relayed", ev.kind);
+            return self.ok(&id, false, &msg).await;
+        }
         let now = event::now();
         if ev.created_at > u64::from(now) + self.state.config.max_future_seconds {
             return self
@@ -396,9 +412,10 @@ impl Connection {
     /// A REQ's or COUNT's filters, or why they're refused.
     fn filters(&self, args: &[Value]) -> Result<Vec<Filter>, String> {
         let indexed = &self.state.store.indexed_tags;
+        let max_values = self.state.config.max_filter_values;
         let mut filters = args
             .iter()
-            .map(|value| Filter::parse(value, indexed))
+            .map(|value| Filter::parse(value, indexed, max_values))
             .collect::<Result<Vec<_>, _>>()?;
         if filters.len() > self.state.config.max_filters {
             return Err("invalid: too many filters".into());

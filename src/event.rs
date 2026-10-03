@@ -37,6 +37,24 @@ impl KindClass {
     }
 }
 
+/// Kinds of signed artifacts that aren't for publishing to relays on their
+/// own. Some look alike but are relayed: NIP-47 and NIP-46 use relays as
+/// transport, and 9735 zap receipts and 1059 gift wraps are published.
+pub const NOT_RELAYED: [u16; 7] = [
+    13,    // NIP-59 seal, only valid inside a gift wrap
+    9734,  // NIP-57 zap request, sent to the LNURL callback
+    20013, // Concord encrypted seal, only valid inside a gift wrap
+    20014, // Concord plaintext seal, only valid inside a gift wrap
+    22242, // NIP-42 auth, only in AUTH messages
+    24242, // Blossom auth, an HTTP Authorization header
+    27235, // NIP-98 HTTP auth, an HTTP Authorization header
+];
+
+/// Whether events of a kind are published to relays.
+pub fn is_relayed(kind: u16) -> bool {
+    !NOT_RELAYED.contains(&kind)
+}
+
 impl Event {
     pub fn kind_class(&self) -> KindClass {
         KindClass::of(self.kind)
@@ -248,5 +266,15 @@ pub mod tests {
         assert_eq!(KindClass::of(20001), KindClass::Ephemeral);
         assert_eq!(KindClass::of(30023), KindClass::Addressable);
         assert_eq!(KindClass::of(40000), KindClass::Regular);
+    }
+
+    #[test]
+    fn relayed_kinds() {
+        for kind in [0, 1, 1059, 9735, 23194, 24133] {
+            assert!(is_relayed(kind), "{kind}");
+        }
+        for kind in [13, 9734, 20013, 20014, 22242, 24242, 27235] {
+            assert!(!is_relayed(kind), "{kind}");
+        }
     }
 }

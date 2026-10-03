@@ -565,7 +565,7 @@ mod tests {
     use super::*;
     use crate::event::Event;
     use crate::event::tests::signed;
-    use crate::store::tests::{open, put, put_at, test_tags};
+    use crate::store::tests::{MAX_VALUES, open, put, put_at, test_tags};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
     use serde_json::{Value, json};
@@ -573,7 +573,7 @@ mod tests {
     fn ids(store: &Store, filters: &[Value], max_limit: u64) -> Vec<String> {
         let filters: Vec<Filter> = filters
             .iter()
-            .map(|f| Filter::parse(f, &test_tags()).unwrap())
+            .map(|f| Filter::parse(f, &test_tags(), MAX_VALUES).unwrap())
             .collect();
         let results = run(store, None, &filters, max_limit, max_limit).unwrap();
         results
@@ -597,7 +597,12 @@ mod tests {
 
         let txn = store.read().unwrap();
         let plan_for = |filter: Value| {
-            plan(&store, &txn, &Filter::parse(&filter, &test_tags()).unwrap()).unwrap()
+            plan(
+                &store,
+                &txn,
+                &Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap(),
+            )
+            .unwrap()
         };
 
         // The rare tag beats the author with twenty events, and needs checking.
@@ -714,7 +719,7 @@ mod tests {
             (Value::Object(filter), limit)
         };
         let matching = |filter: &Value| -> Vec<&Event> {
-            let parsed = Filter::parse(filter, &test_tags()).unwrap();
+            let parsed = Filter::parse(filter, &test_tags(), MAX_VALUES).unwrap();
             all.iter()
                 .filter(|e| {
                     let record = crate::record::encode(e);
@@ -728,7 +733,7 @@ mod tests {
             let mut expected = matching(&filter);
 
             // Counted, with every match's author sketched.
-            let parsed = Filter::parse(&filter, &test_tags()).unwrap();
+            let parsed = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             let counted = count(&store, None, std::slice::from_ref(&parsed)).unwrap();
             let hll = parsed.first_tag.as_ref().map(|value| {
                 let mut registers = [0; hll::REGISTERS];
@@ -751,7 +756,10 @@ mod tests {
                 .chain(&matching(&other))
                 .map(|e| e.id.as_str())
                 .collect();
-            let filters = [parsed, Filter::parse(&other, &test_tags()).unwrap()];
+            let filters = [
+                parsed,
+                Filter::parse(&other, &test_tags(), MAX_VALUES).unwrap(),
+            ];
             let counted = count(&store, None, &filters).unwrap();
             assert_eq!(counted.count, union.len() as u64, "{filter} {other}");
 
@@ -773,7 +781,7 @@ mod tests {
         count(
             store,
             None,
-            &[Filter::parse(&filter, &test_tags()).unwrap()],
+            &[Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap()],
         )
         .unwrap()
     }

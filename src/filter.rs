@@ -10,10 +10,6 @@ use crate::record::{Element, EventView, tag_value};
 use crate::search;
 use crate::store::{IndexedTags, MAX_INDEXED_TAG};
 
-/// The most values one field of a filter may list. Generous enough for a
-/// big follow list.
-pub const MAX_VALUES: usize = 5000;
-
 /// The most terms a search may have.
 pub const MAX_SEARCH_TERMS: usize = 32;
 
@@ -56,8 +52,14 @@ impl Filter {
     /// Parse a filter. Errors are NIP-01 machine-readable messages. A tag
     /// that isn't indexed is refused, so a client isn't left thinking it
     /// filtered by it; other fields neither NIP-01 nor NIP-50 defines are
-    /// ignored.
-    pub fn parse(value: &Value, indexed: &IndexedTags) -> Result<Filter, String> {
+    /// ignored. No field may list more than `max_values` values.
+    pub fn parse(
+        value: &Value,
+        indexed: &IndexedTags,
+        max_values: usize,
+    ) -> Result<Filter, String> {
+        let list = |name: &str, value| list(name, value, max_values);
+        let hex_list = |name: &str, value| hex_list(name, value, max_values);
         let Value::Object(fields) = value else {
             return Err("invalid: a filter must be an object".into());
         };
@@ -255,21 +257,21 @@ fn compare(encoded: &[u8], element: &Element) -> Ordering {
     }
 }
 
-fn list<'a>(name: &str, value: &'a Value) -> Result<&'a Vec<Value>, String> {
+fn list<'a>(name: &str, value: &'a Value, max: usize) -> Result<&'a Vec<Value>, String> {
     let list = value
         .as_array()
         .ok_or_else(|| format!("invalid: {name} must be an array"))?;
-    if list.len() > MAX_VALUES {
+    if list.len() > max {
         return Err(format!(
-            "invalid: {name} lists more than {MAX_VALUES} values"
+            "invalid: filter field \"{name}\" exceeds max_filter_values ({max})"
         ));
     }
     Ok(list)
 }
 
-fn hex_list(name: &str, value: &Value) -> Result<Vec<[u8; 32]>, String> {
+fn hex_list(name: &str, value: &Value, max: usize) -> Result<Vec<[u8; 32]>, String> {
     let mut out = Vec::new();
-    for value in list(name, value)? {
+    for value in list(name, value, max)? {
         let hex = value
             .as_str()
             .filter(|hex| is_hex64(hex))
@@ -300,11 +302,11 @@ mod tests {
     use crate::event::Event;
     use crate::event::tests::signed;
     use crate::record::encode;
-    use crate::store::tests::test_tags;
+    use crate::store::tests::{MAX_VALUES, test_tags};
     use serde_json::json;
 
     fn parse(filter: &Value) -> Result<Filter, String> {
-        Filter::parse(filter, &test_tags())
+        Filter::parse(filter, &test_tags(), MAX_VALUES)
     }
 
     fn matches(filter: Value, event: &Event) -> bool {
@@ -458,5 +460,13 @@ mod tests {
         }
         let filter = parse(&json!({"since": -5, "until": 1u64 << 40})).unwrap();
         assert_eq!((filter.since, filter.until), (0, u32::MAX));
+        // Fields may list only so many values.
+        let tags = test_tags();
+        assert!(Filter::parse(&json!({"kinds": [1, 2]}), &tags, 2).is_ok());
+        let err = Filter::parse(&json!({"#t": ["a", "b", "c"]}), &tags, 2).unwrap_err();
+        assert_eq!(
+            err,
+            "invalid: filter field \"#t\" exceeds max_filter_values (2)"
+        );
     }
 }
