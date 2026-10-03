@@ -40,6 +40,8 @@ pub struct Search {
     pub terms: Vec<String>,
     /// `sort:new`: the newest matches rather than the most relevant.
     pub sort_new: bool,
+    /// `autocomplete:true`: the terms are prefixes of names and titles.
+    pub autocomplete: bool,
 }
 
 impl Filter {
@@ -123,7 +125,10 @@ impl Filter {
             && self
                 .search
                 .as_ref()
-                .is_none_or(|search| search::matches(&search.terms, event))
+                .is_none_or(|search| match search.autocomplete {
+                    true => search::matches_prefixes(&search.terms, event),
+                    false => search::matches(&search.terms, event),
+                })
     }
 
     /// Whether an event matches, its search aside.
@@ -170,10 +175,12 @@ impl Filter {
 fn parse_search(value: &Value) -> Result<Option<Search>, String> {
     let text = value.as_str().ok_or("invalid: search must be a string")?;
     let mut sort_new = false;
+    let mut autocomplete = false;
     let mut words = Vec::new();
     for word in text.split_whitespace() {
         match extension(word) {
             Some(("sort", "new")) => sort_new = true,
+            Some(("autocomplete", "true")) => autocomplete = true,
             Some(_) => {}
             None => words.push(word),
         }
@@ -186,7 +193,11 @@ fn parse_search(value: &Value) -> Result<Option<Search>, String> {
             "invalid: search has more than {MAX_SEARCH_TERMS} terms"
         ));
     }
-    Ok((!terms.is_empty()).then_some(Search { terms, sort_new }))
+    Ok((!terms.is_empty()).then_some(Search {
+        terms,
+        sort_new,
+        autocomplete,
+    }))
 }
 
 /// A NIP-50 extension's key and value. Not a URL's scheme and the rest.
@@ -309,12 +320,36 @@ mod tests {
     }
 
     #[test]
+    fn matches_autocomplete_prefixes_of_names() {
+        let profile = json!({"name": "Jack Dorsey", "about": "bitcoin", "nip05": "jack@x.com"});
+        let event = signed(1, 100, 0, vec![], &profile.to_string());
+        let autocomplete = |text: &str| json!({"search": format!("{text} autocomplete:true")});
+        assert!(matches(autocomplete("jac dor"), &event));
+        assert!(matches(autocomplete("JACK"), &event));
+        assert!(!matches(autocomplete("bitco"), &event));
+        assert!(!matches(autocomplete("ack"), &event));
+        let article = signed(
+            1,
+            100,
+            30023,
+            vec![vec!["title", "Ñandú Facts"]],
+            "body text",
+        );
+        assert!(matches(autocomplete("nan fac"), &article));
+        assert!(!matches(autocomplete("bod"), &article));
+    }
+
+    #[test]
     fn parses_search_extensions() {
         let search = |text: &str| Filter::parse(&json!({"search": text})).unwrap().search;
         let parsed = search("Nostr sort:new include:spam https://x.com nostr").unwrap();
         assert_eq!(parsed.terms, ["com", "https", "nostr", "x"]);
         assert!(parsed.sort_new);
         assert!(!search("rust").unwrap().sort_new);
+        assert!(!parsed.autocomplete);
+        let parsed = search("Jac autocomplete:true sort:new").unwrap();
+        assert!(parsed.autocomplete && parsed.sort_new);
+        assert_eq!(parsed.terms, ["jac"]);
         // Only extensions, or only punctuation: no search.
         assert!(search("sort:new language:en").is_none());
         assert!(search("  !! ").is_none());

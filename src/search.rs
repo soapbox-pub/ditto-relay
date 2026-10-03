@@ -20,6 +20,12 @@
 //! Text is split on anything not alphanumeric, lowercased, and folded to
 //! ASCII, both when indexing and searching, and in [`matches`], which checks
 //! live events against a search. A search matches events with every term.
+//!
+//! With `autocomplete:true`, a search looks instead at the names people
+//! look things up by — a profile's name, display name, and NIP-05, and any
+//! event's title — and its terms are prefixes. Those are indexed in a field
+//! of their own as every prefix of every word, up to [`MAX_PREFIX`]
+//! characters, so a prefix is looked up like any term.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -43,7 +49,8 @@ use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, Schema, TextFieldIndexing, TextOptions,
 };
 use tantivy::tokenizer::{
-    AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
+    AsciiFoldingFilter, LowerCaser, PreTokenizedString, RemoveLongFilter, SimpleTokenizer,
+    TextAnalyzer, Token,
 };
 use tantivy::{
     DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, TantivyDocument, Term,
@@ -55,7 +62,7 @@ use crate::record::{Content, Element, EventView};
 use crate::store::Store;
 
 /// Bumped when what's indexed, or how, changes. The index is then rebuilt.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// The name the analyzer is registered under.
 const ANALYZER: &str = "nostr";
@@ -68,6 +75,13 @@ const TEXT_TAGS: &[&str] = &["title", "summary", "subject", "alt"];
 
 /// The kind 0 fields that are searchable.
 const PROFILE_FIELDS: &[&str] = &["name", "display_name", "about", "nip05", "website"];
+
+/// The kind 0 fields autocomplete matches.
+const NAME_FIELDS: &[&str] = &["name", "display_name", "nip05"];
+
+/// The longest prefix of a word indexed for autocomplete. Longer search
+/// terms are looked up by their first this many characters, then checked.
+const MAX_PREFIX: usize = 20;
 
 /// The indexer's memory, split between its threads.
 const WRITER_MEMORY: usize = 64 << 20;
@@ -151,6 +165,70 @@ pub fn matches(terms: &[String], view: &EventView) -> bool {
     terms.iter().all(|term| have.contains(term))
 }
 
+/// What autocomplete matches: a profile's names and any event's title.
+pub fn names(view: &EventView) -> String {
+    let mut out = String::new();
+    let mut push = |text: &str| {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    };
+    if view.kind() == 0
+        && let Content::Text(content) = view.content()
+        && let Ok(Value::Object(profile)) = serde_json::from_str(content)
+    {
+        for field in NAME_FIELDS {
+            if let Some(Value::String(value)) = profile.get(*field) {
+                push(value);
+            }
+        }
+    }
+    if let Some(Element::Text(title)) = view.tag("title") {
+        push(title);
+    }
+    out
+}
+
+/// Whether every term of an autocomplete search begins a word of an
+/// event's names.
+pub fn matches_prefixes(terms: &[String], view: &EventView) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let have = tokens(&names(view));
+    terms
+        .iter()
+        .all(|term| have.iter().any(|word| word.starts_with(term.as_str())))
+}
+
+/// Every prefix of every word of `text`, up to [`MAX_PREFIX`] characters,
+/// as autocomplete indexes it.
+fn prefixes(text: &str) -> PreTokenizedString {
+    let mut out = Vec::new();
+    for (position, word) in tokens(text).into_iter().enumerate() {
+        let ends = word.char_indices().skip(1).map(|(i, _)| i);
+        for end in ends.chain([word.len()]).take(MAX_PREFIX) {
+            out.push(Token {
+                position,
+                text: word[..end].to_string(),
+                ..Token::default()
+            });
+        }
+    }
+    PreTokenizedString {
+        text: text.to_string(),
+        tokens: out,
+    }
+}
+
+/// A search term as autocomplete looks it up.
+fn prefix(term: &str) -> &str {
+    term.char_indices()
+        .nth(MAX_PREFIX)
+        .map_or(term, |(end, _)| &term[..end])
+}
+
 /// What a commit records.
 #[derive(Serialize, Deserialize)]
 struct Payload {
@@ -166,6 +244,7 @@ struct Fields {
     pubkey: Field,
     created_at: Field,
     text: Field,
+    names: Field,
 }
 
 fn schema() -> Schema {
@@ -177,10 +256,10 @@ fn schema() -> Schema {
     let indexing = TextFieldIndexing::default()
         .set_tokenizer(ANALYZER)
         .set_index_option(IndexRecordOption::WithFreqs);
-    builder.add_text_field(
-        "text",
-        TextOptions::default().set_indexing_options(indexing),
-    );
+    let options = TextOptions::default().set_indexing_options(indexing);
+    builder.add_text_field("text", options.clone());
+    // Pre-tokenized, as prefixes.
+    builder.add_text_field("names", options);
     builder.build()
 }
 
@@ -250,6 +329,7 @@ impl SearchIndex {
             pubkey: field("pubkey"),
             created_at: field("created_at"),
             text: field("text"),
+            names: field("names"),
         };
         let reader = index
             .reader_builder()
@@ -292,7 +372,8 @@ impl SearchIndex {
             return None;
         }
         let text = text(view);
-        if text.is_empty() {
+        let names = names(view);
+        if text.is_empty() && names.is_empty() {
             return None;
         }
         let f = self.fields;
@@ -302,6 +383,9 @@ impl SearchIndex {
         doc.add_bytes(f.pubkey, view.pubkey());
         doc.add_u64(f.created_at, view.created_at().into());
         doc.add_text(f.text, text);
+        if !names.is_empty() {
+            doc.add_pre_tokenized_text(f.names, prefixes(&names));
+        }
         Some(doc)
     }
 
@@ -311,7 +395,11 @@ impl SearchIndex {
             .terms
             .iter()
             .map(|term| {
-                let term = Term::from_field_text(f.text, term);
+                let term = if search.autocomplete {
+                    Term::from_field_text(f.names, prefix(term))
+                } else {
+                    Term::from_field_text(f.text, term)
+                };
                 let query: Box<dyn Query> =
                     Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
                 (Occur::Must, query)
@@ -408,7 +496,13 @@ impl SearchIndex {
                 let Some(view) = store.load(txn, seq)? else {
                     continue;
                 };
-                if filter.matches_fields(&view) {
+                // Autocomplete terms may be longer than what's indexed.
+                let matches = if search.autocomplete {
+                    filter.matches(&view)
+                } else {
+                    filter.matches_fields(&view)
+                };
+                if matches {
                     hits.push((score, seq, view));
                 }
             }
@@ -758,11 +852,70 @@ mod tests {
         let (_db2, other) = open();
         let (index, _) = SearchIndex::open(dir.path(), vec![1], &other).unwrap();
         assert_eq!(index.reader.searcher().num_docs(), 0);
+        drop(index);
+
+        // So is one from an older version.
+        {
+            let (_, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+            let mut commit = indexer.writer.prepare_commit().unwrap();
+            commit.set_payload(r#"{"version":1,"next_seq":3}"#);
+            commit.commit().unwrap();
+        }
+        let (index, _) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+        assert_eq!(index.indexed.load(Ordering::Relaxed), 0);
         drop(db);
     }
 
-    /// Random events and `sort:new` searches, some indexed and some not,
-    /// checked against matching every event.
+    #[test]
+    fn autocompletes_names_and_titles() {
+        let mut f = fixture();
+        let profile = |seed, name: &str| {
+            let content = json!({"name": name, "about": "bitcoin maximalist"});
+            signed(seed, 100, 0, vec![], &content.to_string())
+        };
+        let ali = profile(1, "Ali");
+        let alice = profile(2, "Alice in Wonderland Fan Club");
+        let jack = profile(3, "Jack Dorsey");
+        let article = signed(
+            1,
+            100,
+            30023,
+            vec![vec!["d", "a"], vec!["title", "Alpine"]],
+            "x",
+        );
+        let note = signed(1, 100, 1, vec![], "alibi");
+        for event in [&ali, &alice, &jack, &article, &note] {
+            put(&f.store, event);
+        }
+        f.index_all();
+        let autocomplete = |text: &str| json!({"search": format!("{text} autocomplete:true")});
+        // The shorter name is the better match.
+        assert_eq!(
+            f.search(autocomplete("ali")),
+            [ali.id.as_str(), alice.id.as_str()]
+        );
+        assert_eq!(f.search(autocomplete("jac dor")), [jack.id.as_str()]);
+        assert_eq!(f.search(autocomplete("alp")), [article.id.as_str()]);
+        // Not bios, not notes, not the middle of a word.
+        assert!(f.search(autocomplete("bitc")).is_empty());
+        assert!(f.search(autocomplete("alib")).is_empty());
+        assert!(f.search(autocomplete("orsey")).is_empty());
+        // Ordinary search still finds the bio.
+        assert_eq!(f.search(json!({"search": "bitcoin"})).len(), 3);
+
+        // Past what's indexed, a term is still checked in full.
+        let long = profile(4, "Supercalifragilisticexpialidocious");
+        put(&f.store, &long);
+        f.index_all();
+        assert_eq!(
+            f.search(autocomplete("supercalifragilisticexpi")),
+            [long.id.as_str()]
+        );
+        assert!(f.search(autocomplete("supercalifragilisticky")).is_empty());
+    }
+
+    /// Random events and `sort:new` searches, plain and autocomplete, some
+    /// indexed and some not, checked against matching every event.
     #[test]
     fn agrees_with_brute_force() {
         use rand::rngs::StdRng;
@@ -771,7 +924,16 @@ mod tests {
         let mut f = fixture();
         let mut rng = StdRng::seed_from_u64(11);
         const KINDS: [u16; 3] = [1, 7, 30023];
-        let words = ["apple", "Banana", "cherry", "date", "élan"];
+        // Two that share their first MAX_PREFIX characters.
+        let words = [
+            "apple",
+            "Banana",
+            "cherry",
+            "date",
+            "élan",
+            "supercalifragilisticexpialidocious",
+            "supercalifragilisticky",
+        ];
         let mut all = Vec::new();
         for i in 0..300 {
             let content: Vec<&str> = (0..rng.random_range(0..5))
@@ -782,6 +944,10 @@ mod tests {
             let mut tags = vec![vec!["d", d.as_str()]];
             if rng.random_bool(0.3) {
                 tags.push(vec!["t", "x"]);
+            }
+            let title = words[rng.random_range(0..words.len())];
+            if rng.random_bool(0.5) {
+                tags.push(vec!["title", title]);
             }
             let event = signed(
                 rng.random_range(1..4),
@@ -801,13 +967,26 @@ mod tests {
             .collect();
 
         for _ in 0..200 {
-            let terms: Vec<&str> = (0..rng.random_range(1..3))
-                .map(|_| words[rng.random_range(0..words.len())])
+            let autocomplete = rng.random_bool(0.5);
+            let terms: Vec<String> = (0..rng.random_range(1..3))
+                .map(|_| {
+                    let word = words[rng.random_range(0..words.len())];
+                    if autocomplete {
+                        let len = rng.random_range(1..=word.chars().count());
+                        word.chars().take(len).collect()
+                    } else {
+                        word.to_string()
+                    }
+                })
                 .collect();
+            let extensions = match autocomplete {
+                true => "sort:new autocomplete:true",
+                false => "sort:new",
+            };
             let mut filter = serde_json::Map::new();
             filter.insert(
                 "search".into(),
-                json!(format!("{} sort:new", terms.join(" "))),
+                json!(format!("{} {extensions}", terms.join(" "))),
             );
             if rng.random_bool(0.3) {
                 filter.insert("authors".into(), json!(pubkeys[..rng.random_range(1..3)]));
