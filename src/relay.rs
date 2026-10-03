@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::config::Config;
 use crate::event::{Event, KindClass};
 use crate::filter::Filter;
-use crate::query;
+use crate::query::{self, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
@@ -96,7 +96,7 @@ async fn root(
 }
 
 fn nip11(config: &Config) -> Value {
-    let mut nips = vec![1, 11];
+    let mut nips = vec![1, 11, 45];
     if config.search {
         nips.push(50);
     }
@@ -219,6 +219,7 @@ impl Connection {
         match msg.first().and_then(Value::as_str) {
             Some("EVENT") => self.on_event(msg.get(1)).await,
             Some("REQ") => self.on_req(&msg[1..]).await,
+            Some("COUNT") => self.on_count(&msg[1..]).await,
             Some("CLOSE") => match msg.get(1).and_then(Value::as_str) {
                 Some(sub_id) => {
                     self.subs.remove(sub_id);
@@ -304,27 +305,10 @@ impl Connection {
             return self.closed(sub_id, "invalid: bad subscription id").await;
         }
 
-        let mut filters = match args[1..]
-            .iter()
-            .map(Filter::parse)
-            .collect::<Result<Vec<_>, _>>()
-        {
+        let filters = match self.filters(&args[1..]) {
             Ok(filters) => filters,
             Err(msg) => return self.closed(sub_id, &msg).await,
         };
-        if filters.len() > config.max_filters {
-            return self.closed(sub_id, "invalid: too many filters").await;
-        }
-        for filter in filters.iter_mut().filter(|f| f.search.is_some()) {
-            match &self.state.search {
-                Some(search) => search.restrict(filter),
-                None => {
-                    return self
-                        .closed(sub_id, "unsupported: search is not enabled")
-                        .await;
-                }
-            }
-        }
         if !self.subs.contains_key(sub_id) && self.subs.len() >= config.max_subscriptions {
             return self.closed(sub_id, "error: too many subscriptions").await;
         }
@@ -370,6 +354,65 @@ impl Connection {
             self.send_event(sub_id, json).await?;
         }
         self.send(&("EOSE", sub_id)).await
+    }
+
+    /// A REQ's or COUNT's filters, or why they're refused.
+    fn filters(&self, args: &[Value]) -> Result<Vec<Filter>, String> {
+        let indexed = &self.state.store.indexed_tags;
+        let mut filters = args
+            .iter()
+            .map(|value| Filter::parse(value, indexed))
+            .collect::<Result<Vec<_>, _>>()?;
+        if filters.len() > self.state.config.max_filters {
+            return Err("invalid: too many filters".into());
+        }
+        for filter in filters.iter_mut().filter(|f| f.search.is_some()) {
+            match &self.state.search {
+                Some(search) => search.restrict(filter),
+                None => return Err("unsupported: search is not enabled".into()),
+            }
+        }
+        Ok(filters)
+    }
+
+    /// NIP-45: `["COUNT", id, filters...]`.
+    async fn on_count(&mut self, args: &[Value]) -> Result<(), Disconnect> {
+        let Some(id) = args.first().and_then(Value::as_str) else {
+            return self.notice("invalid: COUNT requires a query id").await;
+        };
+        if id.is_empty() || id.len() > self.state.config.max_subid_length {
+            return self.closed(id, "invalid: bad query id").await;
+        }
+        let filters = match self.filters(&args[1..]) {
+            Ok(filters) => filters,
+            Err(msg) => return self.closed(id, &msg).await,
+        };
+
+        let store = self.state.store.clone();
+        let search = self.state.search.clone();
+        let result =
+            tokio::task::spawn_blocking(move || query::count(&store, search.as_deref(), &filters))
+                .await;
+        match result {
+            Ok(Ok(count)) => {
+                let mut body = json!({"count": count.count});
+                if let Some(registers) = count.hll {
+                    body["hll"] = hex::encode(registers).into();
+                }
+                self.send(&("COUNT", id, body)).await
+            }
+            Ok(Err(err)) if err.is::<TooExpensive>() => {
+                self.closed(id, "unsupported: too expensive to count").await
+            }
+            Ok(Err(err)) => {
+                tracing::error!("count failed: {err:#}");
+                self.closed(id, "error: count failed").await
+            }
+            Err(err) => {
+                tracing::error!("count task panicked: {err}");
+                self.closed(id, "error: count failed").await
+            }
+        }
     }
 
     async fn on_live_event(&self, ev: &LiveEvent) -> Result<(), Disconnect> {

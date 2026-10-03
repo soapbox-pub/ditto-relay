@@ -13,14 +13,24 @@
 //! A filter with a NIP-50 search goes to the [search index](crate::search)
 //! instead, unless it lists ids or its search only excludes words. Those
 //! are planned like any other, and checked by hand.
+//!
+//! A NIP-45 count needs no events when the plan is exact: with no time
+//! bounds, and keys no event is filed under twice, it's the sum of LMDB's
+//! counts of the keys; otherwise the stamps between the bounds are walked,
+//! a page at a time. Only filters no index pins down load events, and only
+//! so many; past that, the relay declines.
 
 use std::collections::{BinaryHeap, HashSet};
 
 use crate::filter::Filter;
+use crate::hll::{self, Registers};
 use crate::lmdb::{Cursor, Db, Result, Txn};
 use crate::record::EventView;
 use crate::search::SearchIndex;
-use crate::store::{CREATED, MAX_SEQ, Stamp, Store, stamp, stamp_created_at, stamp_seq};
+use crate::store::{
+    CREATED, MAX_SEQ, Stamp, Store, each_stamp, stamp, stamp_created_at, stamp_seq, tag_key,
+    tag_key_kind,
+};
 
 /// The most author × kind keys a filter may be planned over together.
 const MAX_AUTHOR_KINDS: usize = 1024;
@@ -28,7 +38,10 @@ const MAX_AUTHOR_KINDS: usize = 1024;
 /// The most records one filter may examine. Only filters whose fields the
 /// index can't pin down examine records that don't match, and this bounds
 /// how long one of those can hold a reader.
-const MAX_EXAMINED: usize = 100_000;
+pub const MAX_EXAMINED: usize = 100_000;
+
+/// The most stamps a count may walk.
+const MAX_WALKED: usize = 2_000_000;
 
 /// The most extra events read past the limit to order a tie at the boundary.
 const MAX_TIES: usize = 1000;
@@ -114,6 +127,8 @@ struct Plan {
     keys: Vec<Vec<u8>>,
     /// Whether every entry found matches the filter, time aside.
     exact: bool,
+    /// Whether no event is filed under two of the keys.
+    disjoint: bool,
 }
 
 fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
@@ -137,6 +152,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             db: t.author_kinds,
             keys,
             exact: no_tags,
+            disjoint: true,
         });
     }
     if let Some(authors) = &filter.authors {
@@ -145,21 +161,37 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             db: t.authors,
             keys,
             exact: filter.kinds.is_none() && no_tags,
+            disjoint: true,
         });
     }
-    for (letter, values) in &filter.tags {
-        let keys = values
-            .iter()
-            .map(|v| [&[*letter][..], v].concat())
-            .collect();
-        let exact = filter.authors.is_none()
-            && filter.kinds.is_none()
-            && filter.tags.len() == 1
-            && filter.search.is_none();
+    for (name, values) in &filter.tags {
+        // The keys of the kinds each value is filed under, as wanted.
+        let mut keys = Vec::new();
+        let mut cursor = txn.cursor(t.tags)?;
+        for value in values {
+            let prefix = tag_key(name, value, None);
+            let mut entry = cursor.set_range(&prefix)?;
+            while let Some((key, _)) = entry
+                && key.starts_with(&prefix)
+            {
+                let kind = tag_key_kind(key);
+                if filter
+                    .kinds
+                    .as_ref()
+                    .is_none_or(|kinds| kinds.binary_search(&kind).is_ok())
+                {
+                    keys.push(key.to_vec());
+                }
+                entry = cursor.next_nodup()?;
+            }
+        }
+        let exact = filter.authors.is_none() && filter.tags.len() == 1 && filter.search.is_none();
         candidates.push(Plan {
             db: t.tags,
             keys,
             exact,
+            // One value's keys are each for another kind.
+            disjoint: values.len() == 1,
         });
     }
     if let Some(kinds) = &filter.kinds {
@@ -168,6 +200,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             db: t.kinds,
             keys,
             exact: filter.authors.is_none() && no_tags,
+            disjoint: true,
         });
     }
 
@@ -185,6 +218,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             db: t.created,
             keys: vec![CREATED.to_vec()],
             exact: filter.search.is_none(),
+            disjoint: true,
         },
         |(_, plan)| plan,
     ))
@@ -291,18 +325,217 @@ fn scan<'t>(
     Ok(())
 }
 
+/// What a NIP-45 count found.
+#[derive(Debug, PartialEq)]
+pub struct Count {
+    pub count: u64,
+    /// For a single filter with a tag, a sketch of the events' authors.
+    pub hll: Option<Registers>,
+}
+
+/// A count that would examine more than the relay allows.
+#[derive(Debug)]
+pub struct TooExpensive;
+
+impl std::fmt::Display for TooExpensive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("too expensive to count")
+    }
+}
+
+impl std::error::Error for TooExpensive {}
+
+/// Count the events matching any of a COUNT's filters. Fails with
+/// [`TooExpensive`] when that's too much work.
+pub fn count(
+    store: &Store,
+    search: Option<&SearchIndex>,
+    filters: &[Filter],
+) -> anyhow::Result<Count> {
+    let txn = store.read()?;
+    let [filter] = filters else {
+        // Events matching two filters count once.
+        let mut seqs = HashSet::new();
+        for filter in filters.iter().filter(|f| !f.never) {
+            collect(store, &txn, search, filter, &mut seqs)?;
+        }
+        return Ok(Count {
+            count: seqs.len() as u64,
+            hll: None,
+        });
+    };
+
+    if filter.never {
+        return Ok(Count {
+            count: 0,
+            hll: filter.first_tag.as_ref().map(|_| [0; hll::REGISTERS]),
+        });
+    }
+    let indexed = filter.ids.is_none()
+        && filter
+            .search
+            .as_ref()
+            .is_none_or(|search| search.terms.is_empty());
+    let plan = match indexed {
+        true => Some(plan(store, &txn, filter)?),
+        false => None,
+    };
+    let Some(plan) = plan.filter(|plan| plan.exact) else {
+        let mut seqs = HashSet::new();
+        collect(store, &txn, search, filter, &mut seqs)?;
+        let hll = match &filter.first_tag {
+            Some(value) => Some(sketch(store, &txn, value, &seqs)?),
+            None => None,
+        };
+        return Ok(Count {
+            count: seqs.len() as u64,
+            hll,
+        });
+    };
+
+    let unbounded = filter.since == 0 && filter.until == u32::MAX;
+    let count = if plan.disjoint && unbounded {
+        let mut cursor = txn.cursor(plan.db)?;
+        let mut total = 0;
+        for key in &plan.keys {
+            if cursor.set(key)?.is_some() {
+                total += cursor.count()? as u64;
+            }
+        }
+        total
+    } else if plan.disjoint {
+        let mut total = 0;
+        walk(&txn, filter, &plan, |_| total += 1)?;
+        total
+    } else {
+        let mut seqs = HashSet::new();
+        walk(&txn, filter, &plan, |seq| {
+            seqs.insert(seq);
+        })?;
+        seqs.len() as u64
+    };
+
+    let hll = match &filter.first_tag {
+        None => None,
+        // Just the one tag value: its keys' sketches, kept or made.
+        Some(_) if plan.db == store.tables.tags && plan.disjoint && unbounded => {
+            let mut registers = [0; hll::REGISTERS];
+            for key in &plan.keys {
+                hll::merge(&mut registers, &store.key_sketch(&txn, key)?);
+            }
+            Some(registers)
+        }
+        Some(value) if count as usize <= MAX_EXAMINED => {
+            let mut seqs = HashSet::new();
+            walk(&txn, filter, &plan, |seq| {
+                seqs.insert(seq);
+            })?;
+            Some(sketch(store, &txn, value, &seqs)?)
+        }
+        Some(_) => None,
+    };
+    Ok(Count { count, hll })
+}
+
+/// Call `f` with the sequence number of each stamp of a plan's keys within
+/// the filter's time bounds, up to [`MAX_WALKED`] of them.
+fn walk(txn: &Txn, filter: &Filter, plan: &Plan, mut f: impl FnMut(u64)) -> anyhow::Result<()> {
+    let mut walked = 0;
+    for key in &plan.keys {
+        each_stamp(txn, plan.db, key, filter.since, filter.until, |stamp| {
+            walked += 1;
+            f(stamp_seq(stamp));
+            walked <= MAX_WALKED
+        })?;
+        if walked > MAX_WALKED {
+            return Err(TooExpensive.into());
+        }
+    }
+    Ok(())
+}
+
+/// Add the sequence numbers of the events matching a filter to `out`.
+fn collect(
+    store: &Store,
+    txn: &Txn,
+    search: Option<&SearchIndex>,
+    filter: &Filter,
+    out: &mut HashSet<u64>,
+) -> anyhow::Result<()> {
+    if let Some(ids) = &filter.ids {
+        for id in ids {
+            if let Some(seq) = store.seq_of(txn, id)?
+                && store
+                    .load(txn, seq)?
+                    .is_some_and(|view| filter.matches(&view))
+            {
+                out.insert(seq);
+            }
+        }
+        return Ok(());
+    }
+    if let Some(query) = filter.search.as_ref().filter(|s| !s.terms.is_empty()) {
+        return match search {
+            Some(search) => search.collect(store, txn, filter, query, out),
+            None => Ok(()),
+        };
+    }
+    let plan = plan(store, txn, filter)?;
+    if plan.exact {
+        return walk(txn, filter, &plan, |seq| {
+            out.insert(seq);
+        });
+    }
+    let mut seqs = Vec::new();
+    walk(txn, filter, &plan, |seq| {
+        if !out.contains(&seq) {
+            seqs.push(seq);
+        }
+    })?;
+    seqs.sort_unstable();
+    seqs.dedup();
+    if seqs.len() > MAX_EXAMINED {
+        return Err(TooExpensive.into());
+    }
+    for seq in seqs {
+        if store
+            .load(txn, seq)?
+            .is_some_and(|view| filter.matches(&view))
+        {
+            out.insert(seq);
+        }
+    }
+    Ok(())
+}
+
+/// Sketch the authors of some events, for a filter whose first tag value
+/// is `value`.
+fn sketch(store: &Store, txn: &Txn, value: &str, seqs: &HashSet<u64>) -> Result<Registers> {
+    let offset = hll::offset(value);
+    let mut registers = [0; hll::REGISTERS];
+    for &seq in seqs {
+        if let Some(view) = store.load(txn, seq)? {
+            hll::add(&mut registers, offset, view.pubkey());
+        }
+    }
+    Ok(registers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::Event;
     use crate::event::tests::signed;
-    use crate::store::tests::{open, put};
+    use crate::store::tests::{open, put, test_tags};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
     use serde_json::{Value, json};
 
     fn ids(store: &Store, filters: &[Value], max_limit: u64) -> Vec<String> {
-        let filters: Vec<Filter> = filters.iter().map(|f| Filter::parse(f).unwrap()).collect();
+        let filters: Vec<Filter> = filters
+            .iter()
+            .map(|f| Filter::parse(f, &test_tags()).unwrap())
+            .collect();
         let results = run(store, None, &filters, max_limit, max_limit).unwrap();
         results
             .events
@@ -324,13 +557,26 @@ mod tests {
         let alice = signed(1, 0, 1, vec![], "").pubkey;
 
         let txn = store.read().unwrap();
-        let plan_for =
-            |filter: Value| plan(&store, &txn, &Filter::parse(&filter).unwrap()).unwrap();
+        let plan_for = |filter: Value| {
+            plan(&store, &txn, &Filter::parse(&filter, &test_tags()).unwrap()).unwrap()
+        };
 
         // The rare tag beats the author with twenty events, and needs checking.
         let p = plan_for(json!({"authors": [alice], "#t": ["rare"]}));
-        assert_eq!(p.keys, vec![[&b"t"[..], &[0], b"rare"].concat()]);
+        assert_eq!(p.keys, [tag_key("t", b"\0rare", Some(1))]);
         assert!(!p.exact);
+        // A tag is keyed by kind, so with kinds or without, it's exact.
+        let p = plan_for(json!({"#t": ["common"], "kinds": [1, 7]}));
+        assert_eq!(p.keys, [tag_key("t", b"\0common", Some(1))]);
+        assert!(p.exact && p.disjoint);
+        let p = plan_for(json!({"#t": ["rare", "common"]}));
+        assert_eq!(p.keys.len(), 2);
+        assert!(p.exact && !p.disjoint);
+        assert!(
+            plan_for(json!({"#t": ["common"], "kinds": [7]}))
+                .keys
+                .is_empty()
+        );
         // Author and kind together, exactly.
         let p = plan_for(json!({"authors": [alice], "kinds": [1]}));
         assert_eq!(p.keys[0].len(), 34);
@@ -392,6 +638,9 @@ mod tests {
             for _ in 0..rng.random_range(0..3) {
                 tags.push(vec!["t", topics[rng.random_range(0..4)]]);
             }
+            if rng.random_bool(0.3) {
+                tags.push(vec!["title", topics[rng.random_range(0..4)]]);
+            }
             let event = signed(seed, rng.random_range(100..160), kind, tags, &i.to_string());
             put(&store, &event);
             all.push(event);
@@ -400,7 +649,7 @@ mod tests {
             .map(|seed| signed(seed, 0, 1, vec![], "").pubkey)
             .collect();
 
-        for _ in 0..300 {
+        let random_filter = |rng: &mut StdRng| {
             let mut filter = serde_json::Map::new();
             if rng.random_bool(0.5) {
                 filter.insert("authors".into(), json!(pubkeys[..rng.random_range(1..3)]));
@@ -412,6 +661,9 @@ mod tests {
             if rng.random_bool(0.5) {
                 filter.insert("#t".into(), json!(topics[..rng.random_range(1..4)]));
             }
+            if rng.random_bool(0.2) {
+                filter.insert("#title".into(), json!([topics[rng.random_range(0..4)]]));
+            }
             if rng.random_bool(0.3) {
                 filter.insert("since".into(), json!(rng.random_range(100..160)));
             }
@@ -420,16 +672,50 @@ mod tests {
             }
             let limit = rng.random_range(1..40);
             filter.insert("limit".into(), json!(limit));
-            let filter = Value::Object(filter);
-
-            let parsed = Filter::parse(&filter).unwrap();
-            let mut expected: Vec<&Event> = all
-                .iter()
+            (Value::Object(filter), limit)
+        };
+        let matching = |filter: &Value| -> Vec<&Event> {
+            let parsed = Filter::parse(filter, &test_tags()).unwrap();
+            all.iter()
                 .filter(|e| {
                     let record = crate::record::encode(e);
                     parsed.matches(&EventView::new(&record).unwrap())
                 })
+                .collect()
+        };
+
+        for _ in 0..300 {
+            let (filter, limit) = random_filter(&mut rng);
+            let mut expected = matching(&filter);
+
+            // Counted, with every match's author sketched.
+            let parsed = Filter::parse(&filter, &test_tags()).unwrap();
+            let counted = count(&store, None, std::slice::from_ref(&parsed)).unwrap();
+            let hll = parsed.first_tag.as_ref().map(|value| {
+                let mut registers = [0; hll::REGISTERS];
+                for event in &expected {
+                    let pubkey = hex::decode(&event.pubkey).unwrap().try_into().unwrap();
+                    hll::add(&mut registers, hll::offset(value), &pubkey);
+                }
+                registers
+            });
+            let want = Count {
+                count: expected.len() as u64,
+                hll,
+            };
+            assert_eq!(counted, want, "{filter}");
+
+            // Two filters count their union.
+            let (other, _) = random_filter(&mut rng);
+            let union: HashSet<&str> = expected
+                .iter()
+                .chain(&matching(&other))
+                .map(|e| e.id.as_str())
                 .collect();
+            let filters = [parsed, Filter::parse(&other, &test_tags()).unwrap()];
+            let counted = count(&store, None, &filters).unwrap();
+            assert_eq!(counted.count, union.len() as u64, "{filter} {other}");
+
             expected.sort_by(|a, b| {
                 b.created_at
                     .cmp(&a.created_at)
@@ -442,6 +728,75 @@ mod tests {
                 "{filter}"
             );
         }
+    }
+
+    fn count_of(store: &Store, filter: Value) -> Count {
+        count(
+            store,
+            None,
+            &[Filter::parse(&filter, &test_tags()).unwrap()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn counts_followers_as_they_come_and_go() {
+        let (_dir, store) = open();
+        let alice = signed(9, 0, 1, vec![], "").pubkey;
+        let bob = signed(8, 0, 1, vec![], "").pubkey;
+        for seed in 1..=3 {
+            put(
+                &store,
+                &signed(seed, 100, 3, vec![vec!["p", &alice], vec!["p", &bob]], ""),
+            );
+        }
+        // A mention isn't a follow.
+        put(&store, &signed(4, 100, 1, vec![vec!["p", &alice]], ""));
+        let followers = json!({"#p": [alice], "kinds": [3]});
+        assert_eq!(count_of(&store, followers.clone()).count, 3);
+        assert_eq!(count_of(&store, json!({"#p": [alice]})).count, 4);
+        assert_eq!(count_of(&store, json!({"#p": [alice, bob]})).count, 4);
+
+        // Unfollowing replaces the list.
+        put(&store, &signed(1, 200, 3, vec![vec!["p", &bob]], ""));
+        assert_eq!(count_of(&store, followers.clone()).count, 2);
+        assert_eq!(
+            count_of(&store, json!({"#p": [bob], "kinds": [3]})).count,
+            3
+        );
+        let recent = json!({"#p": [bob], "kinds": [3], "since": 150});
+        assert_eq!(count_of(&store, recent).count, 1);
+        assert_eq!(count_of(&store, json!({"kinds": [3]})).count, 3);
+        assert_eq!(count_of(&store, json!({})).count, 4);
+    }
+
+    #[test]
+    fn sketches_with_kept_registers() {
+        let (_dir, store) = open();
+        let target = "ab".repeat(32);
+        let mut sketch = [0; hll::REGISTERS];
+        let n = crate::store::HLL_THRESHOLD as u32 + 50;
+        for i in 0..n {
+            let mut secret = [2; 32];
+            secret[28..].copy_from_slice(&i.to_be_bytes());
+            let kind = if i % 2 == 0 { 7 } else { 6 };
+            let tags = vec![vec!["e".to_string(), target.clone()]];
+            let event = crate::event::tests::sign(secret, 100, kind, tags, "+");
+            put(&store, &event);
+            if kind == 7 {
+                let pubkey = hex::decode(&event.pubkey).unwrap().try_into().unwrap();
+                hll::add(&mut sketch, hll::offset(&target), &pubkey);
+            }
+        }
+        // Kind 7's key is past the threshold, kind 6's isn't: one kept, one
+        // made, merged.
+        let both = count_of(&store, json!({"#e": [target], "kinds": [6, 7]}));
+        assert_eq!(both.count, u64::from(n));
+        let reactions = count_of(&store, json!({"#e": [target], "kinds": [7]}));
+        assert_eq!(reactions.count, u64::from(n.div_ceil(2)));
+        assert_eq!(reactions.hll, Some(sketch));
+        let estimate = hll::estimate(&both.hll.unwrap());
+        assert!((900.0..1200.0).contains(&estimate), "{estimate}");
     }
 
     #[test]

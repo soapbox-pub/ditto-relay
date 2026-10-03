@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::event::is_hex64;
 use crate::record::{Element, EventView, tag_value};
 use crate::search;
-use crate::store::MAX_INDEXED_TAG;
+use crate::store::{IndexedTags, MAX_INDEXED_TAG};
 
 /// The most values one field of a filter may list. Generous enough for a
 /// big follow list.
@@ -22,8 +22,11 @@ pub struct Filter {
     pub ids: Option<Vec<[u8; 32]>>,
     pub authors: Option<Vec<[u8; 32]>>,
     pub kinds: Option<Vec<u16>>,
-    /// By letter, each with its values in [`tag_value`] form. Sorted.
-    pub tags: Vec<(u8, Vec<Vec<u8>>)>,
+    /// By name, each with its values in [`tag_value`] form. Sorted.
+    pub tags: Vec<(String, Vec<Vec<u8>>)>,
+    /// The first value of the first tag field, in the order the client
+    /// sent them, from which NIP-45 derives a HyperLogLog's offset.
+    pub first_tag: Option<String>,
     pub since: u32,
     pub until: u32,
     pub limit: Option<u64>,
@@ -50,9 +53,11 @@ pub struct Search {
 }
 
 impl Filter {
-    /// Parse a filter. Errors are NIP-01 machine-readable messages. Fields
-    /// neither NIP-01 nor NIP-50 defines are ignored.
-    pub fn parse(value: &Value) -> Result<Filter, String> {
+    /// Parse a filter. Errors are NIP-01 machine-readable messages. A tag
+    /// that isn't indexed is refused, so a client isn't left thinking it
+    /// filtered by it; other fields neither NIP-01 nor NIP-50 defines are
+    /// ignored.
+    pub fn parse(value: &Value, indexed: &IndexedTags) -> Result<Filter, String> {
         let Value::Object(fields) = value else {
             return Err("invalid: a filter must be an object".into());
         };
@@ -91,19 +96,22 @@ impl Filter {
                     )
                 }
                 _ => {
-                    let &[b'#', letter] = name.as_bytes() else {
+                    let Some(tag) = name.strip_prefix('#') else {
                         continue;
                     };
-                    if !letter.is_ascii_alphabetic() {
-                        continue;
+                    if !indexed.contains(tag) {
+                        return Err(format!("unsupported: {name} is not indexed"));
                     }
                     let values = list(name, value)?.iter().map(|value| {
                         value
                             .as_str()
                             .ok_or_else(|| format!("invalid: {name} must be strings"))
                     });
+                    let values = values.collect::<Result<Vec<_>, _>>()?;
+                    if filter.first_tag.is_none() && filter.tags.is_empty() {
+                        filter.first_tag = values.first().map(|v| v.to_string());
+                    }
                     let mut values: Vec<Vec<u8>> = values
-                        .collect::<Result<Vec<_>, _>>()?
                         .into_iter()
                         .map(tag_value)
                         // Too long to be indexed, so nothing stored has it.
@@ -111,12 +119,12 @@ impl Filter {
                         .collect();
                     values.sort_unstable();
                     values.dedup();
-                    filter.tags.push((letter, values));
+                    filter.tags.push((tag.to_string(), values));
                 }
             }
         }
 
-        filter.tags.sort_unstable_by_key(|(letter, _)| *letter);
+        filter.tags.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         filter.never = filter.ids.as_ref().is_some_and(Vec::is_empty)
             || filter.authors.as_ref().is_some_and(Vec::is_empty)
             || filter.kinds.as_ref().is_some_and(Vec::is_empty)
@@ -162,9 +170,9 @@ impl Filter {
         {
             return false;
         }
-        self.tags.iter().all(|(letter, values)| {
-            event.indexed_tags().any(|(name, value)| {
-                name == *letter && values.binary_search_by(|v| compare(v, &value)).is_ok()
+        self.tags.iter().all(|(name, values)| {
+            event.tag_values().any(|(n, value)| {
+                n == name && values.binary_search_by(|v| compare(v, &value)).is_ok()
             })
         })
     }
@@ -292,11 +300,16 @@ mod tests {
     use crate::event::Event;
     use crate::event::tests::signed;
     use crate::record::encode;
+    use crate::store::tests::test_tags;
     use serde_json::json;
+
+    fn parse(filter: &Value) -> Result<Filter, String> {
+        Filter::parse(filter, &test_tags())
+    }
 
     fn matches(filter: Value, event: &Event) -> bool {
         let record = encode(event);
-        Filter::parse(&filter)
+        parse(&filter)
             .unwrap()
             .matches(&EventView::new(&record).unwrap())
     }
@@ -331,8 +344,9 @@ mod tests {
         assert!(matches(json!({"since": 100, "until": 100}), &event));
         assert!(!matches(json!({"since": 101}), &event));
         assert!(!matches(json!({"until": 99}), &event));
-        // Only single-letter tags are filters; anything else is ignored.
-        assert!(matches(json!({"#title": ["y"], "foo": "z"}), &event));
+        // Longer tag names that are indexed match like letters.
+        assert!(matches(json!({"#title": ["x"], "foo": "z"}), &event));
+        assert!(!matches(json!({"#title": ["y"]}), &event));
     }
 
     #[test]
@@ -373,7 +387,7 @@ mod tests {
 
     #[test]
     fn parses_search_extensions() {
-        let search = |text: &str| Filter::parse(&json!({"search": text})).unwrap().search;
+        let search = |text: &str| parse(&json!({"search": text})).unwrap().search;
         let parsed = search("Nostr sort:new include:spam https://x.com nostr").unwrap();
         assert_eq!(parsed.terms, ["com", "https", "nostr", "x"]);
         assert!(parsed.sort_new);
@@ -395,9 +409,17 @@ mod tests {
         // Only extensions, or only punctuation: no search.
         assert!(search("sort:new language:en").is_none());
         assert!(search("  !! ").is_none());
-        assert!(Filter::parse(&json!({"search": 1})).is_err());
+        assert!(parse(&json!({"search": 1})).is_err());
         let many: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
-        assert!(Filter::parse(&json!({"search": many.join(" ")})).is_err());
+        assert!(parse(&json!({"search": many.join(" ")})).is_err());
+    }
+
+    #[test]
+    fn remembers_the_first_tag_as_sent() {
+        let filter: Value = serde_json::from_str(r##"{"#p": ["b", "a"], "#e": ["c"]}"##).unwrap();
+        assert_eq!(parse(&filter).unwrap().first_tag.as_deref(), Some("b"));
+        assert!(parse(&json!({"kinds": [1]})).unwrap().first_tag.is_none());
+        assert!(parse(&json!({"#t": []})).unwrap().first_tag.is_none());
     }
 
     #[test]
@@ -409,7 +431,7 @@ mod tests {
             json!({"#t": []}),
             json!({"since": 5, "until": 4}),
         ] {
-            assert!(Filter::parse(&filter).unwrap().never, "{filter}");
+            assert!(parse(&filter).unwrap().never, "{filter}");
             assert!(!matches(filter, &event));
         }
     }
@@ -423,9 +445,18 @@ mod tests {
             json!({"limit": -1}),
             json!({"#t": [1]}),
         ] {
-            assert!(Filter::parse(&filter).is_err(), "{filter}");
+            assert!(parse(&filter).is_err(), "{filter}");
         }
-        let filter = Filter::parse(&json!({"since": -5, "until": 1u64 << 40})).unwrap();
+        // Tags that aren't indexed are refused, not ignored.
+        for filter in [
+            json!({"#alt": ["x"]}),
+            json!({"#1": ["x"]}),
+            json!({"#": []}),
+        ] {
+            let err = parse(&filter).unwrap_err();
+            assert!(err.starts_with("unsupported:"), "{err}");
+        }
+        let filter = parse(&json!({"since": -5, "until": 1u64 << 40})).unwrap();
         assert_eq!((filter.since, filter.until), (0, u32::MAX));
     }
 }

@@ -117,7 +117,7 @@ impl DbFlags {
 }
 
 /// A table within an [`Env`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Db(ffi::MDB_dbi);
 
 pub struct Env {
@@ -372,6 +372,28 @@ impl<'t> Cursor<'t> {
         self.op(None, None, ffi::MDB_PREV_DUP)
     }
 
+    /// The first entry of the next key.
+    pub fn next_nodup(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_NEXT_NODUP)
+    }
+
+    /// In a `DUP_FIXED` table, the whole page of values the cursor is on,
+    /// packed — from the page's start, which may be before the cursor —
+    /// leaving the cursor on its last. Empty when the key has only the one
+    /// value, which LMDB keeps outside any page: it's the one the cursor is
+    /// on.
+    pub fn get_multiple(&mut self) -> Result<&'t [u8]> {
+        Ok(self
+            .op(None, None, ffi::MDB_GET_MULTIPLE)?
+            .map_or(&[][..], |(_, v)| v))
+    }
+
+    /// The next page of the current key's values, as
+    /// [`get_multiple`](Self::get_multiple) returns them.
+    pub fn next_multiple(&mut self) -> Result<Option<&'t [u8]>> {
+        Ok(self.op(None, None, ffi::MDB_NEXT_MULTIPLE)?.map(|(_, v)| v))
+    }
+
     /// How many values the current key has.
     pub fn count(&mut self) -> Result<usize> {
         let mut count = 0;
@@ -458,6 +480,51 @@ mod tests {
         assert_eq!(cursor.last_dup().unwrap().unwrap().1, 30u16.to_be_bytes());
         assert!(cursor.set(b"x").unwrap().is_none());
         assert_eq!(txn.len(db).unwrap(), 4);
+    }
+
+    #[test]
+    fn reads_duplicates_a_page_at_a_time() {
+        let (_dir, env) = open();
+        let db = env.create_db("pages", DbFlags::DUP_FIXED).unwrap();
+        let mut txn = env.write_txn().unwrap();
+        for n in 0..3000u32 {
+            txn.put_dup(db, b"k", &n.to_be_bytes()).unwrap();
+        }
+        txn.put_dup(db, b"m", &7u32.to_be_bytes()).unwrap();
+        txn.put_dup(db, b"n", &8u32.to_be_bytes()).unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        let mut cursor = txn.cursor(db).unwrap();
+        cursor
+            .get_both_range(b"k", &1500u32.to_be_bytes())
+            .unwrap()
+            .unwrap();
+        // The first page starts before the cursor; together they're all.
+        let mut values = Vec::new();
+        let mut page = Some(cursor.get_multiple().unwrap());
+        let mut pages = 0;
+        while let Some(bytes) = page {
+            pages += 1;
+            values.extend(
+                bytes
+                    .chunks(4)
+                    .map(|c| u32::from_be_bytes(c.try_into().unwrap())),
+            );
+            page = cursor.next_multiple().unwrap();
+        }
+        assert!(pages > 1);
+        assert!(values[0] <= 1500);
+        assert_eq!(values.last(), Some(&2999));
+        assert!(values.windows(2).all(|w| w[1] == w[0] + 1));
+
+        // A lone value is on no page.
+        let (key, _) = cursor.next_nodup().unwrap().unwrap();
+        assert_eq!(key, b"m");
+        assert!(cursor.get_multiple().unwrap().is_empty());
+        assert!(cursor.next_multiple().unwrap().is_none());
+        assert_eq!(cursor.next_nodup().unwrap().unwrap().0, b"n");
+        assert!(cursor.next_nodup().unwrap().is_none());
     }
 
     #[test]

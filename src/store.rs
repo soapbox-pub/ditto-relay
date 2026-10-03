@@ -17,7 +17,8 @@
 //! | `kinds`         | kind (u16 BE)                | stamps                 |
 //! | `authors`       | pubkey                       | stamps                 |
 //! | `author_kinds`  | pubkey ‖ kind                | stamps                 |
-//! | `tags`          | letter ‖ value               | stamps                 |
+//! | `tags`          | tag key (below)              | stamps                 |
+//! | `hll`           | tag key                      | HLL registers          |
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `meta`          | name                         | value                  |
 //!
@@ -29,6 +30,16 @@
 //! Tag values are indexed in [`record::tag_value`] form; an *address* is
 //! pubkey ‖ kind ‖ the `d` tag in that form (always empty for replaceable
 //! kinds).
+//!
+//! A tag key is name length ‖ name ‖ value length ‖ value ‖ kind, so a tag
+//! is counted per kind — followers, reactions — by LMDB for free, and all
+//! of one value's kinds sit together. Every single-letter tag is indexed,
+//! and the longer names [`IndexedTags`] lists.
+//!
+//! Each tag key with at least [`HLL_THRESHOLD`] events has a NIP-45
+//! [HyperLogLog](crate::hll) sketch of their authors in `hll`, kept up as
+//! events arrive; smaller ones are sketched when asked. Sketches can't
+//! forget, so one counts authors whose events have since gone too.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -38,6 +49,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::event::KindClass;
+use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn};
 use crate::record::{Element, EventView};
 
@@ -51,8 +63,14 @@ pub type Stamp = [u8; STAMP_LEN];
 pub const MAX_SEQ: u64 = (1 << 48) - 1;
 
 /// Tag values longer than this, encoded, aren't indexed: LMDB keys top out
-/// at 511 bytes, and nobody filters by an essay.
-pub const MAX_INDEXED_TAG: usize = 256;
+/// at 511 bytes, and nobody filters by an essay. Its length is a byte.
+pub const MAX_INDEXED_TAG: usize = 255;
+
+/// The longest tag name that may be indexed.
+pub const MAX_TAG_NAME: usize = 64;
+
+/// How many events a tag key has before its HyperLogLog is kept.
+pub const HLL_THRESHOLD: usize = 1000;
 
 /// Longer `d` tags are hashed in addresses, to fit in a key.
 const MAX_ADDRESS_D: usize = 256;
@@ -81,6 +99,69 @@ pub fn stamp_seq(stamp: &[u8]) -> u64 {
     let mut seq = [0; 8];
     seq[2..].copy_from_slice(&stamp[4..STAMP_LEN]);
     u64::from_be_bytes(seq)
+}
+
+/// A key of the `tags` table, for a value in [`record::tag_value`] form no
+/// longer than [`MAX_INDEXED_TAG`]. Without a kind, the prefix every kind's
+/// key for the value starts with.
+pub fn tag_key(name: &str, value: &[u8], kind: Option<u16>) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + name.len() + value.len() + 2);
+    key.push(name.len() as u8);
+    key.extend_from_slice(name.as_bytes());
+    key.push(value.len() as u8);
+    key.extend_from_slice(value);
+    if let Some(kind) = kind {
+        key.extend_from_slice(&kind.to_be_bytes());
+    }
+    key
+}
+
+/// The kind a tag key is for.
+pub fn tag_key_kind(key: &[u8]) -> u16 {
+    u16::from_be_bytes(key[key.len() - 2..].try_into().unwrap())
+}
+
+/// The value of a tag key, as the text it was in the event.
+fn tag_key_value(key: &[u8]) -> String {
+    let name_len = usize::from(key[0]);
+    let value = &key[name_len + 2..key.len() - 2];
+    match value.split_first() {
+        Some((1, bytes)) => hex::encode(bytes),
+        Some((_, text)) => String::from_utf8_lossy(text).into_owned(),
+        None => String::new(),
+    }
+}
+
+/// Which tags are indexed, and so can be filtered by: every single letter,
+/// and the longer names configured.
+#[derive(Debug, Clone, Default)]
+pub struct IndexedTags {
+    /// Sorted.
+    names: Vec<String>,
+}
+
+impl IndexedTags {
+    pub fn new(names: impl IntoIterator<Item = String>) -> anyhow::Result<IndexedTags> {
+        let mut names: Vec<String> = names.into_iter().collect();
+        for name in &names {
+            if name.len() < 2 || name.len() > MAX_TAG_NAME {
+                bail!("Tag names to index must be 2 to {MAX_TAG_NAME} bytes, not {name:?}");
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        Ok(IndexedTags { names })
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        match name.as_bytes() {
+            [letter] => letter.is_ascii_alphabetic(),
+            _ => self
+                .names
+                .binary_search_by(|n| n.as_str().cmp(name))
+                .is_ok(),
+        }
+    }
 }
 
 /// What a write transaction did.
@@ -112,6 +193,7 @@ pub struct Tables {
     pub authors: Db,
     pub author_kinds: Db,
     pub tags: Db,
+    pub hll: Db,
     pub replaceable: Db,
     pub meta: Db,
 }
@@ -119,10 +201,11 @@ pub struct Tables {
 pub struct Store {
     env: Env,
     pub tables: Tables,
+    pub indexed_tags: IndexedTags,
 }
 
 impl Store {
-    pub fn open(dir: &Path, map_size: usize) -> anyhow::Result<Store> {
+    pub fn open(dir: &Path, map_size: usize, indexed_tags: IndexedTags) -> anyhow::Result<Store> {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("Could not create the database directory {}", dir.display())
         })?;
@@ -136,6 +219,7 @@ impl Store {
             authors: env.create_db("authors", DbFlags::DUP_FIXED)?,
             author_kinds: env.create_db("author_kinds", DbFlags::DUP_FIXED)?,
             tags: env.create_db("tags", DbFlags::DUP_FIXED)?,
+            hll: env.create_db("hll", DbFlags::PLAIN)?,
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         };
@@ -152,7 +236,11 @@ impl Store {
             ),
         }
         txn.commit()?;
-        Ok(Store { env, tables })
+        Ok(Store {
+            env,
+            tables,
+            indexed_tags,
+        })
     }
 
     #[cfg(test)]
@@ -256,6 +344,9 @@ impl Store {
         for (db, key) in self.index_keys(&view) {
             txn.put_dup(db, &key, &stamp)?;
         }
+        for (key, value) in self.tag_keys(&view) {
+            self.sketch(txn, &key, &value, view.pubkey())?;
+        }
         if let Some(address) = &address {
             txn.put(t.replaceable, address, &seq.to_be_bytes())?;
         }
@@ -286,19 +377,81 @@ impl Store {
             (t.authors, view.pubkey().to_vec()),
             (t.author_kinds, [&view.pubkey()[..], &kind].concat()),
         ];
-        let mut tags: Vec<Vec<u8>> = Vec::new();
-        for (letter, value) in view.indexed_tags() {
-            if value.encoded_len() > MAX_INDEXED_TAG {
+        keys.extend(
+            self.tag_keys(view)
+                .into_iter()
+                .map(|(key, _)| (t.tags, key)),
+        );
+        keys
+    }
+
+    /// The `tags` keys an event is filed under, each with its value as text.
+    fn tag_keys(&self, view: &EventView) -> Vec<(Vec<u8>, String)> {
+        let mut keys = Vec::new();
+        for (name, value) in view.tag_values() {
+            if !self.indexed_tags.contains(name) || value.encoded_len() > MAX_INDEXED_TAG {
                 continue;
             }
-            let mut key = vec![letter];
-            value.encode(&mut key);
-            tags.push(key);
+            let mut encoded = Vec::with_capacity(value.encoded_len());
+            value.encode(&mut encoded);
+            let text = match value {
+                Element::Hex(bytes) => hex::encode(bytes),
+                Element::Text(text) => text.to_string(),
+            };
+            keys.push((tag_key(name, &encoded, Some(view.kind())), text));
         }
-        tags.sort_unstable();
-        tags.dedup();
-        keys.extend(tags.into_iter().map(|key| (t.tags, key)));
+        keys.sort_unstable();
+        keys.dedup();
         keys
+    }
+
+    /// Count an author into a tag key's HyperLogLog, starting it if the key
+    /// has grown big enough.
+    fn sketch(&self, txn: &mut RwTxn, key: &[u8], value: &str, pubkey: &[u8; 32]) -> Result<()> {
+        let t = self.tables;
+        let registers = match txn.get(t.hll, key)? {
+            Some(stored) => {
+                let mut registers: Registers = stored.try_into().unwrap_or([0; hll::REGISTERS]);
+                if !hll::add(&mut registers, hll::offset(value), pubkey) {
+                    return Ok(());
+                }
+                registers
+            }
+            None => {
+                let mut cursor = txn.cursor(t.tags)?;
+                if cursor.set(key)?.is_none() || cursor.count()? < HLL_THRESHOLD {
+                    return Ok(());
+                }
+                self.sketch_from_events(txn, key)?
+            }
+        };
+        txn.put(t.hll, key, &registers)?;
+        Ok(())
+    }
+
+    /// Sketch a tag key's authors from its events.
+    fn sketch_from_events(&self, txn: &Txn, key: &[u8]) -> Result<Registers> {
+        let offset = hll::offset(&tag_key_value(key));
+        let mut registers = [0; hll::REGISTERS];
+        let mut seqs = Vec::new();
+        each_stamp(txn, self.tables.tags, key, 0, u32::MAX, |stamp| {
+            seqs.push(stamp_seq(stamp));
+            true
+        })?;
+        for seq in seqs {
+            if let Some(view) = self.load(txn, seq)? {
+                hll::add(&mut registers, offset, view.pubkey());
+            }
+        }
+        Ok(registers)
+    }
+
+    /// A tag key's HyperLogLog: kept, or sketched now.
+    pub fn key_sketch(&self, txn: &Txn, key: &[u8]) -> Result<Registers> {
+        match txn.get(self.tables.hll, key)? {
+            Some(stored) => Ok(stored.try_into().unwrap_or([0; hll::REGISTERS])),
+            None => self.sketch_from_events(txn, key),
+        }
     }
 
     /// Delete a stored event and every index entry pointing at it.
@@ -313,6 +466,12 @@ impl Store {
         for (db, key) in self.index_keys(&view) {
             txn.del(db, &key, Some(&stamp))?;
         }
+        // A sketch outlives its events, but not its key.
+        for (key, _) in self.tag_keys(&view) {
+            if txn.cursor(t.tags)?.set(&key)?.is_none() {
+                txn.del(t.hll, &key, None)?;
+            }
+        }
         if let Some(address) = address_of(&view)
             && self.replaceable_seq(txn, &address)? == Some(seq)
         {
@@ -322,6 +481,41 @@ impl Store {
         txn.del(t.ids, &view.id()[..ID_PREFIX], Some(&seq.to_be_bytes()))?;
         txn.del(t.events, &seq.to_ne_bytes(), None)?;
         Ok(true)
+    }
+}
+
+/// Call `f` with each of `key`'s stamps from `since` to `until`, oldest
+/// first, until it returns false. Reads a page of them at a time.
+pub fn each_stamp(
+    txn: &Txn,
+    db: Db,
+    key: &[u8],
+    since: u32,
+    until: u32,
+    mut f: impl FnMut(&[u8]) -> bool,
+) -> Result<()> {
+    let (low, high) = (stamp(since, 0), stamp(until, MAX_SEQ));
+    let mut cursor = txn.cursor(db)?;
+    let Some((_, first)) = cursor.get_both_range(key, &low)? else {
+        return Ok(());
+    };
+    let mut page = cursor.get_multiple()?;
+    if page.is_empty() {
+        page = first;
+    }
+    loop {
+        for stamp in page.as_chunks::<STAMP_LEN>().0 {
+            if *stamp > high {
+                return Ok(());
+            }
+            if *stamp >= low && !f(stamp) {
+                return Ok(());
+            }
+        }
+        match cursor.next_multiple()? {
+            Some(next) => page = next,
+            None => return Ok(()),
+        }
     }
 }
 
@@ -422,13 +616,18 @@ pub mod tests {
     use crate::event::tests::signed;
     use crate::record;
 
+    /// What tests index: single letters and `title`.
+    pub fn test_tags() -> IndexedTags {
+        IndexedTags::new(["title".to_string()]).unwrap()
+    }
+
     pub fn open() -> (tempfile::TempDir, Store) {
         open_sized(1 << 26)
     }
 
     fn open_sized(map_size: usize) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), map_size).unwrap();
+        let store = Store::open(dir.path(), map_size, test_tags()).unwrap();
         (dir, store)
     }
 
@@ -457,6 +656,7 @@ pub mod tests {
             t.authors,
             t.author_kinds,
             t.tags,
+            t.hll,
             t.replaceable,
         ]
         .iter()
@@ -472,13 +672,20 @@ pub mod tests {
             1,
             100,
             1,
-            vec![vec!["t", "x"], vec!["t", "x"], vec!["p", &hex]],
+            vec![
+                vec!["t", "x"],
+                vec!["t", "x"],
+                vec!["p", &hex],
+                vec!["title", "T"],
+                vec!["alt", "not indexed"],
+                vec!["7", "nor this"],
+            ],
             "hi",
         );
         assert_eq!(put(&store, &event), Outcome::Stored(1));
         assert_eq!(put(&store, &event), Outcome::Duplicate);
-        // events, ids, created, kinds, authors, author_kinds, two tags.
-        assert_eq!(entries(&store), 8);
+        // events, ids, created, kinds, authors, author_kinds, three tags.
+        assert_eq!(entries(&store), 9);
 
         let mut txn = store.write().unwrap();
         assert!(store.remove(&mut txn, 1).unwrap());
@@ -488,6 +695,68 @@ pub mod tests {
         // Sequence numbers aren't reused.
         let other = signed(1, 100, 1, vec![], "again");
         assert_eq!(put(&store, &other), Outcome::Stored(2));
+    }
+
+    #[test]
+    fn keys_tags_by_name_value_and_kind() {
+        let hex = "cd".repeat(32);
+        let key = tag_key("e", &crate::record::tag_value(&hex), Some(7));
+        assert_eq!(key.len(), 1 + 1 + 1 + 33 + 2);
+        assert_eq!(tag_key_kind(&key), 7);
+        assert_eq!(tag_key_value(&key), hex);
+        let key = tag_key("title", &crate::record::tag_value("Hi"), Some(30023));
+        assert_eq!(tag_key_value(&key), "Hi");
+        // A value can't run into a longer one.
+        let short = tag_key("t", &crate::record::tag_value("a"), None);
+        let long = tag_key("t", &crate::record::tag_value("ab"), Some(1));
+        assert!(!long.starts_with(&short));
+
+        let tags = IndexedTags::new(["title".into(), "title".into()]).unwrap();
+        assert!(tags.contains("t") && tags.contains("Q") && tags.contains("title"));
+        assert!(!tags.contains("alt") && !tags.contains("1") && !tags.contains(""));
+        assert!(IndexedTags::new(["x".into()]).is_err());
+    }
+
+    #[test]
+    fn sketches_big_tag_keys() {
+        let (_dir, store) = open();
+        let target = "ef".repeat(32);
+        let reactions: Vec<Event> = (0..HLL_THRESHOLD as u32 + 5)
+            .map(|n| {
+                let mut secret = [1; 32];
+                secret[28..].copy_from_slice(&n.to_be_bytes());
+                let tags = vec![vec!["e".to_string(), target.clone()]];
+                crate::event::tests::sign(secret, 100, 7, tags, "+")
+            })
+            .collect();
+        let key = tag_key("e", &crate::record::tag_value(&target), Some(7));
+        let stored = |store: &Store| {
+            store
+                .read()
+                .unwrap()
+                .get(store.tables.hll, &key)
+                .unwrap()
+                .is_some()
+        };
+        for (i, event) in reactions.iter().enumerate() {
+            put(&store, event);
+            assert_eq!(stored(&store), i + 1 >= HLL_THRESHOLD, "{i}");
+        }
+        // Kept up as events arrive: the same as sketching them all now.
+        let txn = store.read().unwrap();
+        let kept = store.key_sketch(&txn, &key).unwrap();
+        assert_eq!(kept, store.sketch_from_events(&txn, &key).unwrap());
+        let estimate = hll::estimate(&kept);
+        assert!((800.0..1250.0).contains(&estimate), "{estimate}");
+        drop(txn);
+
+        // Gone with the last of its events.
+        let mut txn = store.write().unwrap();
+        for seq in 1..=reactions.len() as u64 {
+            store.remove(&mut txn, seq).unwrap();
+        }
+        txn.commit().unwrap();
+        assert!(!stored(&store));
     }
 
     #[test]

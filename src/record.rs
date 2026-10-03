@@ -207,21 +207,14 @@ impl<'a> EventView<'a> {
         Tags { buf, remaining }
     }
 
-    /// Each single-letter tag's name and first value: what's indexed and
-    /// what filters match against.
-    pub fn indexed_tags(&self) -> impl Iterator<Item = (u8, Element<'a>)> {
-        self.tags().filter_map(|tag| {
-            let mut elements = tag;
-            let Some(Element::Text(name)) = elements.next() else {
+    /// Each tag's name and first value: what's indexed, for the names that
+    /// are, and what filters match against.
+    pub fn tag_values(&self) -> impl Iterator<Item = (&'a str, Element<'a>)> {
+        self.tags().filter_map(|mut tag| {
+            let Some(Element::Text(name)) = tag.next() else {
                 return None;
             };
-            let &[letter] = name.as_bytes() else {
-                return None;
-            };
-            if !letter.is_ascii_alphabetic() {
-                return None;
-            }
-            Some((letter, elements.next()?))
+            Some((name, tag.next()?))
         })
     }
 
@@ -454,12 +447,14 @@ mod tests {
         assert_eq!(view.expiration(), Some(1_800_000_000));
         assert_eq!(view.tag("d"), Some(Element::Text("a \"quoted\"\nname")));
 
-        let indexed: Vec<_> = view.indexed_tags().collect();
-        assert_eq!(indexed.len(), 3);
-        assert_eq!(indexed[1].0, b'e');
-        assert!(indexed[1].1.is(&tag_value(&hex)));
-        assert!(!indexed[2].1.is(&tag_value(&hex)));
-        assert!(indexed[2].1.is(&tag_value(&upper)));
+        // Tags with no value have none to give.
+        let values: Vec<_> = view.tag_values().collect();
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[1].0, "e");
+        assert!(values[1].1.is(&tag_value(&hex)));
+        assert!(!values[2].1.is(&tag_value(&hex)));
+        assert!(values[2].1.is(&tag_value(&upper)));
+        assert_eq!(values[3], ("expiration", Element::Text("1800000000")));
     }
 
     #[test]

@@ -46,7 +46,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, DocSetCollector, TopDocs};
 use tantivy::columnar::Column;
 use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery, TermQuery, TermSetQuery};
 use tantivy::schema::{
@@ -57,11 +57,13 @@ use tantivy::tokenizer::{
     TextAnalyzer, Token,
 };
 use tantivy::{
-    DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, TantivyDocument, Term,
+    DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Searcher, TantivyDocument,
+    Term,
 };
 
 use crate::filter::{Filter, Search};
 use crate::lmdb::Txn;
+use crate::query::{MAX_EXAMINED, TooExpensive};
 use crate::record::{Content, Element, EventView};
 use crate::store::Store;
 
@@ -464,23 +466,9 @@ impl SearchIndex {
         // In this order, so the searcher has everything below `indexed`.
         let indexed = self.indexed.load(Ordering::Acquire);
         let searcher = self.reader.searcher();
-        let next_seq = store.next_seq(txn)?;
-
-        // Stored since the last commit: checked by hand. The searcher may
-        // have some of them too, so hits are deduplicated.
-        let mut seen = HashSet::new();
-        let mut unindexed = Vec::new();
-        let mut cursor = txn.cursor(store.tables.events)?;
-        let start = indexed.max(next_seq.saturating_sub(MAX_UNINDEXED));
-        let mut entry = cursor.set_range(&start.to_ne_bytes())?;
-        while let Some((key, record)) = entry {
-            let seq = u64::from_ne_bytes(key.try_into()?);
-            if let Some(view) = EventView::new(record).filter(|view| filter.matches(view)) {
-                seen.insert(seq);
-                unindexed.push((seq, view));
-            }
-            entry = cursor.next()?;
-        }
+        let mut unindexed = unindexed(store, txn, indexed, filter)?;
+        // The searcher may have some of those too.
+        let mut seen: HashSet<u64> = unindexed.iter().map(|(seq, _)| *seq).collect();
         unindexed.sort_unstable_by(|(_, a), (_, b)| newest_first(a, b));
 
         let query = self.query(filter, search);
@@ -502,16 +490,7 @@ impl SearchIndex {
             };
             let count = page_hits.len();
             for (score, address) in page_hits {
-                let column = match columns.entry(address.segment_ord) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => e.insert(
-                        searcher
-                            .segment_reader(address.segment_ord)
-                            .fast_fields()
-                            .u64("seq")?,
-                    ),
-                };
-                let Some(seq) = column.first(address.doc_id) else {
+                let Some(seq) = seq_of(&searcher, &mut columns, address)? else {
                     continue;
                 };
                 if !seen.insert(seq) {
@@ -521,13 +500,7 @@ impl SearchIndex {
                 let Some(view) = store.load(txn, seq)? else {
                     continue;
                 };
-                // Autocomplete terms may be longer than what's indexed.
-                let matches = if search.autocomplete {
-                    filter.matches(&view)
-                } else {
-                    filter.matches_fields(&view)
-                };
-                if matches {
+                if hit_matches(filter, search, &view) {
                     hits.push((score, seq, view));
                 }
             }
@@ -549,6 +522,95 @@ impl SearchIndex {
         }
         found.truncate(limit);
         Ok(found)
+    }
+}
+
+impl SearchIndex {
+    /// Add the sequence numbers of every event a search filter matches to
+    /// `out`. Fails with [`TooExpensive`] when that's too many to check.
+    pub fn collect(
+        &self,
+        store: &Store,
+        txn: &Txn,
+        filter: &Filter,
+        search: &Search,
+        out: &mut HashSet<u64>,
+    ) -> anyhow::Result<()> {
+        let indexed = self.indexed.load(Ordering::Acquire);
+        let searcher = self.reader.searcher();
+        out.extend(
+            unindexed(store, txn, indexed, filter)?
+                .into_iter()
+                .map(|(seq, _)| seq),
+        );
+        let query = self.query(filter, search);
+        if searcher.search(&query, &Count)? > MAX_EXAMINED {
+            return Err(TooExpensive.into());
+        }
+        let mut columns = HashMap::new();
+        for address in searcher.search(&query, &DocSetCollector)? {
+            let Some(seq) = seq_of(&searcher, &mut columns, address)? else {
+                continue;
+            };
+            if !out.contains(&seq)
+                && store
+                    .load(txn, seq)?
+                    .is_some_and(|view| hit_matches(filter, search, &view))
+            {
+                out.insert(seq);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The events stored since the index was last committed that a filter
+/// matches, checked by hand. Only the newest [`MAX_UNINDEXED`].
+fn unindexed<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    indexed: u64,
+    filter: &Filter,
+) -> anyhow::Result<Vec<(u64, EventView<'t>)>> {
+    let next_seq = store.next_seq(txn)?;
+    let mut found = Vec::new();
+    let mut cursor = txn.cursor(store.tables.events)?;
+    let start = indexed.max(next_seq.saturating_sub(MAX_UNINDEXED));
+    let mut entry = cursor.set_range(&start.to_ne_bytes())?;
+    while let Some((key, record)) = entry {
+        let seq = u64::from_ne_bytes(key.try_into()?);
+        if let Some(view) = EventView::new(record).filter(|view| filter.matches(view)) {
+            found.push((seq, view));
+        }
+        entry = cursor.next()?;
+    }
+    Ok(found)
+}
+
+/// The sequence number of a hit, reading each segment's column once.
+fn seq_of(
+    searcher: &Searcher,
+    columns: &mut HashMap<u32, Column<u64>>,
+    address: DocAddress,
+) -> anyhow::Result<Option<u64>> {
+    let column = match columns.entry(address.segment_ord) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => e.insert(
+            searcher
+                .segment_reader(address.segment_ord)
+                .fast_fields()
+                .u64("seq")?,
+        ),
+    };
+    Ok(column.first(address.doc_id))
+}
+
+/// Whether a hit matches the rest of its filter. Autocomplete terms may be
+/// longer than what's indexed, so those are checked too.
+fn hit_matches(filter: &Filter, search: &Search, view: &EventView) -> bool {
+    match search.autocomplete {
+        true => filter.matches(view),
+        false => filter.matches_fields(view),
     }
 }
 
@@ -675,7 +737,7 @@ mod tests {
     use crate::event::Event;
     use crate::event::tests::signed;
     use crate::record;
-    use crate::store::tests::{open, put};
+    use crate::store::tests::{open, put, test_tags};
     use serde_json::json;
 
     fn view_text(event: &Event) -> Vec<String> {
@@ -733,7 +795,7 @@ mod tests {
 
         /// Run a search filter as a REQ would.
         fn search(&self, filter: serde_json::Value) -> Vec<String> {
-            let mut filter = Filter::parse(&filter).unwrap();
+            let mut filter = Filter::parse(&filter, &test_tags()).unwrap();
             assert!(filter.search.is_some());
             self.index.restrict(&mut filter);
             crate::query::run(&self.store, Some(&self.index), &[filter], 100, 500)
@@ -793,6 +855,32 @@ mod tests {
             f.search(json!({"search": "nostr -bitcoin -e-cash"})),
             ids(&[&late, &plain])
         );
+    }
+
+    #[test]
+    fn counts_searches() {
+        let mut f = fixture();
+        let hello = signed(1, 100, 1, vec![vec!["t", "x"]], "hello world");
+        let bitcoin = signed(2, 200, 1, vec![], "hello bitcoin");
+        let reaction = signed(2, 200, 7, vec![], "hello");
+        for event in [&hello, &bitcoin, &reaction] {
+            put(&f.store, event);
+        }
+        f.index_all();
+        put(&f.store, &signed(3, 300, 1, vec![], "hello again"));
+        let count = |filter: serde_json::Value| {
+            let mut filter = Filter::parse(&filter, &test_tags()).unwrap();
+            f.index.restrict(&mut filter);
+            crate::query::count(&f.store, Some(&f.index), &[filter])
+                .unwrap()
+                .count
+        };
+        // Indexed or not yet, but only the searchable kinds.
+        assert_eq!(count(json!({"search": "hello"})), 3);
+        assert_eq!(count(json!({"search": "hello -bitcoin"})), 2);
+        assert_eq!(count(json!({"search": "hello", "#t": ["x"]})), 1);
+        assert_eq!(count(json!({"search": "-bitcoin"})), 2);
+        assert_eq!(count(json!({"search": "hello", "since": 150})), 2);
     }
 
     #[test]
@@ -1104,7 +1192,7 @@ mod tests {
             filter.insert("limit".into(), json!(limit));
             let filter = serde_json::Value::Object(filter);
 
-            let mut parsed = Filter::parse(&filter).unwrap();
+            let mut parsed = Filter::parse(&filter, &test_tags()).unwrap();
             f.index.restrict(&mut parsed);
             let mut expected: Vec<&Event> = all
                 .iter()

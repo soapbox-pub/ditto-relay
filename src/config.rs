@@ -20,6 +20,8 @@ pub struct Config {
     pub max_limit: u64,
     /// Reject events with `created_at` further than this many seconds in the future.
     pub max_future_seconds: u64,
+    /// Tags with longer names than a letter to index, so filter by.
+    pub indexed_tags: Vec<String>,
     /// Whether NIP-50 search is on.
     pub search: bool,
     pub search_path: PathBuf,
@@ -44,6 +46,12 @@ impl Config {
             default_limit: env("RELAY_DEFAULT_LIMIT", 500)?,
             max_limit: env("RELAY_MAX_LIMIT", 500)?,
             max_future_seconds: env("RELAY_MAX_FUTURE_SECONDS", 900)?,
+            indexed_tags: env("RELAY_INDEXED_TAGS", String::new())?
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(String::from)
+                .collect(),
             search: env("RELAY_SEARCH", true)?,
             search_path: env("RELAY_SEARCH_PATH", PathBuf::from("./data/search"))?,
             search_kinds: kinds("RELAY_SEARCH_KINDS", &[0, 1, 20, 1111, 9802, 30023])?,
