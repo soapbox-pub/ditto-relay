@@ -37,7 +37,12 @@ pub struct Filter {
 #[derive(Debug, Clone, Default)]
 pub struct Search {
     /// What an event must have all of, as [`search::tokens`]. Sorted.
+    /// Empty when the search only excludes.
     pub terms: Vec<String>,
+    /// From `-word`s: an event with every term of any of these doesn't
+    /// match. Usually one term each; `-e-cash` makes two. Never with
+    /// autocomplete.
+    pub excluded: Vec<Vec<String>>,
     /// `sort:new`: the newest matches rather than the most relevant.
     pub sort_new: bool,
     /// `autocomplete:true`: the terms are prefixes of names and titles.
@@ -127,7 +132,7 @@ impl Filter {
                 .as_ref()
                 .is_none_or(|search| match search.autocomplete {
                     true => search::matches_prefixes(&search.terms, event),
-                    false => search::matches(&search.terms, event),
+                    false => search::matches(&search.terms, &search.excluded, event),
                 })
     }
 
@@ -169,35 +174,55 @@ impl Filter {
     }
 }
 
-/// A search's terms and the extensions it understands. Any other `key:value`
-/// is an extension it doesn't, which NIP-50 says to ignore. With no terms
-/// left, it's no search at all.
+/// A search's terms, the words it excludes, and the extensions it
+/// understands. Any other `key:value` is an extension it doesn't, which
+/// NIP-50 says to ignore. With no terms or exclusions left, it's no search
+/// at all.
 fn parse_search(value: &Value) -> Result<Option<Search>, String> {
     let text = value.as_str().ok_or("invalid: search must be a string")?;
     let mut sort_new = false;
     let mut autocomplete = false;
     let mut words = Vec::new();
+    let mut excluded = Vec::new();
     for word in text.split_whitespace() {
         match extension(word) {
             Some(("sort", "new")) => sort_new = true,
             Some(("autocomplete", "true")) => autocomplete = true,
             Some(_) => {}
-            None => words.push(word),
+            None => match word.strip_prefix('-') {
+                Some(negated) => {
+                    let mut group = search::tokens(negated);
+                    group.sort_unstable();
+                    group.dedup();
+                    if !group.is_empty() {
+                        excluded.push(group);
+                    }
+                }
+                None => words.push(word),
+            },
         }
     }
+    if autocomplete {
+        excluded.clear();
+    }
+    excluded.sort_unstable();
+    excluded.dedup();
     let mut terms = search::tokens(&words.join(" "));
     terms.sort_unstable();
     terms.dedup();
-    if terms.len() > MAX_SEARCH_TERMS {
+    if terms.len() + excluded.iter().map(Vec::len).sum::<usize>() > MAX_SEARCH_TERMS {
         return Err(format!(
             "invalid: search has more than {MAX_SEARCH_TERMS} terms"
         ));
     }
-    Ok((!terms.is_empty()).then_some(Search {
-        terms,
-        sort_new,
-        autocomplete,
-    }))
+    Ok(
+        (!terms.is_empty() || !excluded.is_empty()).then_some(Search {
+            terms,
+            excluded,
+            sort_new,
+            autocomplete,
+        }),
+    )
 }
 
 /// A NIP-50 extension's key and value. Not a URL's scheme and the rest.
@@ -317,6 +342,13 @@ mod tests {
         assert!(matches(json!({"search": "cafe"}), &event));
         assert!(!matches(json!({"search": "hello there"}), &event));
         assert!(!matches(json!({"search": "hello", "kinds": [7]}), &event));
+        assert!(!matches(json!({"search": "hello -World"}), &event));
+        assert!(matches(json!({"search": "hello -bitcoin"}), &event));
+        assert!(!matches(json!({"search": "-cafe"}), &event));
+        assert!(matches(json!({"search": "-bitcoin"}), &event));
+        // A hyphenated exclusion needs all its words.
+        assert!(matches(json!({"search": "-hello-there"}), &event));
+        assert!(!matches(json!({"search": "-hello-world"}), &event));
     }
 
     #[test]
@@ -350,6 +382,16 @@ mod tests {
         let parsed = search("Jac autocomplete:true sort:new").unwrap();
         assert!(parsed.autocomplete && parsed.sort_new);
         assert_eq!(parsed.terms, ["jac"]);
+        let parsed = search("well-known -Bitcoin -e-cash - -!! -bitcoin").unwrap();
+        assert_eq!(parsed.terms, ["known", "well"]);
+        assert_eq!(parsed.excluded, [vec!["bitcoin"], vec!["cash", "e"]]);
+        let parsed = search("-bitcoin").unwrap();
+        assert!(parsed.terms.is_empty());
+        assert_eq!(parsed.excluded, [vec!["bitcoin"]]);
+        // Autocomplete ignores exclusions.
+        let parsed = search("jac -dorsey autocomplete:true").unwrap();
+        assert!(parsed.excluded.is_empty());
+        assert!(search("-dorsey autocomplete:true").is_none());
         // Only extensions, or only punctuation: no search.
         assert!(search("sort:new language:en").is_none());
         assert!(search("  !! ").is_none());

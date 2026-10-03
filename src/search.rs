@@ -19,7 +19,10 @@
 //!
 //! Text is split on anything not alphanumeric, lowercased, and folded to
 //! ASCII, both when indexing and searching, and in [`matches`], which checks
-//! live events against a search. A search matches events with every term.
+//! live events against a search. A search matches events with every term,
+//! and none it excludes with `-word`. One that only excludes has nothing to
+//! look up, so it's no use here: it's answered like any other filter, from
+//! the LMDB's indexes newest first, with the exclusions checked by hand.
 //!
 //! With `autocomplete:true`, a search looks instead at the names people
 //! look things up by — a profile's name, display name, and NIP-05, and any
@@ -157,13 +160,17 @@ pub fn text(view: &EventView) -> String {
     out
 }
 
-/// Whether an event has every term of a search.
-pub fn matches(terms: &[String], view: &EventView) -> bool {
-    if terms.is_empty() {
+/// Whether an event has every term of a search, and not every term of any
+/// group it excludes.
+pub fn matches(terms: &[String], excluded: &[Vec<String>], view: &EventView) -> bool {
+    if terms.is_empty() && excluded.is_empty() {
         return true;
     }
     let have: HashSet<String> = tokens(&text(view)).into_iter().collect();
     terms.iter().all(|term| have.contains(term))
+        && !excluded
+            .iter()
+            .any(|group| group.iter().all(|term| have.contains(term)))
 }
 
 /// What autocomplete matches: a profile's names and any event's title.
@@ -410,6 +417,19 @@ impl SearchIndex {
                 (Occur::Must, query)
             })
             .collect();
+        for group in &search.excluded {
+            let mut terms = group.iter().map(|term| {
+                let term = Term::from_field_text(f.text, term);
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>
+            });
+            let query = match group.len() {
+                1 => terms.next().expect("one term"),
+                _ => Box::new(BooleanQuery::new(
+                    terms.map(|query| (Occur::Must, query)).collect(),
+                )),
+            };
+            clauses.push((Occur::MustNot, query));
+        }
         // Only indexed kinds are in the index, so asking for all is moot.
         if let Some(kinds) = filter.kinds.as_ref().filter(|&kinds| *kinds != self.kinds) {
             let terms = kinds
@@ -711,19 +731,68 @@ mod tests {
             self.indexer.catch_up_all(&self.store).unwrap();
         }
 
+        /// Run a search filter as a REQ would.
         fn search(&self, filter: serde_json::Value) -> Vec<String> {
             let mut filter = Filter::parse(&filter).unwrap();
+            assert!(filter.search.is_some());
             self.index.restrict(&mut filter);
-            let txn = self.store.read().unwrap();
-            let search = filter.search.as_ref().unwrap();
-            let limit = filter.limit.unwrap_or(100) as usize;
-            self.index
-                .run(&self.store, &txn, &filter, search, limit)
+            crate::query::run(&self.store, Some(&self.index), &[filter], 100, 500)
                 .unwrap()
-                .into_iter()
-                .map(|(_, view)| hex::encode(view.id()))
+                .events
+                .iter()
+                .map(|json| serde_json::from_str::<Event>(json).unwrap().id)
                 .collect()
         }
+    }
+
+    #[test]
+    fn excludes_words() {
+        let mut f = fixture();
+        let plain = signed(1, 100, 1, vec![], "nostr nostr is neat");
+        let bitcoin = signed(2, 200, 1, vec![], "nostr and Bitcoin");
+        let ecash = signed(3, 300, 1, vec![], "nostr e-cash");
+        let cash = signed(1, 400, 1, vec![], "cash only");
+        let article = signed(2, 500, 30023, vec![vec!["d", "a"]], "long read");
+        let reaction = signed(3, 600, 7, vec![], "+");
+        for event in [&plain, &bitcoin, &ecash, &cash, &article, &reaction] {
+            put(&f.store, event);
+        }
+        f.index_all();
+        let ids =
+            |events: &[&Event]| -> Vec<String> { events.iter().map(|e| e.id.clone()).collect() };
+
+        assert_eq!(
+            f.search(json!({"search": "nostr -bitcoin"})),
+            ids(&[&plain, &ecash])
+        );
+        assert_eq!(
+            f.search(json!({"search": "nostr -bitcoin sort:new"})),
+            ids(&[&ecash, &plain])
+        );
+        assert_eq!(
+            f.search(json!({"search": "nostr -e-cash"})),
+            ids(&[&plain, &bitcoin])
+        );
+        // Only exclusions: newest first, among the searchable kinds.
+        assert_eq!(
+            f.search(json!({"search": "-bitcoin"})),
+            ids(&[&article, &cash, &ecash, &plain])
+        );
+        assert_eq!(
+            f.search(json!({"search": "-bitcoin -cash", "kinds": [1, 7]})),
+            ids(&[&plain])
+        );
+        assert_eq!(
+            f.search(json!({"search": "-bitcoin", "kinds": [1], "limit": 2})),
+            ids(&[&cash, &ecash])
+        );
+        // Stored since the last commit makes no difference.
+        let late = signed(1, 700, 1, vec![], "nostr later");
+        put(&f.store, &late);
+        assert_eq!(
+            f.search(json!({"search": "nostr -bitcoin -e-cash"})),
+            ids(&[&late, &plain])
+        );
     }
 
     #[test]
@@ -992,7 +1061,8 @@ mod tests {
 
         for _ in 0..200 {
             let autocomplete = rng.random_bool(0.5);
-            let terms: Vec<String> = (0..rng.random_range(1..3))
+            let (min, max) = if autocomplete { (1, 3) } else { (0, 3) };
+            let mut terms: Vec<String> = (0..rng.random_range(min..max))
                 .map(|_| {
                     let word = words[rng.random_range(0..words.len())];
                     if autocomplete {
@@ -1003,6 +1073,12 @@ mod tests {
                     }
                 })
                 .collect();
+            if !autocomplete {
+                let count = rng.random_range(usize::from(terms.is_empty())..3);
+                for _ in 0..count {
+                    terms.push(format!("-{}", words[rng.random_range(0..words.len())]));
+                }
+            }
             let extensions = match autocomplete {
                 true => "sort:new autocomplete:true",
                 false => "sort:new",

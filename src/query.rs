@@ -11,7 +11,8 @@
 //! in time, and merges them newest first until `since` or the limit.
 //!
 //! A filter with a NIP-50 search goes to the [search index](crate::search)
-//! instead, unless it lists ids.
+//! instead, unless it lists ids or its search only excludes words. Those
+//! are planned like any other, and checked by hand.
 
 use std::collections::{BinaryHeap, HashSet};
 
@@ -59,7 +60,7 @@ pub fn run(
             continue;
         }
         let found = match (&filter.search, &filter.ids) {
-            (Some(query), None) => match search {
+            (Some(query), None) if !query.terms.is_empty() => match search {
                 Some(search) => search.run(store, &txn, filter, query, limit)?,
                 None => Vec::new(),
             },
@@ -118,7 +119,8 @@ struct Plan {
 fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
     let t = store.tables;
     let mut candidates = Vec::new();
-    let no_tags = filter.tags.is_empty();
+    // A search is never pinned down by an index.
+    let no_tags = filter.tags.is_empty() && filter.search.is_none();
 
     if let (Some(authors), Some(kinds)) = (&filter.authors, &filter.kinds)
         && authors.len() * kinds.len() <= MAX_AUTHOR_KINDS
@@ -150,7 +152,10 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             .iter()
             .map(|v| [&[*letter][..], v].concat())
             .collect();
-        let exact = filter.authors.is_none() && filter.kinds.is_none() && filter.tags.len() == 1;
+        let exact = filter.authors.is_none()
+            && filter.kinds.is_none()
+            && filter.tags.len() == 1
+            && filter.search.is_none();
         candidates.push(Plan {
             db: t.tags,
             keys,
@@ -179,7 +184,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
         Plan {
             db: t.created,
             keys: vec![CREATED.to_vec()],
-            exact: true,
+            exact: filter.search.is_none(),
         },
         |(_, plan)| plan,
     ))
@@ -331,6 +336,9 @@ mod tests {
         assert_eq!(p.keys[0].len(), 34);
         assert!(p.exact);
         assert_eq!(plan_for(json!({"since": 5})).keys, [CREATED]);
+        // A search is checked whatever the index.
+        assert!(!plan_for(json!({"kinds": [1], "search": "-x"})).exact);
+        assert!(!plan_for(json!({"search": "-x"})).exact);
     }
 
     #[test]
