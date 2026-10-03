@@ -39,6 +39,9 @@
 //! of the address, current too, in `history`, but out of every other index,
 //! so that queries, counts, and search see only the current one. A version
 //! older than the current one when it arrives goes straight to history.
+//! Each address keeps at most so many versions, current included: past
+//! that, the oldest are removed as new ones arrive, and one older than them
+//! all isn't kept. If the cap is lowered, [`Store::open`] prunes to it.
 //!
 //! An event with a NIP-40 expiration is refused once it has expired, and
 //! [`Store::load`] treats a stored one as gone from then on, so no query
@@ -116,6 +119,12 @@ const VANISH: u16 = 62;
 
 /// NIP-59 gift wraps.
 const GIFT_WRAP: u16 = 1059;
+
+/// The `meta` key of the history cap the store was last pruned to.
+const HISTORY_MAX_VERSIONS: &[u8] = b"history_max_versions";
+
+/// The most addresses pruned in one write transaction at startup.
+const PRUNE_CHUNK: usize = 1000;
 
 /// The one key of the `expiring` table.
 const EXPIRING: &[u8] = &[0];
@@ -209,19 +218,26 @@ impl IndexedTags {
     }
 }
 
-/// Which replaceable and addressable kinds keep the versions they replace.
-#[derive(Debug, Clone, Default)]
+/// Which replaceable and addressable kinds keep the versions they replace,
+/// and how many.
+#[derive(Debug, Clone)]
 pub struct History {
     enabled: bool,
     /// Sorted.
     excluded: Vec<u16>,
+    /// The most versions an address keeps, current included. At least 1.
+    max_versions: usize,
 }
 
 impl History {
-    pub fn new(enabled: bool, mut excluded: Vec<u16>) -> History {
+    pub fn new(enabled: bool, mut excluded: Vec<u16>, max_versions: usize) -> History {
         excluded.sort_unstable();
         excluded.dedup();
-        History { enabled, excluded }
+        History {
+            enabled,
+            excluded,
+            max_versions: max_versions.max(1),
+        }
     }
 
     pub fn keeps(&self, kind: u16) -> bool {
@@ -248,7 +264,8 @@ pub enum Outcome {
     Archived(u64),
     /// Already here.
     Duplicate,
-    /// A newer version of it is already here, and history isn't kept.
+    /// A newer version of it is already here, and history isn't kept, or
+    /// it's older than every version kept.
     Replaced,
     /// Its NIP-40 expiration has passed.
     Expired,
@@ -318,12 +335,97 @@ impl Store {
             ),
         }
         txn.commit()?;
-        Ok(Store {
+        let store = Store {
             env,
             tables,
             indexed_tags,
             history,
-        })
+        };
+        store.prune_all()?;
+        Ok(store)
+    }
+
+    /// If the history cap is lower than when the store was last opened (or
+    /// it has never been recorded), prune every address to it. Only old
+    /// versions go, which aren't searchable, so search needn't hear of it.
+    fn prune_all(&self) -> anyhow::Result<()> {
+        let t = self.tables;
+        let max = self.history.max_versions;
+        let recorded = self
+            .read()?
+            .get(t.meta, HISTORY_MAX_VERSIONS)?
+            .map(|v| u64::from_be_bytes(v.try_into().unwrap_or_default()));
+        if recorded.is_none_or(|recorded| recorded > max as u64) {
+            let mut over = Vec::new();
+            let txn = self.read()?;
+            let mut cursor = txn.cursor(t.history)?;
+            let mut entry = cursor.first()?;
+            while let Some((address, _)) = entry {
+                if cursor.count()? > max {
+                    over.push(address.to_vec());
+                }
+                entry = cursor.next_nodup()?;
+            }
+            drop(cursor);
+            drop(txn);
+            let mut pruned = 0;
+            for chunk in over.chunks(PRUNE_CHUNK) {
+                let mut txn = self.write()?;
+                for address in chunk {
+                    pruned += self.prune(&mut txn, address, &mut Vec::new())?;
+                }
+                txn.commit()?;
+            }
+            if pruned > 0 {
+                tracing::info!("pruned {pruned} old versions to keep {max} per address");
+            }
+        }
+        if recorded != Some(max as u64) {
+            let mut txn = self.write()?;
+            txn.put(t.meta, HISTORY_MAX_VERSIONS, &(max as u64).to_be_bytes())?;
+            txn.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Remove an address's oldest versions past the history cap, never its
+    /// current one, noting them in `removed`. Returns how many went.
+    fn prune(&self, txn: &mut RwTxn, address: &[u8], removed: &mut Vec<u64>) -> Result<usize> {
+        let mut cursor = txn.cursor(self.tables.history)?;
+        if cursor.set(address)?.is_none() {
+            return Ok(0);
+        }
+        let excess = cursor.count()?.saturating_sub(self.history.max_versions);
+        drop(cursor);
+        if excess == 0 {
+            return Ok(0);
+        }
+        let current = self.replaceable_seq(txn, address)?;
+        let mut seqs = Vec::with_capacity(excess);
+        each_stamp(txn, self.tables.history, address, 0, u32::MAX, |stamp| {
+            let seq = stamp_seq(stamp);
+            if Some(seq) != current {
+                seqs.push(seq);
+            }
+            seqs.len() < excess
+        })?;
+        for &seq in &seqs {
+            if self.remove(txn, seq)? {
+                removed.push(seq);
+            }
+        }
+        Ok(seqs.len())
+    }
+
+    /// Whether an address's history is full, and a version from
+    /// `created_at` would be older than every version in it.
+    fn too_old(&self, txn: &Txn, address: &[u8], created_at: u32) -> Result<bool> {
+        let mut cursor = txn.cursor(self.tables.history)?;
+        let Some((_, oldest)) = cursor.set(address)? else {
+            return Ok(false);
+        };
+        let oldest = stamp_created_at(oldest);
+        Ok(cursor.count()? >= self.history.max_versions && created_at < oldest)
     }
 
     #[cfg(test)]
@@ -430,11 +532,12 @@ impl Store {
                 && (old.created_at(), std::cmp::Reverse(old.id()))
                     >= (created_at, std::cmp::Reverse(id))
             {
-                if !keeps {
+                if !keeps || self.too_old(txn, address, created_at)? {
                     return Ok(Outcome::Replaced);
                 }
                 let seq = self.put_record(txn, &view, record)?;
                 txn.put_dup(t.history, address, &stamp(created_at, seq))?;
+                self.prune(txn, address, removed)?;
                 return Ok(Outcome::Archived(seq));
             }
             replaces = Some(seq);
@@ -462,6 +565,9 @@ impl Store {
             if gone {
                 removed.push(old);
             }
+        }
+        if keeps && let Some(address) = &address {
+            self.prune(txn, address, removed)?;
         }
         match view.kind() {
             DELETION => self.delete(txn, &view, now, removed)?,
@@ -1109,7 +1215,7 @@ pub mod tests {
 
     /// A store keeping every kind's history.
     pub fn open() -> (tempfile::TempDir, Store) {
-        open_with(1 << 26, History::new(true, vec![]))
+        open_with(1 << 26, History::new(true, vec![], 20))
     }
 
     fn open_with(map_size: usize, history: History) -> (tempfile::TempDir, Store) {
@@ -1254,7 +1360,7 @@ pub mod tests {
     }
 
     fn open_without_history() -> (tempfile::TempDir, Store) {
-        open_with(1 << 26, History::new(false, vec![]))
+        open_with(1 << 26, History::new(false, vec![], 20))
     }
 
     /// The sequence number of an event's address's current version.
@@ -1353,8 +1459,57 @@ pub mod tests {
     }
 
     #[test]
+    fn caps_history() {
+        let (dir, store) = open_with(1 << 26, History::new(true, vec![], 20));
+        let version = |at: u64| signed(1, at, 0, vec![vec!["t", "x"]], &at.to_string());
+        let versions: Vec<Event> = (0..25).map(|i| version(1000 + i * 10)).collect();
+        for event in &versions {
+            put(&store, event);
+        }
+        let history_len = |store: &Store| store.read().unwrap().len(store.tables.history).unwrap();
+        assert_eq!(history_len(&store), 20);
+        assert!(versions[..5].iter().all(|event| !has(&store, event)));
+        assert!(versions[5..].iter().all(|event| has(&store, event)));
+
+        // Older than all twenty kept: not kept either.
+        assert_eq!(put(&store, &version(500)), Outcome::Replaced);
+        // Among them: kept, and the oldest goes instead.
+        let between = version(1055);
+        let batch = store
+            .write_batch([record::encode(&between).as_slice()], 0)
+            .unwrap();
+        assert!(matches!(batch.outcomes[0], Outcome::Archived(_)));
+        assert_eq!(batch.removed, [6]);
+        assert!(has(&store, &between) && !has(&store, &versions[5]));
+        assert_eq!(history_len(&store), 20);
+        assert_eq!(current(&store, &versions[24]), Some(25));
+        drop(store);
+
+        // Reopened with a lower cap, pruned to it.
+        let history = History::new(true, vec![], 5);
+        let store = Store::open(dir.path(), 1 << 26, test_tags(), history).unwrap();
+        assert_eq!(history_len(&store), 5);
+        assert!(versions[20..].iter().all(|event| has(&store, event)));
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), 5);
+        assert_eq!(current(&store, &versions[24]), Some(25));
+        // The current version is still the one indexed.
+        assert_eq!(store.read().unwrap().len(store.tables.tags).unwrap(), 1);
+        drop(store);
+
+        // A higher cap prunes nothing, and keeps more from then on.
+        let history = History::new(true, vec![], 7);
+        let store = Store::open(dir.path(), 1 << 26, test_tags(), history).unwrap();
+        assert_eq!(history_len(&store), 5);
+        put(&store, &version(2000));
+        put(&store, &version(2010));
+        assert_eq!(history_len(&store), 7);
+        put(&store, &version(2020));
+        assert_eq!(history_len(&store), 7);
+    }
+
+    #[test]
     fn keeps_no_history_of_excluded_kinds() {
-        let (_dir, store) = open_with(1 << 26, History::new(true, vec![30_382]));
+        let (_dir, store) = open_with(1 << 26, History::new(true, vec![30_382], 20));
         let old = signed(1, 100, 30_382, vec![vec!["d", "x"]], "");
         let new = signed(1, 200, 30_382, vec![vec!["d", "x"]], "");
         put(&store, &old);
@@ -1576,7 +1731,7 @@ pub mod tests {
     #[test]
     #[ignore]
     fn disk_usage() {
-        let (_dir, store) = open_with(1 << 32, History::new(true, vec![]));
+        let (_dir, store) = open_with(1 << 32, History::new(true, vec![], 20));
         let events = crate::event::tests::feed(100_000);
         let json: usize = events
             .iter()

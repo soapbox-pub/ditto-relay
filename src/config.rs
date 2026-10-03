@@ -29,6 +29,8 @@ pub struct Config {
     pub history: bool,
     /// Kinds whose old versions aren't kept.
     pub history_excluded_kinds: Vec<u16>,
+    /// The most versions of an address kept, current included.
+    pub history_max_versions: usize,
     /// Whether NIP-50 search is on.
     pub search: bool,
     pub search_path: PathBuf,
@@ -68,6 +70,7 @@ impl Config {
                 "RELAY_HISTORY_EXCLUDED_KINDS",
                 &[30382, 30383, 30384, 30385],
             )?,
+            history_max_versions: env("RELAY_HISTORY_MAX_VERSIONS", 20)?,
             search: env("RELAY_SEARCH", true)?,
             search_path: env("RELAY_SEARCH_PATH", PathBuf::from("./data/search"))?,
             search_kinds: kinds("RELAY_SEARCH_KINDS", &[0, 1, 20, 1111, 9802, 30023])?,

@@ -30,7 +30,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let indexed_tags = IndexedTags::new(config.indexed_tags.clone())?;
-    let history = History::new(config.history, config.history_excluded_kinds.clone());
+    let history = History::new(
+        config.history,
+        config.history_excluded_kinds.clone(),
+        config.history_max_versions,
+    );
     let store = Arc::new(Store::open(
         &config.db_path,
         config.map_size,

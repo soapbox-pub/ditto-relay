@@ -346,7 +346,6 @@ impl<'t> Cursor<'t> {
         self.op(Some(key), None, ffi::MDB_SET_RANGE)
     }
 
-    #[cfg(test)]
     pub fn first(&mut self) -> Result<Option<Entry<'t>>> {
         self.op(None, None, ffi::MDB_FIRST)
     }
