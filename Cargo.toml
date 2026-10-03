@@ -1,0 +1,26 @@
+[package]
+name = "ditto-relay-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23.1"
+futures-util = "0.3.34"
+hex = "0.4.3"
+libc = "0.2.190"
+# Raw LMDB, wrapped in src/lmdb.rs. heed can't seek or count within a key's
+# sorted duplicates, which the indexes are built on.
+lmdb-master-sys = "0.2.6"
+secp256k1 = { version = "0.33.1", features = ["global-context"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+rand = "0.10.3"
+tempfile = "3.27.0"
