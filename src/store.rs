@@ -47,6 +47,12 @@
 //! sweep away those that have expired, oldest first. Until it does, counts
 //! that need no events loaded still include them.
 //!
+//! A NIP-09 deletion removes what it names when it arrives, and is kept, so
+//! that what it names is refused if it arrives later: its `e` and `a` tags
+//! are indexed like any other, so whether an event has been deleted is a
+//! lookup or two of `tags` under kind 5. Deleting an address's current
+//! version by id makes the newest version left in its history current.
+//!
 //! A tag key is name length ‖ name ‖ value length ‖ value ‖ kind, so a tag
 //! is counted per kind — followers, reactions — by LMDB for free, and all
 //! of one value's kinds sit together. Every single-letter tag is indexed,
@@ -67,9 +73,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::event::KindClass;
+use crate::event::decode_hex;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn};
-use crate::record::{Element, EventView};
+use crate::record::{Element, EventView, tag_value};
 
 /// Bumped when the layout changes incompatibly.
 const VERSION: u32 = 3;
@@ -95,6 +102,15 @@ const MAX_ADDRESS_D: usize = 256;
 
 /// The one key of the `created` table.
 pub const CREATED: &[u8] = &[0];
+
+/// NIP-09 deletion requests.
+const DELETION: u16 = 5;
+
+/// NIP-62 requests to vanish.
+const VANISH: u16 = 62;
+
+/// NIP-59 gift wraps.
+const GIFT_WRAP: u16 = 1059;
 
 /// The one key of the `expiring` table.
 const EXPIRING: &[u8] = &[0];
@@ -231,6 +247,8 @@ pub enum Outcome {
     Replaced,
     /// Its NIP-40 expiration has passed.
     Expired,
+    /// A NIP-09 deletion of it is here.
+    Deleted,
 }
 
 #[derive(Clone, Copy)]
@@ -392,6 +410,9 @@ impl Store {
         if self.contains(txn, id)? {
             return Ok(Outcome::Duplicate);
         }
+        if self.is_deleted(txn, &view)? {
+            return Ok(Outcome::Deleted);
+        }
 
         let address = address_of(&view);
         let keeps = self.history.keeps(view.kind());
@@ -437,7 +458,155 @@ impl Store {
                 removed.push(old);
             }
         }
+        if view.kind() == DELETION {
+            self.delete(txn, &view, now, removed)?;
+        }
         Ok(Outcome::Stored(seq))
+    }
+
+    /// Whether a stored NIP-09 deletion covers an event: one that names its
+    /// id, by someone who [may delete](may_delete) it, or that names its
+    /// address, by its author, at or after its `created_at`.
+    fn is_deleted(&self, txn: &Txn, view: &EventView) -> Result<bool> {
+        let mut id = Vec::with_capacity(33);
+        Element::Hex(view.id()).encode(&mut id);
+        let key = tag_key("e", &id, Some(DELETION));
+        if self.any_deletion(txn, &key, 0, |deletion| may_delete(deletion.pubkey(), view))? {
+            return Ok(true);
+        }
+        if let Some(text) = address_text(view) {
+            let value = tag_value(&text);
+            if value.len() <= MAX_INDEXED_TAG {
+                let key = tag_key("a", &value, Some(DELETION));
+                return self.any_deletion(txn, &key, view.created_at(), |deletion| {
+                    deletion.pubkey() == view.pubkey()
+                });
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether any deletion filed under a `tags` key, from `since` on,
+    /// passes `f`.
+    fn any_deletion(
+        &self,
+        txn: &Txn,
+        key: &[u8],
+        since: u32,
+        f: impl Fn(&EventView) -> bool,
+    ) -> Result<bool> {
+        let mut seqs = Vec::new();
+        each_stamp(txn, self.tables.tags, key, since, u32::MAX, |stamp| {
+            seqs.push(stamp_seq(stamp));
+            true
+        })?;
+        for seq in seqs {
+            if self.load(txn, seq)?.is_some_and(|deletion| f(&deletion)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Carry out a NIP-09 deletion: remove the events it names by id that
+    /// its author [may delete](may_delete), and every version of the
+    /// addresses it names, of its author's, up to its `created_at`. Removing
+    /// an address's current version makes the newest left current.
+    fn delete(
+        &self,
+        txn: &mut RwTxn,
+        deletion: &EventView,
+        now: u32,
+        removed: &mut Vec<u64>,
+    ) -> Result<()> {
+        let author = deletion.pubkey();
+        let mut ids = Vec::new();
+        let mut addresses = Vec::new();
+        for (name, value) in deletion.tag_values() {
+            match (name, value) {
+                ("e", Element::Hex(id)) => ids.push(id),
+                ("a", Element::Text(text)) => addresses.extend(parse_address(text, author)),
+                _ => {}
+            }
+        }
+
+        for id in ids {
+            let Some(seq) = self.seq_of(txn, id)? else {
+                continue;
+            };
+            let Some(target) = self.load(txn, seq)? else {
+                continue;
+            };
+            if !may_delete(author, &target) {
+                continue;
+            }
+            let promote = match self.is_current(txn, seq, &target)? {
+                true => address_of(&target),
+                false => None,
+            };
+            self.remove(txn, seq)?;
+            removed.push(seq);
+            if let Some(address) = promote {
+                self.promote(txn, &address, now, removed)?;
+            }
+        }
+
+        for address in addresses {
+            // The current version is the newest, so if it goes, all go.
+            let mut seqs = Vec::new();
+            each_stamp(
+                txn,
+                self.tables.history,
+                &address,
+                0,
+                deletion.created_at(),
+                |stamp| {
+                    seqs.push(stamp_seq(stamp));
+                    true
+                },
+            )?;
+            for seq in seqs {
+                if self.remove(txn, seq)? {
+                    removed.push(seq);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Make the newest version left at an address current, if there is one.
+    /// It's stored again under a new sequence number, so it's indexed,
+    /// search too, as if it had just arrived.
+    fn promote(
+        &self,
+        txn: &mut RwTxn,
+        address: &[u8],
+        now: u32,
+        removed: &mut Vec<u64>,
+    ) -> Result<()> {
+        let mut seqs = Vec::new();
+        each_stamp(txn, self.tables.history, address, 0, u32::MAX, |stamp| {
+            seqs.push(stamp_seq(stamp));
+            true
+        })?;
+        // NIP-01: the newest, and on a tie, the lowest id.
+        let mut newest = None;
+        for seq in seqs {
+            if let Some(view) = self.load(txn, seq)? {
+                let rank = (view.created_at(), std::cmp::Reverse(*view.id()), seq);
+                if newest.is_none_or(|newest| rank > newest) {
+                    newest = Some(rank);
+                }
+            }
+        }
+        let Some((_, _, seq)) = newest else {
+            return Ok(());
+        };
+        let record = self.record(txn, seq)?.expect("a stored record");
+        self.remove(txn, seq)?;
+        removed.push(seq);
+        self.insert(txn, &record, now, removed)?;
+        Ok(())
     }
 
     /// Keep a record under the next sequence number, findable by id.
@@ -675,6 +844,53 @@ fn address_of(view: &EventView) -> Option<Vec<u8>> {
         _ => return None,
     }
     Some(address(view.pubkey(), kind, &d))
+}
+
+/// The address an `a` tag names, as an address of the store's, if it's of
+/// a replaceable or addressable event by `author`.
+fn parse_address(text: &str, author: &[u8; 32]) -> Option<Vec<u8>> {
+    let mut parts = text.splitn(3, ':');
+    let kind: u16 = parts.next()?.parse().ok()?;
+    let pubkey = decode_hex::<32>(parts.next()?)?;
+    let d = match KindClass::of(kind) {
+        KindClass::Addressable => parts.next().unwrap_or(""),
+        KindClass::Replaceable => "",
+        _ => return None,
+    };
+    (&pubkey == author).then(|| address(&pubkey, kind, &tag_value(d)))
+}
+
+/// An event's address as an `a` tag names it: `kind:pubkey:d`.
+fn address_text(view: &EventView) -> Option<String> {
+    let d = match KindClass::of(view.kind()) {
+        KindClass::Addressable => match view.tag("d") {
+            Some(Element::Text(text)) => text.to_string(),
+            Some(Element::Hex(bytes)) => hex::encode(bytes),
+            None => String::new(),
+        },
+        KindClass::Replaceable => String::new(),
+        _ => return None,
+    };
+    Some(format!(
+        "{}:{}:{d}",
+        view.kind(),
+        hex::encode(view.pubkey())
+    ))
+}
+
+/// Whether a NIP-09 deletion by `author` can delete `target`: its own
+/// event, or a gift wrap addressed to it, but never a deletion or a vanish
+/// request.
+fn may_delete(author: &[u8; 32], target: &EventView) -> bool {
+    let kind = target.kind();
+    if kind == DELETION || kind == VANISH {
+        return false;
+    }
+    target.pubkey() == author
+        || kind == GIFT_WRAP
+            && target
+                .tag_values()
+                .any(|(name, value)| name == "p" && value == Element::Hex(author))
 }
 
 /// The address of `kind` by `pubkey` with the `d` tag `d`, in
@@ -1113,6 +1329,118 @@ pub mod tests {
         assert_eq!(store.expire(&mut txn, now + 1000, 100).unwrap(), [4]);
         txn.commit().unwrap();
         assert_eq!(entries(&store), 0);
+    }
+
+    #[test]
+    fn deletes_by_id() {
+        let (_dir, store) = open();
+        let note = signed(1, 100, 1, vec![], "note");
+        put(&store, &note);
+        let deleting = |seed, target: &Event| signed(seed, 200, 5, vec![vec!["e", &target.id]], "");
+
+        // Only by its author.
+        put(&store, &deleting(2, &note));
+        assert!(has(&store, &note));
+        let deletion = deleting(1, &note);
+        let batch = store
+            .write_batch([record::encode(&deletion).as_slice()], 0)
+            .unwrap();
+        assert_eq!(batch.removed, [1]);
+        assert!(!has(&store, &note) && has(&store, &deletion));
+        assert_eq!(put(&store, &note), Outcome::Deleted);
+
+        // Before it arrives, too.
+        let later = signed(1, 300, 1, vec![], "later");
+        put(&store, &deleting(1, &later));
+        assert_eq!(put(&store, &later), Outcome::Deleted);
+        let others = signed(2, 300, 1, vec![], "others");
+        put(&store, &deleting(1, &others));
+        assert!(matches!(put(&store, &others), Outcome::Stored(_)));
+
+        // Not deletions, though.
+        put(&store, &deleting(1, &deletion));
+        assert!(has(&store, &deletion));
+    }
+
+    #[test]
+    fn lets_recipients_delete_gift_wraps() {
+        let (_dir, store) = open();
+        let bob = signed(2, 0, 1, vec![], "").pubkey;
+        let wrap = signed(9, 100, 1059, vec![vec!["p", &bob]], "sealed");
+        put(&store, &wrap);
+        put(&store, &signed(3, 200, 5, vec![vec!["e", &wrap.id]], ""));
+        assert!(has(&store, &wrap));
+        put(&store, &signed(2, 200, 5, vec![vec!["e", &wrap.id]], ""));
+        assert!(!has(&store, &wrap));
+        assert_eq!(put(&store, &wrap), Outcome::Deleted);
+    }
+
+    #[test]
+    fn deletes_addresses_up_to_a_time() {
+        let (_dir, store) = open();
+        let version = |at| signed(1, at, 30_023, vec![vec!["d", "x"]], &at.to_string());
+        let (v1, v2) = (version(100), version(200));
+        put(&store, &v1);
+        put(&store, &v2);
+        let address = format!("30023:{}:x", v1.pubkey);
+        let deleting = |seed, at| signed(seed, at, 5, vec![vec!["a", &address]], "");
+
+        put(&store, &deleting(2, 300));
+        assert!(has(&store, &v1) && has(&store, &v2));
+        put(&store, &deleting(1, 150));
+        assert!(!has(&store, &v1) && has(&store, &v2));
+        assert_eq!(current(&store, &v2), Some(2));
+        assert_eq!(put(&store, &v1), Outcome::Deleted);
+
+        put(&store, &deleting(1, 250));
+        assert!(!has(&store, &v2));
+        assert_eq!(current(&store, &v2), None);
+        assert_eq!(put(&store, &v2), Outcome::Deleted);
+        assert_eq!(put(&store, &version(250)), Outcome::Deleted);
+        // A newer version is untouched.
+        let v3 = version(300);
+        assert!(matches!(put(&store, &v3), Outcome::Stored(_)));
+        assert!(has(&store, &v3));
+
+        // Replaceable kinds are named with an empty d.
+        let profile = signed(1, 100, 0, vec![], "");
+        put(&store, &profile);
+        let address = format!("0:{}:", profile.pubkey);
+        put(&store, &signed(1, 200, 5, vec![vec!["a", &address]], ""));
+        assert!(!has(&store, &profile));
+        assert_eq!(put(&store, &profile), Outcome::Deleted);
+    }
+
+    #[test]
+    fn promotes_the_previous_version() {
+        let (_dir, store) = open();
+        let old = signed(1, 100, 0, vec![vec!["t", "old"]], "old");
+        let new = signed(1, 200, 0, vec![vec!["t", "new"]], "new");
+        put(&store, &old);
+        put(&store, &new);
+        let deletion = signed(1, 300, 5, vec![vec!["e", &new.id]], "");
+        let batch = store
+            .write_batch([record::encode(&deletion).as_slice()], 0)
+            .unwrap();
+        // The new one, and the old one under its old sequence number.
+        assert_eq!(batch.removed, [2, 1]);
+        assert!(!has(&store, &new) && has(&store, &old));
+        // Stored again, after the deletion.
+        assert_eq!(current(&store, &old), Some(4));
+        let txn = store.read().unwrap();
+        let key = tag_key("t", &tag_value("old"), Some(0));
+        assert!(
+            txn.cursor(store.tables.tags)
+                .unwrap()
+                .set(&key)
+                .unwrap()
+                .is_some()
+        );
+        drop(txn);
+
+        // With nothing left, the address is empty.
+        put(&store, &signed(1, 300, 5, vec![vec!["e", &old.id]], ""));
+        assert_eq!(current(&store, &old), None);
     }
 
     /// How big the database is, compacted, against the events' JSON. Slow,

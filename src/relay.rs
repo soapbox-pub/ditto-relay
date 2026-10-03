@@ -95,7 +95,7 @@ async fn root(
 }
 
 fn nip11(config: &Config) -> Value {
-    let mut nips = vec![1, 11, 40, 45];
+    let mut nips = vec![1, 9, 11, 40, 45];
     if config.search {
         nips.push(50);
     }
@@ -291,6 +291,10 @@ impl Connection {
                     .await
             }
             Ok(Outcome::Expired) => self.ok(&id, false, EXPIRED).await,
+            Ok(Outcome::Deleted) => {
+                self.ok(&id, false, "blocked: this event has been deleted")
+                    .await
+            }
             Ok(Outcome::Replaced) => {
                 self.ok(&id, false, "duplicate: have a newer version of this event")
                     .await
