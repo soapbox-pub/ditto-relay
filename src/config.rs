@@ -23,7 +23,7 @@ pub struct Config {
     /// Whether NIP-50 search is on.
     pub search: bool,
     pub search_path: PathBuf,
-    /// The kinds searchable.
+    /// The kinds whose text is searchable. Autocomplete covers every kind.
     pub search_kinds: Vec<u16>,
     /// How often, at most, new events become searchable.
     pub search_commit_ms: u64,

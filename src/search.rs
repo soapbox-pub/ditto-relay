@@ -25,7 +25,8 @@
 //! look things up by — a profile's name, display name, and NIP-05, and any
 //! event's title — and its terms are prefixes. Those are indexed in a field
 //! of their own as every prefix of every word, up to [`MAX_PREFIX`]
-//! characters, so a prefix is looked up like any term.
+//! characters, so a prefix is looked up like any term. Names are indexed
+//! whatever the kind: the searchable kinds only limit ordinary search.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -62,7 +63,7 @@ use crate::record::{Content, Element, EventView};
 use crate::store::Store;
 
 /// Bumped when what's indexed, or how, changes. The index is then rebuilt.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// The name the analyzer is registered under.
 const ANALYZER: &str = "nostr";
@@ -351,9 +352,13 @@ impl SearchIndex {
     }
 
     /// Limit a search filter to the kinds indexed, so it matches the same
-    /// events live as it finds stored.
+    /// events live as it finds stored. Autocomplete has every kind.
     pub fn restrict(&self, filter: &mut Filter) {
-        if filter.search.is_none() {
+        if filter
+            .search
+            .as_ref()
+            .is_none_or(|search| search.autocomplete)
+        {
             return;
         }
         let kinds: Vec<u16> = match filter.kinds.take() {
@@ -368,10 +373,10 @@ impl SearchIndex {
     }
 
     fn document(&self, seq: u64, view: &EventView) -> Option<TantivyDocument> {
-        if self.kinds.binary_search(&view.kind()).is_err() {
-            return None;
-        }
-        let text = text(view);
+        let text = match self.kinds.binary_search(&view.kind()) {
+            Ok(_) => text(view),
+            Err(_) => String::new(),
+        };
         let names = names(view);
         if text.is_empty() && names.is_empty() {
             return None;
@@ -902,6 +907,25 @@ mod tests {
         assert!(f.search(autocomplete("orsey")).is_empty());
         // Ordinary search still finds the bio.
         assert_eq!(f.search(json!({"search": "bitcoin"})).len(), 3);
+
+        // Any kind with a title, searchable or not; but only its title.
+        let listing = signed(
+            5,
+            100,
+            30402,
+            vec![vec!["d", "b"], vec!["title", "Bicycle"]],
+            "red",
+        );
+        put(&f.store, &listing);
+        f.index_all();
+        assert_eq!(f.search(autocomplete("bicy")), [listing.id.as_str()]);
+        let kinds = json!({"search": "bicy autocomplete:true", "kinds": [30402]});
+        assert_eq!(f.search(kinds), [listing.id.as_str()]);
+        assert!(f.search(json!({"search": "bicycle"})).is_empty());
+        assert!(
+            f.search(json!({"search": "red", "kinds": [30402]}))
+                .is_empty()
+        );
 
         // Past what's indexed, a term is still checked in full.
         let long = profile(4, "Supercalifragilisticexpialidocious");
