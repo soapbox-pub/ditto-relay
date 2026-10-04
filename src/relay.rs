@@ -1,5 +1,7 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::State;
@@ -18,6 +20,7 @@ use crate::config::Config;
 use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
 use crate::landing;
+use crate::metrics::{Connected, METRICS};
 use crate::query::{self, Restricted, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
@@ -204,6 +207,7 @@ struct Disconnect;
 
 impl Connection {
     async fn run(socket: WebSocket, state: AppState) {
+        let _connected = Connected::new();
         let (mut sink, mut stream) = socket.split();
         let (outbox, mut outbox_rx) = mpsc::channel::<String>(OUTBOX_SIZE);
 
@@ -240,6 +244,7 @@ impl Connection {
                     Ok(ev) => conn.on_live_event(&ev).await,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("connection lagged, dropped {n} live events");
+                        METRICS.live_dropped.add(n);
                         Ok(())
                     }
                     Err(broadcast::error::RecvError::Closed) => Err(Disconnect),
@@ -314,38 +319,46 @@ impl Connection {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let (accepted, msg) = self.judge(&id, value).await;
+        let counter = match (accepted, msg.split_once(':').map(|(prefix, _)| prefix)) {
+            (_, Some("duplicate")) => &METRICS.events_duplicate,
+            (true, _) => &METRICS.events_accepted,
+            (false, Some("error")) => &METRICS.events_failed,
+            (false, _) => &METRICS.events_rejected,
+        };
+        counter.inc();
+        self.ok(&id, accepted, &msg).await
+    }
 
+    /// Accept an event or not, storing it or sending it to live
+    /// subscriptions if so, with a NIP-01 OK message.
+    async fn judge(&mut self, id: &str, value: &Value) -> (bool, Cow<'static, str>) {
+        let rejected = |msg: String| (false, Cow::Owned(msg));
         let ev: Event = match serde_json::from_value(value.clone()) {
             Ok(ev) => ev,
-            Err(err) => return self.ok(&id, false, &format!("invalid: {err}")).await,
+            Err(err) => return rejected(format!("invalid: {err}")),
         };
         if let Err(msg) = ev.verify() {
-            return self.ok(&id, false, &msg).await;
+            return rejected(msg);
         }
         if !event::is_relayed(ev.kind) {
-            let msg = format!("blocked: kind {} is not relayed", ev.kind);
-            return self.ok(&id, false, &msg).await;
+            return rejected(format!("blocked: kind {} is not relayed", ev.kind));
         }
         let author = event::decode_hex(&ev.pubkey).expect("verified");
         if is_protected(&ev) && !self.authed.contains(&author) {
             let msg = "auth-required: this event may only be published by its author";
-            return self.ok(&id, false, msg).await;
+            return (false, msg.into());
         }
         let now = event::now();
         if ev.created_at > u64::from(now) + self.state.config.max_future_seconds {
-            return self
-                .ok(&id, false, "invalid: created_at is too far in the future")
-                .await;
+            return (false, "invalid: created_at is too far in the future".into());
         }
 
         if ev.kind == VANISH && !addressed_to(&ev, &self.state.config.url) {
-            return self
-                .ok(
-                    &id,
-                    false,
-                    "invalid: this request to vanish is for other relays",
-                )
-                .await;
+            return (
+                false,
+                "invalid: this request to vanish is for other relays".into(),
+            );
         }
 
         let ephemeral = ev.kind_class() == KindClass::Ephemeral;
@@ -355,12 +368,13 @@ impl Connection {
             Ok(record) => Arc::new(record),
             Err(err) => {
                 tracing::error!("encoding event {id} panicked: {err}");
-                return self.ok(&id, false, "error: failed to store event").await;
+                METRICS.errors_panic.inc();
+                return (false, "error: failed to store event".into());
             }
         };
         let view = EventView::new(&record).expect("an encoded record");
         if view.is_expired(now) {
-            return self.ok(&id, false, EXPIRED).await;
+            return (false, EXPIRED.into());
         }
         let json = view.to_json();
         if ephemeral {
@@ -369,7 +383,7 @@ impl Connection {
                 record,
                 json,
             }));
-            return self.ok(&id, true, "").await;
+            return (true, "".into());
         }
 
         match self.state.writer.write(record.clone()).await {
@@ -380,26 +394,21 @@ impl Connection {
                     json,
                 };
                 let _ = self.state.live.send(Arc::new(live));
-                self.ok(&id, true, "").await
+                (true, "".into())
             }
             // Kept, but old news: not sent to live subscriptions.
-            Ok(Outcome::Archived(_)) => self.ok(&id, true, "").await,
-            Ok(Outcome::Duplicate) => {
-                self.ok(&id, true, "duplicate: already have this event")
-                    .await
-            }
-            Ok(Outcome::Expired) => self.ok(&id, false, EXPIRED).await,
-            Ok(Outcome::Deleted) => {
-                self.ok(&id, false, "blocked: this event has been deleted")
-                    .await
-            }
-            Ok(Outcome::Replaced) => {
-                self.ok(&id, false, "duplicate: have a newer version of this event")
-                    .await
-            }
+            Ok(Outcome::Archived(_)) => (true, "".into()),
+            Ok(Outcome::Duplicate) => (true, "duplicate: already have this event".into()),
+            Ok(Outcome::Expired) => (false, EXPIRED.into()),
+            Ok(Outcome::Deleted) => (false, "blocked: this event has been deleted".into()),
+            Ok(Outcome::Replaced) => (
+                false,
+                "duplicate: have a newer version of this event".into(),
+            ),
             Err(err) => {
                 tracing::error!("failed to store event {id}: {err:#}");
-                self.ok(&id, false, "error: failed to store event").await
+                METRICS.errors_write.inc();
+                (false, "error: failed to store event".into())
             }
         }
     }
@@ -433,6 +442,7 @@ impl Connection {
         let search = self.state.search.clone();
         let query_filters = filters.clone();
         let visible = self.visible();
+        let start = Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             query::run(
                 &store,
@@ -444,6 +454,7 @@ impl Connection {
             )
         })
         .await;
+        METRICS.reqs.since(start);
 
         let results = match result {
             Ok(Ok(results)) => results,
@@ -452,10 +463,12 @@ impl Connection {
             }
             Ok(Err(err)) => {
                 tracing::error!("query failed: {err:#}");
+                METRICS.errors_query.inc();
                 return self.closed(sub_id, "error: query failed").await;
             }
             Err(err) => {
                 tracing::error!("query task panicked: {err}");
+                METRICS.errors_panic.inc();
                 return self.closed(sub_id, "error: query failed").await;
             }
         };
@@ -562,10 +575,12 @@ impl Connection {
         let store = self.state.store.clone();
         let search = self.state.search.clone();
         let visible = self.visible();
+        let start = Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             query::count(&store, search.as_deref(), &filters, visible)
         })
         .await;
+        METRICS.counts.since(start);
         match result {
             Ok(Ok(count)) => {
                 let mut body = json!({"count": count.count});
@@ -576,14 +591,17 @@ impl Connection {
             }
             Ok(Err(err)) if err.is::<Restricted>() => self.refuse(id, Refusal::Results).await,
             Ok(Err(err)) if err.is::<TooExpensive>() => {
+                METRICS.counts_refused.inc();
                 self.closed(id, "unsupported: too expensive to count").await
             }
             Ok(Err(err)) => {
                 tracing::error!("count failed: {err:#}");
+                METRICS.errors_query.inc();
                 self.closed(id, "error: count failed").await
             }
             Err(err) => {
                 tracing::error!("count task panicked: {err}");
+                METRICS.errors_panic.inc();
                 self.closed(id, "error: count failed").await
             }
         }

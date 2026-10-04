@@ -101,7 +101,8 @@ use crate::event::KindClass;
 use crate::event::decode_hex;
 use crate::facets;
 use crate::hll::{self, Registers};
-use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn};
+use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
+use crate::metrics::METRICS;
 use crate::rank::{self, Rank};
 use crate::record::{Element, EventView, tag_value};
 use crate::wot::{self, Wot};
@@ -475,6 +476,10 @@ impl Store {
     #[cfg(test)]
     pub fn copy_compact(&self, path: &Path) -> Result<()> {
         self.env.copy_compact(path)
+    }
+
+    pub fn usage(&self) -> Result<Usage> {
+        self.env.usage()
     }
 
     pub fn read(&self) -> Result<RoTxn<'_>> {
@@ -1282,7 +1287,10 @@ impl Writer {
                         false => next_sweep.saturating_duration_since(Instant::now()),
                     };
                     let first = match rx.recv_timeout(wait) {
-                        Ok(job) => job,
+                        Ok(job) => {
+                            METRICS.write_queue.dec();
+                            job
+                        }
                         Err(RecvTimeoutError::Timeout) => {
                             if trust {
                                 turn(&mut trust);
@@ -1294,7 +1302,10 @@ impl Writer {
                     let mut batch = vec![first];
                     while batch.len() < MAX_WRITE_BATCH {
                         match rx.try_recv() {
-                            Ok(job) => batch.push(job),
+                            Ok(job) => {
+                                METRICS.write_queue.dec();
+                                batch.push(job);
+                            }
                             Err(_) => break,
                         }
                     }
@@ -1327,12 +1338,18 @@ impl Writer {
 
     /// Store an encoded record.
     pub async fn write(&self, record: Arc<Vec<u8>>) -> anyhow::Result<Outcome> {
+        let start = Instant::now();
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send((record, reply))
-            .map_err(|_| anyhow!("writer thread is gone"))?;
-        rx.await
-            .map_err(|_| anyhow!("writer thread dropped the request"))?
+        METRICS.write_queue.inc();
+        if self.tx.send((record, reply)).is_err() {
+            METRICS.write_queue.dec();
+            bail!("writer thread is gone");
+        }
+        let outcome = rx
+            .await
+            .map_err(|_| anyhow!("writer thread dropped the request"))?;
+        METRICS.writes.since(start);
+        outcome
     }
 }
 

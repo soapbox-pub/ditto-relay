@@ -31,6 +31,7 @@ use crate::event::KindClass;
 use crate::filter::Filter;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Cursor, Db, Result, Txn};
+use crate::metrics::METRICS;
 use crate::record::EventView;
 use crate::search::SearchIndex;
 use crate::store::{
@@ -380,6 +381,7 @@ fn scan<'t>(
         }
         examined += 1;
         if examined > MAX_EXAMINED {
+            METRICS.filters_cut_short.inc();
             break;
         }
 

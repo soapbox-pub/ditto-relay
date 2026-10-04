@@ -368,6 +368,11 @@ impl SearchIndex {
         Ok((search, indexer))
     }
 
+    /// Every event stored below this sequence number is searchable.
+    pub fn indexed(&self) -> u64 {
+        self.indexed.load(Ordering::Acquire)
+    }
+
     /// Limit a search filter to the kinds indexed, so it matches the same
     /// events live as it finds stored. Autocomplete has every kind, and so
     /// does a search with only extensions, which the LMDB answers.

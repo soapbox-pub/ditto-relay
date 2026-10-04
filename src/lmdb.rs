@@ -120,6 +120,12 @@ impl DbFlags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Db(ffi::MDB_dbi);
 
+/// See [`Env::usage`].
+pub struct Usage {
+    pub map: u64,
+    pub used: u64,
+}
+
 pub struct Env {
     ptr: *mut ffi::MDB_env,
 }
@@ -174,6 +180,19 @@ impl Env {
             CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
         // SAFETY: the env is open and the path NUL-terminated.
         check(unsafe { ffi::mdb_env_copy2(self.ptr, path.as_ptr(), ffi::MDB_CP_COMPACT) })
+    }
+
+    /// How big the map is, and how much of it is used, in bytes.
+    pub fn usage(&self) -> Result<Usage> {
+        // SAFETY: plain data, filled in by LMDB from an open env.
+        let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
+        let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
+        check(unsafe { ffi::mdb_env_info(self.ptr, &mut info) })?;
+        check(unsafe { ffi::mdb_env_stat(self.ptr, &mut stat) })?;
+        Ok(Usage {
+            map: info.me_mapsize as u64,
+            used: (info.me_last_pgno as u64 + 1) * u64::from(stat.ms_psize),
+        })
     }
 
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
@@ -231,7 +250,6 @@ impl Txn<'_> {
     }
 
     /// How many entries `db` holds, counting each duplicate.
-    #[cfg(test)]
     pub fn len(&self, db: Db) -> Result<usize> {
         // SAFETY: MDB_stat is plain data, filled in by LMDB.
         let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };

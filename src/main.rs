@@ -7,6 +7,7 @@ mod filter;
 mod hll;
 mod landing;
 mod lmdb;
+mod metrics;
 mod query;
 mod rank;
 mod record;
@@ -76,12 +77,31 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.bind).await?;
     tracing::info!("listening on ws://{}", listener.local_addr()?);
 
+    let metrics = match &config.metrics_bind {
+        Some(bind) => {
+            let listener = TcpListener::bind(bind).await?;
+            tracing::info!(
+                "serving metrics on http://{}/metrics",
+                listener.local_addr()?
+            );
+            let index = search.as_ref().map(|(index, _)| index.clone());
+            let app = metrics::router(store.clone(), index);
+            Some(tokio::spawn(
+                async move { axum::serve(listener, app).await },
+            ))
+        }
+        None => None,
+    };
+
     let app = relay::router(AppState::new(config, store, search));
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    if let Some(metrics) = metrics {
+        metrics.abort();
+    }
 
     Ok(())
 }

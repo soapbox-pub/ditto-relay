@@ -50,6 +50,7 @@ use crate::analysis::Sentiment;
 use crate::event::KindClass;
 use crate::filter::{Filter, Sort};
 use crate::lmdb::{Result, RwTxn, Txn};
+use crate::metrics::METRICS;
 use crate::query::MAX_EXAMINED;
 use crate::record::{Element, EventView};
 use crate::store::{Store, address};
@@ -836,7 +837,11 @@ fn walk<'t>(
             heap.push((next.to_vec(), i));
         }
         examined += 1;
-        if found.len() >= limit || examined > MAX_EXAMINED {
+        if found.len() >= limit {
+            break;
+        }
+        if examined > MAX_EXAMINED {
+            METRICS.filters_cut_short.inc();
             break;
         }
         let seq = ranked_seq(&value);

@@ -10,6 +10,8 @@ use crate::facets;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
+    /// Where to serve metrics, apart from clients. None turns them off.
+    pub metrics_bind: Option<String>,
     pub db_path: PathBuf,
     /// LMDB map size in bytes. This is virtual address space, not disk usage.
     pub map_size: usize,
@@ -103,6 +105,10 @@ impl Config {
         );
         Ok(Self {
             bind: env("RELAY_BIND", "127.0.0.1:13131".to_string())?,
+            metrics_bind: match std::env::var("RELAY_METRICS_BIND") {
+                Ok(v) => Some(v).filter(|v| !v.is_empty()),
+                Err(_) => Some("127.0.0.1:13133".to_string()),
+            },
             db_path: env("RELAY_DB_PATH", PathBuf::from("./data/db"))?,
             map_size: env("RELAY_MAP_SIZE", 1 << 40)?,
             url,
