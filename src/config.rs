@@ -57,10 +57,31 @@ pub struct Config {
     pub search_commit_ms: u64,
     /// Hashtags that mark media as adult, for the `nsfw:` search extension.
     pub nsfw_hashtags: Vec<String>,
+    /// Whom the web of trust is rooted at. None turns it off.
+    pub wot_seeds: Vec<[u8; 32]>,
+    /// How likely trust is to pass along a follow rather than stop.
+    pub wot_damping: f64,
+    /// How many people's worth of trust weighs fully.
+    pub wot_full_trust: u64,
+    /// The least weight counted; less is 0.
+    pub wot_min_weight: f64,
+    /// About how many follows to push trust along per turn of the writer.
+    pub wot_budget: usize,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let pubkey = optional("RELAY_PUBKEY");
+        let wot_damping = env("RELAY_WOT_DAMPING", 0.85)?;
+        anyhow::ensure!(
+            0.0 < wot_damping && wot_damping < 1.0,
+            "RELAY_WOT_DAMPING must be between 0 and 1"
+        );
+        let wot_min_weight = env("RELAY_WOT_MIN_WEIGHT", 0.01)?;
+        anyhow::ensure!(
+            0.0 < wot_min_weight && wot_min_weight <= 1.0,
+            "RELAY_WOT_MIN_WEIGHT must be above 0 and at most 1"
+        );
         Ok(Self {
             bind: env("RELAY_BIND", "127.0.0.1:13131".to_string())?,
             db_path: env("RELAY_DB_PATH", PathBuf::from("./data/db"))?,
@@ -68,7 +89,16 @@ impl Config {
             url: optional("RELAY_URL").context("RELAY_URL is required")?,
             name: env("RELAY_NAME", "Ditto Relay".to_string())?,
             description: env("RELAY_DESCRIPTION", String::new())?,
-            pubkey: optional("RELAY_PUBKEY"),
+            // The operator's own follows, unless told otherwise.
+            wot_seeds: match std::env::var("RELAY_WOT_SEEDS") {
+                Ok(_) => pubkeys("RELAY_WOT_SEEDS")?,
+                Err(_) => pubkey.as_deref().and_then(decode_hex).into_iter().collect(),
+            },
+            wot_damping,
+            wot_full_trust: env("RELAY_WOT_FULL_TRUST", 100_000)?,
+            wot_min_weight,
+            wot_budget: env("RELAY_WOT_BUDGET", 10_000)?,
+            pubkey,
             contact: optional("RELAY_CONTACT"),
             max_message_size: env("RELAY_MAX_MESSAGE_SIZE", 4_000_000)?,
             max_subscriptions: env("RELAY_MAX_SUBSCRIPTIONS", 20)?,

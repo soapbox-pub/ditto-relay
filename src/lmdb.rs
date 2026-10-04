@@ -300,6 +300,13 @@ impl RwTxn<'_> {
         Ok(found(unsafe { ffi::mdb_del(self.0.ptr, db.0, &mut k, v_ptr) })?.is_some())
     }
 
+    /// Remove every entry of a table, keeping the table.
+    pub fn clear(&mut self, db: Db) -> Result<()> {
+        // SAFETY: a live write transaction; 0 empties the table without
+        // closing its handle.
+        check(unsafe { ffi::mdb_drop(self.0.ptr, db.0, 0) })
+    }
+
     pub fn commit(mut self) -> Result<()> {
         let ptr = std::mem::replace(&mut self.0.ptr, ptr::null_mut());
         // SAFETY: commit frees the transaction whatever it returns, so it's

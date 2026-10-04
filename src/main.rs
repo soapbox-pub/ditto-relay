@@ -11,6 +11,7 @@ mod record;
 mod relay;
 mod search;
 mod store;
+mod wot;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,7 @@ use crate::config::Config;
 use crate::relay::AppState;
 use crate::search::SearchIndex;
 use crate::store::{History, IndexedTags, Store};
+use crate::wot::Wot;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,6 +46,13 @@ async fn main() -> anyhow::Result<()> {
         config.map_size,
         indexed_tags,
         history,
+        Wot::new(
+            config.wot_seeds.clone(),
+            config.wot_damping,
+            config.wot_full_trust,
+            config.wot_min_weight,
+            config.wot_budget,
+        ),
     )?);
     tracing::info!("opened LMDB at {}", config.db_path.display());
 

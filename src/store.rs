@@ -20,6 +20,8 @@
 //! | `tags`          | tag key (below)              | stamps                 |
 //! | `hll`           | tag key                      | HLL registers          |
 //! | `facets`        | facet key (see [`facets`])   | stamps                 |
+//! | `wot`           | pubkey                       | trust state ([`wot`])  |
+//! | `wot_queue`     | pubkey                       | nothing                |
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `history`       | address                      | stamps                 |
 //! | `expiring`      | `EXPIRING`                   | expiry stamps          |
@@ -70,6 +72,9 @@
 //! What NIP-50 search extensions look up — proof of work, media, and the
 //! like — is filed in `facets`, keyed much like tags.
 //!
+//! With a [web of trust](wot), each author's trust is kept in `wot`, and
+//! moved along in the same transaction as a follow list that changes it.
+//!
 //! Each tag key with at least [`HLL_THRESHOLD`] events has a NIP-45
 //! [HyperLogLog](crate::hll) sketch of their authors in `hll`, kept up as
 //! events arrive; smaller ones are sketched when asked. Sketches can't
@@ -90,9 +95,10 @@ use crate::facets;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn};
 use crate::record::{Element, EventView, tag_value};
+use crate::wot::{self, Wot};
 
 /// Bumped when the layout changes incompatibly.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 pub const STAMP_LEN: usize = 10;
 pub type Stamp = [u8; STAMP_LEN];
@@ -289,6 +295,8 @@ pub struct Tables {
     pub tags: Db,
     pub hll: Db,
     pub facets: Db,
+    pub wot: Db,
+    pub wot_queue: Db,
     pub replaceable: Db,
     pub history: Db,
     pub expiring: Db,
@@ -300,6 +308,7 @@ pub struct Store {
     pub tables: Tables,
     pub indexed_tags: IndexedTags,
     history: History,
+    wot: Option<Wot>,
 }
 
 impl Store {
@@ -308,11 +317,12 @@ impl Store {
         map_size: usize,
         indexed_tags: IndexedTags,
         history: History,
+        wot: Option<Wot>,
     ) -> anyhow::Result<Store> {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("Could not create the database directory {}", dir.display())
         })?;
-        let env = Env::open(dir, map_size, 16, 1024)
+        let env = Env::open(dir, map_size, 32, 1024)
             .with_context(|| format!("Could not open the database at {}", dir.display()))?;
         let tables = Tables {
             events: env.create_db("events", DbFlags::INTEGER_KEY)?,
@@ -324,6 +334,8 @@ impl Store {
             tags: env.create_db("tags", DbFlags::DUP_FIXED)?,
             hll: env.create_db("hll", DbFlags::PLAIN)?,
             facets: env.create_db("facets", DbFlags::DUP_FIXED)?,
+            wot: env.create_db("wot", DbFlags::PLAIN)?,
+            wot_queue: env.create_db("wot_queue", DbFlags::PLAIN)?,
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
             history: env.create_db("history", DbFlags::DUP_FIXED)?,
             expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,
@@ -347,8 +359,10 @@ impl Store {
             tables,
             indexed_tags,
             history,
+            wot,
         };
         store.prune_all()?;
+        wot::open(&store, store.wot.as_ref())?;
         Ok(store)
     }
 
@@ -446,6 +460,38 @@ impl Store {
 
     pub fn write(&self) -> Result<RwTxn<'_>> {
         self.env.write_txn()
+    }
+
+    /// How much an author's engagement counts, from 0 to 1: their weight
+    /// in the web of trust, or 1 without one.
+    // Not yet read outside tests: engagement counting is next.
+    #[allow(dead_code)]
+    pub fn trust(&self, txn: &Txn, pubkey: &[u8; 32]) -> Result<f32> {
+        match &self.wot {
+            Some(wot) => wot.weight(self, txn, pubkey),
+            None => Ok(1.0),
+        }
+    }
+
+    /// Push trust along for a turn, in a transaction of its own. Returns
+    /// whether there's more to push.
+    pub fn wot_turn(&self) -> Result<bool> {
+        let Some(wot) = &self.wot else {
+            return Ok(false);
+        };
+        // Most of the time there's nothing to push: don't take the lock.
+        if self
+            .read()?
+            .cursor(self.tables.wot_queue)?
+            .first()?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let mut txn = self.write()?;
+        let more = wot::turn(self, &mut txn, wot)?;
+        txn.commit()?;
+        Ok(more)
     }
 
     /// The sequence number the next stored event will get.
@@ -562,6 +608,19 @@ impl Store {
         if let Some(address) = &address {
             txn.put(t.replaceable, address, &seq.to_be_bytes())?;
             txn.put_dup(t.history, address, &stamp)?;
+        }
+        if let Some(wot) = &self.wot
+            && view.kind() == wot::FOLLOWS
+        {
+            let old = match replaces {
+                Some(old) => self.record(txn, old)?,
+                None => None,
+            };
+            let old = old
+                .as_deref()
+                .and_then(EventView::new)
+                .map_or_else(Vec::new, |old| wot::follows(&old));
+            wot::relist(self, txn, wot, view.pubkey(), &old, &wot::follows(&view))?;
         }
 
         if let Some(old) = replaces {
@@ -994,6 +1053,13 @@ impl Store {
             && self.replaceable_seq(txn, &address)? == Some(seq)
         {
             txn.del(t.replaceable, &address, None)?;
+            // The current follow list gone: following no one, until
+            // another version is promoted.
+            if let Some(wot) = &self.wot
+                && view.kind() == wot::FOLLOWS
+            {
+                wot::relist(self, txn, wot, view.pubkey(), &wot::follows(view), &[])?;
+            }
         }
         txn.del(t.created, CREATED, Some(&stamp))?;
         Ok(())
@@ -1133,7 +1199,9 @@ const MAX_SWEEP: usize = 10_000;
 
 /// LMDB allows one writer at a time, so all writes go through a dedicated
 /// thread that batches whatever is queued into a single transaction. Every
-/// [`SWEEP_INTERVAL`] it also removes the events that have expired.
+/// [`SWEEP_INTERVAL`] it also removes the events that have expired. After
+/// each batch, and whenever nothing's queued, it pushes the web of trust
+/// along a turn at a time until there's nothing left to push.
 #[derive(Clone)]
 pub struct Writer {
     tx: std::sync::mpsc::Sender<WriteJob>,
@@ -1156,19 +1224,36 @@ impl Writer {
             .name("lmdb-writer".into())
             .spawn(move || {
                 let mut next_sweep = Instant::now();
+                // Whether the web of trust may have pushing to do.
+                let mut trust = true;
+                let turn = |trust: &mut bool| {
+                    *trust = store.wot_turn().unwrap_or_else(|err| {
+                        tracing::error!("pushing trust failed: {err}");
+                        false
+                    });
+                };
                 loop {
                     if Instant::now() >= next_sweep {
                         match sweep(&store) {
                             Ok(removed) => tell(removed, false),
                             Err(err) => tracing::error!("sweeping expired events failed: {err}"),
                         }
+                        // Expired follow lists move trust.
+                        trust = true;
                         next_sweep = Instant::now() + SWEEP_INTERVAL;
                     }
-                    let first = match rx
-                        .recv_timeout(next_sweep.saturating_duration_since(Instant::now()))
-                    {
+                    let wait = match trust {
+                        true => Duration::ZERO,
+                        false => next_sweep.saturating_duration_since(Instant::now()),
+                    };
+                    let first = match rx.recv_timeout(wait) {
                         Ok(job) => job,
-                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Timeout) => {
+                            if trust {
+                                turn(&mut trust);
+                            }
+                            continue;
+                        }
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
                     let mut batch = vec![first];
@@ -1195,6 +1280,9 @@ impl Writer {
                             }
                         }
                     }
+                    // A follow list in the batch may have moved trust; a
+                    // turn between batches keeps it from falling behind.
+                    turn(&mut trust);
                 }
             })
             .expect("failed to spawn writer thread");
@@ -1235,7 +1323,7 @@ pub mod tests {
 
     fn open_with(map_size: usize, history: History) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), map_size, test_tags(), history).unwrap();
+        let store = Store::open(dir.path(), map_size, test_tags(), history, None).unwrap();
         (dir, store)
     }
 
@@ -1504,7 +1592,7 @@ pub mod tests {
 
         // Reopened with a lower cap, pruned to it.
         let history = History::new(true, vec![], 5);
-        let store = Store::open(dir.path(), 1 << 26, test_tags(), history).unwrap();
+        let store = Store::open(dir.path(), 1 << 26, test_tags(), history, None).unwrap();
         assert_eq!(history_len(&store), 5);
         assert!(versions[20..].iter().all(|event| has(&store, event)));
         assert_eq!(store.len(&store.read().unwrap()).unwrap(), 5);
@@ -1515,7 +1603,7 @@ pub mod tests {
 
         // A higher cap prunes nothing, and keeps more from then on.
         let history = History::new(true, vec![], 7);
-        let store = Store::open(dir.path(), 1 << 26, test_tags(), history).unwrap();
+        let store = Store::open(dir.path(), 1 << 26, test_tags(), history, None).unwrap();
         assert_eq!(history_len(&store), 5);
         put(&store, &version(2000));
         put(&store, &version(2010));
