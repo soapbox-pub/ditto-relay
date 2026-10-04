@@ -77,9 +77,6 @@ use crate::query::{MAX_EXAMINED, TooExpensive};
 use crate::record::{Content, Element, EventView};
 use crate::store::Store;
 
-/// Bumped when what's indexed, or how, changes. The index is then rebuilt.
-const VERSION: u32 = 3;
-
 /// The name the analyzer is registered under.
 const ANALYZER: &str = "nostr";
 
@@ -251,7 +248,6 @@ fn prefix(term: &str) -> &str {
 /// What a commit records.
 #[derive(Serialize, Deserialize)]
 struct Payload {
-    version: u32,
     /// Every event stored below this sequence number has been indexed.
     next_seq: u64,
 }
@@ -293,9 +289,9 @@ pub struct SearchIndex {
 }
 
 impl SearchIndex {
-    /// Open the index at `dir`, or create it, rebuilding it if it's from an
-    /// older version or doesn't belong with `store`. The indexer catches it
-    /// up once spawned.
+    /// Open the index at `dir`, or create it, rebuilding it if its schema
+    /// differs or it doesn't belong with `store`. The indexer catches it up
+    /// once spawned.
     pub fn open(
         dir: &Path,
         mut kinds: Vec<u16>,
@@ -316,11 +312,7 @@ impl SearchIndex {
                 .and_then(|payload| serde_json::from_str::<Payload>(&payload).ok());
             match payload {
                 // Further along than the LMDB means it's another LMDB's.
-                Some(p)
-                    if p.version == VERSION
-                        && p.next_seq <= store_next_seq
-                        && index.schema() == schema =>
-                {
+                Some(p) if p.next_seq <= store_next_seq && index.schema() == schema => {
                     opened = Some((index, p.next_seq));
                 }
                 _ => {
@@ -742,7 +734,6 @@ impl Indexer {
             return Ok(());
         }
         let payload = Payload {
-            version: VERSION,
             next_seq: self.next_seq,
         };
         let mut commit = self.writer.prepare_commit()?;
@@ -1197,18 +1188,7 @@ mod tests {
         let (_db2, other) = open();
         let (index, _) = SearchIndex::open(dir.path(), vec![1], &other).unwrap();
         assert_eq!(index.reader.searcher().num_docs(), 0);
-        drop(index);
-
-        // So is one from an older version.
-        {
-            let (_, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
-            let mut commit = indexer.writer.prepare_commit().unwrap();
-            commit.set_payload(r#"{"version":1,"next_seq":3}"#);
-            commit.commit().unwrap();
-        }
-        let (index, _) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
-        assert_eq!(index.indexed.load(Ordering::Relaxed), 0);
-        drop(db);
+        drop((index, db));
     }
 
     #[test]

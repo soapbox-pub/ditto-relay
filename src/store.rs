@@ -107,9 +107,6 @@ use crate::rank::{self, Rank};
 use crate::record::{Element, EventView, tag_value};
 use crate::wot::{self, Wot};
 
-/// Bumped when the layout changes incompatibly.
-const VERSION: u32 = 7;
-
 pub const STAMP_LEN: usize = 10;
 pub type Stamp = [u8; STAMP_LEN];
 
@@ -364,18 +361,6 @@ impl Store {
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         };
 
-        let mut txn = env.write_txn()?;
-        match txn.get(tables.meta, b"version")? {
-            None => {
-                txn.put(tables.meta, b"version", &VERSION.to_be_bytes())?;
-            }
-            Some(version) if version == VERSION.to_be_bytes() => {}
-            Some(version) => bail!(
-                "The database at {} is format {version:?}, not {VERSION}.",
-                dir.display()
-            ),
-        }
-        txn.commit()?;
         let store = Store {
             env,
             tables,

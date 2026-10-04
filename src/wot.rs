@@ -64,9 +64,6 @@ const MILLION: i64 = 1_000_000;
 /// An author whose follow list hasn't been read.
 const UNKNOWN: u32 = u32::MAX;
 
-/// Bumped when how trust is computed changes. The state is then rebuilt.
-const VERSION: u32 = 1;
-
 /// The `meta` keys of what the state was computed with, the seeds it was
 /// rooted at, and how much trust has leaked.
 const PARAMS: &[u8] = b"wot_params";
@@ -121,8 +118,7 @@ impl Wot {
     /// What, if it changes, means starting over.
     pub fn params(&self) -> Vec<u8> {
         [
-            &VERSION.to_be_bytes()[..],
-            &ONE.to_be_bytes(),
+            &ONE.to_be_bytes()[..],
             &self.damping.to_be_bytes(),
             &self.epsilon.to_be_bytes(),
         ]

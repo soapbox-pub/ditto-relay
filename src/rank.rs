@@ -100,9 +100,6 @@ const RISING: u8 = 6;
 /// A weight of 1, in the thousandths weights and scores are kept in.
 const FULL: i64 = 1000;
 
-/// Bumped when how scores are kept changes. They're then rebuilt.
-const VERSION: u32 = 2;
-
 /// The `meta` keys of what scores were computed with, and the walk under
 /// way.
 const PARAMS: &[u8] = b"rank_params";
@@ -1002,15 +999,14 @@ pub fn turn(store: &Store, txn: &mut RwTxn) -> Result<()> {
     Ok(())
 }
 
-/// Rebuild scores and ranks from `engagement` if how they're computed has
-/// changed, when the store opens: before it serves anything, a chunk per
+/// Rebuild scores and ranks from `engagement` if the parameters they're
+/// computed with have changed, when the store opens: before it serves anything, a chunk per
 /// transaction, and over again if interrupted.
 pub fn open(store: &Store) -> anyhow::Result<()> {
     let t = store.tables;
     let rank = store.rank();
     let params = [
-        &VERSION.to_be_bytes()[..],
-        &rank.half_life.to_be_bytes(),
+        &rank.half_life.to_be_bytes()[..],
         &rank.step.to_be_bytes(),
         &store.wot().map(|wot| wot.params()).unwrap_or_default(),
     ]
