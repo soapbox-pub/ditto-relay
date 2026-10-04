@@ -5,6 +5,7 @@ mod event;
 mod facets;
 mod filter;
 mod hll;
+mod landing;
 mod lmdb;
 mod query;
 mod rank;

@@ -17,6 +17,7 @@ use crate::auth::{self, Access, Authed, Refusal};
 use crate::config::Config;
 use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
+use crate::landing;
 use crate::query::{self, Restricted, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
@@ -33,6 +34,9 @@ pub struct AppState {
     pub search: Option<Arc<SearchIndex>>,
     /// Every accepted event, for live subscriptions.
     pub live: broadcast::Sender<Arc<LiveEvent>>,
+    /// The NIP-11 information document, and the landing page made from it.
+    nip11: Arc<str>,
+    landing: Arc<str>,
 }
 
 /// An accepted event, encoded once for every subscription it's sent to.
@@ -51,7 +55,11 @@ impl AppState {
         search: Option<(Arc<SearchIndex>, std::sync::mpsc::Sender<Vec<u64>>)>,
     ) -> Self {
         let (search, indexer) = search.unzip();
+        let info = nip11(&config);
+        let landing = landing::render(&info, &config.url).into();
         Self {
+            nip11: info.to_string().into(),
+            landing,
             access: Arc::new(Access::new(&config)),
             config: Arc::new(config),
             writer: Writer::spawn(store.clone(), indexer),
@@ -63,7 +71,15 @@ impl AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new().route("/", get(root)).with_state(state)
+    let asset = |content_type: &'static str, body: &'static [u8]| {
+        get(move || async move { ([(header::CONTENT_TYPE, content_type)], body) })
+    };
+    Router::new()
+        .route("/", get(root))
+        .route("/favicon.ico", asset("image/x-icon", landing::FAVICON))
+        .route("/icon.png", asset("image/png", landing::ICON))
+        .route("/banner.jpg", asset("image/jpeg", landing::BANNER))
+        .with_state(state)
 }
 
 async fn root(
@@ -90,12 +106,19 @@ async fn root(
                 (header::CONTENT_TYPE, "application/nostr+json"),
                 (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
             ],
-            nip11(&state.config).to_string(),
+            state.nip11.to_string(),
         )
             .into_response();
     }
 
-    "Please use a Nostr client to connect.\n".into_response()
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
+        state.landing.to_string(),
+    )
+        .into_response()
 }
 
 fn nip11(config: &Config) -> Value {
@@ -110,6 +133,8 @@ fn nip11(config: &Config) -> Value {
         "supported_nips": nips,
         "software": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
+        "icon": landing::asset_url(&config.public_url, "/icon.png"),
+        "banner": landing::asset_url(&config.public_url, "/banner.jpg"),
         "limitation": {
             "max_message_length": config.max_message_size,
             "max_subscriptions": config.max_subscriptions,

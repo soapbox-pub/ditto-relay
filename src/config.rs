@@ -16,6 +16,9 @@ pub struct Config {
     /// The relay's own URL, which NIP-42 authentication and NIP-62 requests
     /// to vanish name it by.
     pub url: String,
+    /// Where the relay is reached over HTTP(S), which its icon and banner
+    /// are linked from.
+    pub public_url: String,
     pub name: String,
     pub description: String,
     /// The operator's pubkey, for NIP-11.
@@ -88,11 +91,22 @@ impl Config {
             0.0 < wot_min_weight && wot_min_weight <= 1.0,
             "RELAY_WOT_MIN_WEIGHT must be above 0 and at most 1"
         );
+        let url = optional("RELAY_URL").context("RELAY_URL is required")?;
+        // ws://host is served at http://host, and wss://host at https://host.
+        let public_url = optional("RELAY_PUBLIC_URL").unwrap_or_else(|| {
+            url.strip_prefix("ws")
+                .map_or(url.clone(), |rest| format!("http{rest}"))
+        });
+        anyhow::ensure!(
+            public_url.starts_with("http://") || public_url.starts_with("https://"),
+            "RELAY_PUBLIC_URL must be an http or https URL"
+        );
         Ok(Self {
             bind: env("RELAY_BIND", "127.0.0.1:13131".to_string())?,
             db_path: env("RELAY_DB_PATH", PathBuf::from("./data/db"))?,
             map_size: env("RELAY_MAP_SIZE", 1 << 40)?,
-            url: optional("RELAY_URL").context("RELAY_URL is required")?,
+            url,
+            public_url,
             name: env("RELAY_NAME", "Ditto Relay".to_string())?,
             description: env("RELAY_DESCRIPTION", String::new())?,
             // The operator's own follows, unless told otherwise.
