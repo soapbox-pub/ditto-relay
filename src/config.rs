@@ -65,8 +65,14 @@ pub struct Config {
     pub wot_full_trust: u64,
     /// The least weight counted; less is 0.
     pub wot_min_weight: f64,
-    /// About how many follows to push trust along per turn of the writer.
+    /// About how many follows to push trust along, or targets to rescore,
+    /// per turn of the writer.
     pub wot_budget: usize,
+    /// How many seconds it takes `sort:hot` to halve an event's worth.
+    pub hot_half_life: u32,
+    /// How far an engager's weight must move before what they've engaged
+    /// with is rescored.
+    pub rank_step: f64,
 }
 
 impl Config {
@@ -98,6 +104,8 @@ impl Config {
             wot_full_trust: env("RELAY_WOT_FULL_TRUST", 100_000)?,
             wot_min_weight,
             wot_budget: env("RELAY_WOT_BUDGET", 10_000)?,
+            hot_half_life: env("RELAY_HOT_HALF_LIFE", 86_400)?,
+            rank_step: env("RELAY_RANK_STEP", 0.05)?,
             pubkey,
             contact: optional("RELAY_CONTACT"),
             max_message_size: env("RELAY_MAX_MESSAGE_SIZE", 4_000_000)?,

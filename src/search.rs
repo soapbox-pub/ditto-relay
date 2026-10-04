@@ -69,7 +69,7 @@ use tantivy::{
     Term,
 };
 
-use crate::filter::{Filter, Search};
+use crate::filter::{Filter, Search, Sort};
 use crate::lmdb::Txn;
 use crate::query::{MAX_EXAMINED, TooExpensive};
 use crate::record::{Content, Element, EventView};
@@ -475,7 +475,8 @@ impl SearchIndex {
     }
 
     /// Run a search filter: the best matches by relevance, or with
-    /// `sort:new`, the newest.
+    /// `sort:new`, the newest, or with `sort:top` or `sort:hot`, the best
+    /// [ranked](crate::rank) of up to [`MAX_HITS`] matches.
     pub fn run<'t>(
         &self,
         store: &Store,
@@ -505,7 +506,8 @@ impl SearchIndex {
         let mut page = (limit * 2).max(32);
         loop {
             let top = TopDocs::with_limit(page).and_offset(offset);
-            let page_hits: Vec<(f32, DocAddress)> = if search.sort_new {
+            // Ranked searches rank every match, so take them newest first.
+            let page_hits: Vec<(f32, DocAddress)> = if search.sort != Sort::Relevance {
                 let collector = top.order_by_fast_field::<u64>("created_at", Order::Desc);
                 let found = searcher.search(&query, &collector)?;
                 found
@@ -536,9 +538,10 @@ impl SearchIndex {
                 }
             }
             offset += count;
-            let enough = match search.distinct_author {
-                true => authors.len() >= limit,
-                false => hits.len() + unindexed.len() >= limit,
+            let enough = match (search.sort.is_ranked(), search.distinct_author) {
+                (true, _) => false,
+                (false, true) => authors.len() >= limit,
+                (false, false) => hits.len() + unindexed.len() >= limit,
             };
             if enough || count < page || offset >= MAX_HITS {
                 break;
@@ -547,7 +550,10 @@ impl SearchIndex {
         }
 
         let mut found = unindexed;
-        if search.sort_new {
+        if search.sort.is_ranked() {
+            found.extend(hits.into_iter().map(|(_, seq, view)| (seq, view)));
+            crate::rank::sort(store, txn, filter, search.sort, &mut found)?;
+        } else if search.sort == Sort::New {
             found.extend(hits.into_iter().map(|(_, seq, view)| (seq, view)));
             found.sort_unstable_by(|(_, a), (_, b)| newest_first(a, b));
         } else {
@@ -660,7 +666,7 @@ fn hit_matches(filter: &Filter, search: &Search, view: &EventView) -> bool {
 }
 
 /// Newest first; on a tie, the lowest id first (NIP-01).
-fn newest_first(a: &EventView, b: &EventView) -> std::cmp::Ordering {
+pub fn newest_first(a: &EventView, b: &EventView) -> std::cmp::Ordering {
     b.created_at()
         .cmp(&a.created_at())
         .then_with(|| a.id().cmp(b.id()))
@@ -962,6 +968,44 @@ mod tests {
         assert_eq!(
             f.search(json!({"search": "my distinct:author sort:new"})),
             ids(&[&dog, &cat])
+        );
+    }
+
+    #[test]
+    fn ranks_matches() {
+        let mut f = fixture();
+        let one = signed(1, 100, 1, vec![], "cat one");
+        let two = signed(1, 300, 1, vec![], "cat two");
+        let three = signed(2, 200, 1, vec![], "cat three");
+        let dog = signed(2, 400, 1, vec![], "dog");
+        let react = |seed, to: &Event| signed(seed, 500, 7, vec![vec!["e", &to.id]], "+");
+        for event in [&one, &two, &three, &dog] {
+            put(&f.store, event);
+        }
+        for event in [
+            react(3, &one),
+            react(4, &one),
+            react(3, &three),
+            react(3, &dog),
+        ] {
+            put(&f.store, &event);
+        }
+        f.index_all();
+        // Not yet indexed, and more engaged with than any.
+        let four = signed(3, 50, 1, vec![], "cat four");
+        put(&f.store, &four);
+        for seed in 4..7 {
+            put(&f.store, &react(seed, &four));
+        }
+        let ids =
+            |events: &[&Event]| -> Vec<String> { events.iter().map(|e| e.id.clone()).collect() };
+        assert_eq!(
+            f.search(json!({"search": "cat sort:top"})),
+            ids(&[&four, &one, &three, &two])
+        );
+        assert_eq!(
+            f.search(json!({"search": "cat sort:top distinct:author", "limit": 2})),
+            ids(&[&four, &one])
         );
     }
 

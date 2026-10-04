@@ -7,6 +7,7 @@ mod filter;
 mod hll;
 mod lmdb;
 mod query;
+mod rank;
 mod record;
 mod relay;
 mod search;
@@ -20,6 +21,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+use crate::rank::Rank;
 use crate::relay::AppState;
 use crate::search::SearchIndex;
 use crate::store::{History, IndexedTags, Store};
@@ -53,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
             config.wot_min_weight,
             config.wot_budget,
         ),
+        Rank::new(config.hot_half_life, config.rank_step, config.wot_budget),
     )?);
     tracing::info!("opened LMDB at {}", config.db_path.display());
 

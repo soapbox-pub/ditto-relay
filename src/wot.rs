@@ -119,7 +119,7 @@ impl Wot {
     }
 
     /// What, if it changes, means starting over.
-    fn params(&self) -> Vec<u8> {
+    pub fn params(&self) -> Vec<u8> {
         [
             &VERSION.to_be_bytes()[..],
             &ONE.to_be_bytes(),
@@ -212,6 +212,11 @@ impl Node {
             degree: u32::from_le_bytes(bytes[16..].try_into().unwrap()),
         })
     }
+}
+
+/// An author's trust score, of [`ONE`].
+pub fn score(store: &Store, txn: &Txn, pubkey: &[u8; 32]) -> Result<i64> {
+    Ok(node(store, txn, pubkey)?.map_or(0, |node| node.score))
 }
 
 fn node(store: &Store, txn: &Txn, pubkey: &[u8; 32]) -> Result<Option<Node>> {
@@ -343,6 +348,7 @@ fn push(store: &Store, txn: &mut RwTxn, wot: &Wot, pubkey: &[u8; 32]) -> Result<
     };
     let follows = current_follows(store, txn, pubkey)?;
     node.degree = follows.len() as u32;
+    let before = node.score;
     if wot.due(&node) {
         let residual = std::mem::take(&mut node.residual);
         let passed = wot.passed(residual);
@@ -350,6 +356,9 @@ fn push(store: &Store, txn: &mut RwTxn, wot: &Wot, pubkey: &[u8; 32]) -> Result<
         node.residual = share(store, txn, wot, &follows, passed)?;
     }
     put_node(store, txn, pubkey, &node)?;
+    if node.score != before {
+        crate::rank::trust_changed(store, txn, pubkey, before, node.score)?;
+    }
     Ok(follows.len() + 1)
 }
 
@@ -405,6 +414,10 @@ pub fn open(store: &Store, wot: Option<&Wot>) -> anyhow::Result<()> {
             add(store, &mut txn, wot, &seed, share)?;
         }
         txn.put(t.meta, SEEDS, &wot.seeds.concat())?;
+        // Seeds weigh 1 whatever their score.
+        for seed in old_seeds.iter().chain(&wot.seeds) {
+            crate::rank::requeue(store, &mut txn, seed)?;
+        }
     }
     txn.commit()?;
     if let Err(err) = check(store) {
@@ -482,7 +495,7 @@ mod tests {
 
     fn open_at(dir: &Path, wot: Option<Wot>) -> Store {
         let history = History::new(true, vec![], 20);
-        Store::open(dir, 1 << 28, test_tags(), history, wot).unwrap()
+        Store::open(dir, 1 << 28, test_tags(), history, wot, Default::default()).unwrap()
     }
 
     fn put(store: &Store, event: &Event) {
@@ -490,7 +503,7 @@ mod tests {
     }
 
     fn settle(store: &Store) {
-        while store.wot_turn().unwrap() {}
+        while store.turn().unwrap() {}
     }
 
     /// Every author's state, and the sum of every residual's size.
@@ -616,7 +629,7 @@ mod tests {
                     lists.entry(n).or_default().push(event);
                 }
             }
-            store.wot_turn().unwrap();
+            store.turn().unwrap();
             check(&store).unwrap();
         }
         settle(&store);
@@ -706,7 +719,7 @@ mod tests {
                 &follow_list(n, 100, &[pubkey(n + 1), pubkey(1), seed]),
             );
         }
-        assert!(!store.wot_turn().unwrap());
+        assert!(!store.turn().unwrap());
         assert_eq!(state(&store).0, before);
     }
 
@@ -731,7 +744,7 @@ mod tests {
         let (mut turns, mut longest) = (0, std::time::Duration::ZERO);
         loop {
             let turn = std::time::Instant::now();
-            let more = store.wot_turn().unwrap();
+            let more = store.turn().unwrap();
             turns += 1;
             longest = longest.max(turn.elapsed());
             if !more {

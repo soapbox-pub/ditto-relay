@@ -22,6 +22,11 @@
 //! | `facets`        | facet key (see [`facets`])   | stamps                 |
 //! | `wot`           | pubkey                       | trust state ([`wot`])  |
 //! | `wot_queue`     | pubkey                       | nothing                |
+//! | `engagement`    | engager ‖ target id          | count ([`rank`])       |
+//! | `scores`        | target id                    | score and whereabouts  |
+//! | `ranked`        | mode ‖ kind                  | rank ‖ seq (48 bits)   |
+//! | `applied`       | pubkey                       | weight applied         |
+//! | `rank_queue`    | pubkey                       | nothing                |
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `history`       | address                      | stamps                 |
 //! | `expiring`      | `EXPIRING`                   | expiry stamps          |
@@ -75,6 +80,9 @@
 //! With a [web of trust](wot), each author's trust is kept in `wot`, and
 //! moved along in the same transaction as a follow list that changes it.
 //!
+//! Engagement is counted, scored, and [ranked](rank) for `sort:top` and
+//! `sort:hot` as events are indexed and unindexed.
+//!
 //! Each tag key with at least [`HLL_THRESHOLD`] events has a NIP-45
 //! [HyperLogLog](crate::hll) sketch of their authors in `hll`, kept up as
 //! events arrive; smaller ones are sketched when asked. Sketches can't
@@ -94,11 +102,12 @@ use crate::event::decode_hex;
 use crate::facets;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn};
+use crate::rank::{self, Rank};
 use crate::record::{Element, EventView, tag_value};
 use crate::wot::{self, Wot};
 
 /// Bumped when the layout changes incompatibly.
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 
 pub const STAMP_LEN: usize = 10;
 pub type Stamp = [u8; STAMP_LEN];
@@ -297,6 +306,11 @@ pub struct Tables {
     pub facets: Db,
     pub wot: Db,
     pub wot_queue: Db,
+    pub engagement: Db,
+    pub scores: Db,
+    pub ranked: Db,
+    pub applied: Db,
+    pub rank_queue: Db,
     pub replaceable: Db,
     pub history: Db,
     pub expiring: Db,
@@ -309,6 +323,7 @@ pub struct Store {
     pub indexed_tags: IndexedTags,
     history: History,
     wot: Option<Wot>,
+    rank: Rank,
 }
 
 impl Store {
@@ -318,6 +333,7 @@ impl Store {
         indexed_tags: IndexedTags,
         history: History,
         wot: Option<Wot>,
+        rank: Rank,
     ) -> anyhow::Result<Store> {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("Could not create the database directory {}", dir.display())
@@ -336,6 +352,11 @@ impl Store {
             facets: env.create_db("facets", DbFlags::DUP_FIXED)?,
             wot: env.create_db("wot", DbFlags::PLAIN)?,
             wot_queue: env.create_db("wot_queue", DbFlags::PLAIN)?,
+            engagement: env.create_db("engagement", DbFlags::PLAIN)?,
+            scores: env.create_db("scores", DbFlags::PLAIN)?,
+            ranked: env.create_db("ranked", DbFlags::DUP_FIXED)?,
+            applied: env.create_db("applied", DbFlags::PLAIN)?,
+            rank_queue: env.create_db("rank_queue", DbFlags::PLAIN)?,
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
             history: env.create_db("history", DbFlags::DUP_FIXED)?,
             expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,
@@ -360,9 +381,11 @@ impl Store {
             indexed_tags,
             history,
             wot,
+            rank,
         };
         store.prune_all()?;
         wot::open(&store, store.wot.as_ref())?;
+        rank::open(&store)?;
         Ok(store)
     }
 
@@ -473,25 +496,35 @@ impl Store {
         }
     }
 
-    /// Push trust along for a turn, in a transaction of its own. Returns
-    /// whether there's more to push.
-    pub fn wot_turn(&self) -> Result<bool> {
-        let Some(wot) = &self.wot else {
-            return Ok(false);
+    pub fn wot(&self) -> Option<&Wot> {
+        self.wot.as_ref()
+    }
+
+    pub fn rank(&self) -> &Rank {
+        &self.rank
+    }
+
+    /// Do a turn's worth of background work, in a transaction of its own:
+    /// push trust along, or once that's done, apply engagers' new weights
+    /// to the scores of what they've engaged with. Returns whether there
+    /// was any to do.
+    pub fn turn(&self) -> Result<bool> {
+        // Most of the time there's nothing to do: don't take the lock.
+        let (push, walk) = {
+            let txn = self.read()?;
+            let push = self.wot.is_some() && txn.cursor(self.tables.wot_queue)?.first()?.is_some();
+            (push, !push && rank::due(self, &txn)?)
         };
-        // Most of the time there's nothing to push: don't take the lock.
-        if self
-            .read()?
-            .cursor(self.tables.wot_queue)?
-            .first()?
-            .is_none()
-        {
-            return Ok(false);
-        }
         let mut txn = self.write()?;
-        let more = wot::turn(self, &mut txn, wot)?;
+        match (&self.wot, push, walk) {
+            (Some(wot), true, _) => {
+                wot::turn(self, &mut txn, wot)?;
+            }
+            (_, false, true) => rank::turn(self, &mut txn)?,
+            _ => return Ok(false),
+        }
         txn.commit()?;
-        Ok(more)
+        Ok(true)
     }
 
     /// The sequence number the next stored event will get.
@@ -605,6 +638,7 @@ impl Store {
         for (key, value) in self.tag_keys(&view) {
             self.sketch(txn, &key, &value, view.pubkey())?;
         }
+        rank::index(self, txn, seq, &view)?;
         if let Some(address) = &address {
             txn.put(t.replaceable, address, &seq.to_be_bytes())?;
             txn.put_dup(t.history, address, &stamp)?;
@@ -1040,6 +1074,7 @@ impl Store {
     fn unindex_view(&self, txn: &mut RwTxn, seq: u64, view: &EventView) -> Result<()> {
         let t = self.tables;
         let stamp = stamp(view.created_at(), seq);
+        rank::unindex(self, txn, seq, view)?;
         for (db, key) in self.index_keys(view) {
             txn.del(db, &key, Some(&stamp))?;
         }
@@ -1227,8 +1262,8 @@ impl Writer {
                 // Whether the web of trust may have pushing to do.
                 let mut trust = true;
                 let turn = |trust: &mut bool| {
-                    *trust = store.wot_turn().unwrap_or_else(|err| {
-                        tracing::error!("pushing trust failed: {err}");
+                    *trust = store.turn().unwrap_or_else(|err| {
+                        tracing::error!("a background turn failed: {err}");
                         false
                     });
                 };
@@ -1323,7 +1358,15 @@ pub mod tests {
 
     fn open_with(map_size: usize, history: History) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), map_size, test_tags(), history, None).unwrap();
+        let store = Store::open(
+            dir.path(),
+            map_size,
+            test_tags(),
+            history,
+            None,
+            Rank::default(),
+        )
+        .unwrap();
         (dir, store)
     }
 
@@ -1592,7 +1635,15 @@ pub mod tests {
 
         // Reopened with a lower cap, pruned to it.
         let history = History::new(true, vec![], 5);
-        let store = Store::open(dir.path(), 1 << 26, test_tags(), history, None).unwrap();
+        let store = Store::open(
+            dir.path(),
+            1 << 26,
+            test_tags(),
+            history,
+            None,
+            Rank::default(),
+        )
+        .unwrap();
         assert_eq!(history_len(&store), 5);
         assert!(versions[20..].iter().all(|event| has(&store, event)));
         assert_eq!(store.len(&store.read().unwrap()).unwrap(), 5);
@@ -1603,7 +1654,15 @@ pub mod tests {
 
         // A higher cap prunes nothing, and keeps more from then on.
         let history = History::new(true, vec![], 7);
-        let store = Store::open(dir.path(), 1 << 26, test_tags(), history, None).unwrap();
+        let store = Store::open(
+            dir.path(),
+            1 << 26,
+            test_tags(),
+            history,
+            None,
+            Rank::default(),
+        )
+        .unwrap();
         assert_eq!(history_len(&store), 5);
         put(&store, &version(2000));
         put(&store, &version(2010));

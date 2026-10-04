@@ -85,6 +85,9 @@ pub fn run(
                 Some(search) => search.run(store, &txn, filter, query, limit)?,
                 None => Vec::new(),
             },
+            (Some(query), _) if query.sort.is_ranked() => {
+                crate::rank::run(store, &txn, filter, limit)?
+            }
             _ => run_filter(store, &txn, filter, limit)?,
         };
         for (seq, view) in found {
@@ -99,7 +102,7 @@ pub fn run(
     Ok(Results { next_seq, events })
 }
 
-fn run_filter<'t>(
+pub fn run_filter<'t>(
     store: &Store,
     txn: &'t Txn,
     filter: &Filter,

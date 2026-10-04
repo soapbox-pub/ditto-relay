@@ -46,14 +46,36 @@ pub struct Search {
     /// match. Usually one term each; `-e-cash` makes two. Never with
     /// autocomplete.
     pub excluded: Vec<Vec<String>>,
-    /// `sort:new`: the newest matches rather than the most relevant.
-    pub sort_new: bool,
+    /// The order to find matches in.
+    pub sort: Sort,
     /// `autocomplete:true`: the terms are prefixes of names and titles.
     pub autocomplete: bool,
     /// The other extensions, which an event must meet all of. Sorted.
     pub conditions: Vec<Condition>,
     /// `distinct:author`: only the first event found of each author.
     pub distinct_author: bool,
+}
+
+/// What order a search finds matches in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Sort {
+    /// The most relevant to the search's text first, or with no text,
+    /// the newest.
+    #[default]
+    Relevance,
+    /// `sort:new`: the newest first.
+    New,
+    /// `sort:top`: the most engaged with by people the relay trusts.
+    Top,
+    /// `sort:hot`: likewise, but newer counts for more.
+    Hot,
+}
+
+impl Sort {
+    /// Whether matches are [ranked](crate::rank).
+    pub fn is_ranked(self) -> bool {
+        matches!(self, Sort::Top | Sort::Hot)
+    }
 }
 
 impl Search {
@@ -218,7 +240,7 @@ impl Filter {
 /// search at all.
 fn parse_search(value: &Value) -> Result<Option<Search>, String> {
     let text = value.as_str().ok_or("invalid: search must be a string")?;
-    let mut sort_new = false;
+    let mut sort = None;
     let mut autocomplete = false;
     let mut distinct_author = false;
     let mut conditions = Vec::new();
@@ -226,7 +248,15 @@ fn parse_search(value: &Value) -> Result<Option<Search>, String> {
     let mut excluded = Vec::new();
     for word in text.split_whitespace() {
         match extension(word) {
-            Some(("sort", "new")) => sort_new = true,
+            // The first one counts.
+            Some(("sort", order)) => {
+                sort = sort.or(match order {
+                    "new" => Some(Sort::New),
+                    "top" => Some(Sort::Top),
+                    "hot" => Some(Sort::Hot),
+                    _ => None,
+                })
+            }
             Some(("autocomplete", "true")) => autocomplete = true,
             Some(("distinct", "author")) => distinct_author = true,
             Some((key, value)) => conditions.extend(Condition::parse(key, value)),
@@ -261,12 +291,16 @@ fn parse_search(value: &Value) -> Result<Option<Search>, String> {
     let search = Search {
         terms,
         excluded,
-        sort_new,
+        sort: sort.unwrap_or_default(),
         autocomplete,
         conditions,
         distinct_author,
     };
-    Ok((search.has_text() || !search.conditions.is_empty() || distinct_author).then_some(search))
+    let something = search.has_text()
+        || !search.conditions.is_empty()
+        || distinct_author
+        || search.sort.is_ranked();
+    Ok(something.then_some(search))
 }
 
 /// A NIP-50 extension's key and value. Not a URL's scheme and the rest.
@@ -426,11 +460,14 @@ mod tests {
         let search = |text: &str| parse(&json!({"search": text})).unwrap().search;
         let parsed = search("Nostr sort:new include:spam https://x.com nostr").unwrap();
         assert_eq!(parsed.terms, ["com", "https", "nostr", "x"]);
-        assert!(parsed.sort_new);
-        assert!(!search("rust").unwrap().sort_new);
+        assert_eq!(parsed.sort, Sort::New);
+        assert_eq!(search("rust").unwrap().sort, Sort::Relevance);
+        assert_eq!(search("rust sort:hot sort:new").unwrap().sort, Sort::Hot);
+        assert_eq!(search("sort:top").unwrap().sort, Sort::Top);
+        assert_eq!(search("rust sort:best").unwrap().sort, Sort::Relevance);
         assert!(!parsed.autocomplete);
         let parsed = search("Jac autocomplete:true sort:new").unwrap();
-        assert!(parsed.autocomplete && parsed.sort_new);
+        assert!(parsed.autocomplete && parsed.sort == Sort::New);
         assert_eq!(parsed.terms, ["jac"]);
         let parsed = search("well-known -Bitcoin -e-cash - -!! -bitcoin").unwrap();
         assert_eq!(parsed.terms, ["known", "well"]);
