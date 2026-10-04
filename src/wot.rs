@@ -117,12 +117,7 @@ impl Wot {
 
     /// What, if it changes, means starting over.
     pub fn params(&self) -> Vec<u8> {
-        [
-            &ONE.to_be_bytes()[..],
-            &self.damping.to_be_bytes(),
-            &self.epsilon.to_be_bytes(),
-        ]
-        .concat()
+        [&self.damping.to_be_bytes()[..], &self.epsilon.to_be_bytes()].concat()
     }
 
     /// Whether an author is due a push.

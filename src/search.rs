@@ -289,9 +289,8 @@ pub struct SearchIndex {
 }
 
 impl SearchIndex {
-    /// Open the index at `dir`, or create it, rebuilding it if its schema
-    /// differs or it doesn't belong with `store`. The indexer catches it up
-    /// once spawned.
+    /// Open the index at `dir`, or create it, rebuilding it if it doesn't
+    /// belong with `store`. The indexer catches it up once spawned.
     pub fn open(
         dir: &Path,
         mut kinds: Vec<u16>,
@@ -312,7 +311,7 @@ impl SearchIndex {
                 .and_then(|payload| serde_json::from_str::<Payload>(&payload).ok());
             match payload {
                 // Further along than the LMDB means it's another LMDB's.
-                Some(p) if p.next_seq <= store_next_seq && index.schema() == schema => {
+                Some(p) if p.next_seq <= store_next_seq => {
                     opened = Some((index, p.next_seq));
                 }
                 _ => {
