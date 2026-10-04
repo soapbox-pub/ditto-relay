@@ -22,7 +22,7 @@
 //! | `facets`        | facet key (see [`facets`])   | stamps                 |
 //! | `wot`           | pubkey                       | trust state ([`wot`])  |
 //! | `wot_queue`     | pubkey                       | nothing                |
-//! | `engagement`    | engager ‖ target id          | count ([`rank`])       |
+//! | `engagement`    | engager ‖ target id          | counts ([`rank`])      |
 //! | `scores`        | target id                    | score and whereabouts  |
 //! | `ranked`        | mode ‖ kind                  | rank ‖ seq (48 bits)   |
 //! | `applied`       | pubkey                       | weight applied         |
@@ -80,8 +80,8 @@
 //! With a [web of trust](wot), each author's trust is kept in `wot`, and
 //! moved along in the same transaction as a follow list that changes it.
 //!
-//! Engagement is counted, scored, and [ranked](rank) for `sort:top` and
-//! `sort:hot` as events are indexed and unindexed.
+//! Engagement is counted, scored, and [ranked](rank) for the ranked sorts
+//! as events are indexed and unindexed.
 //!
 //! Each tag key with at least [`HLL_THRESHOLD`] events has a NIP-45
 //! [HyperLogLog](crate::hll) sketch of their authors in `hll`, kept up as
@@ -108,7 +108,7 @@ use crate::record::{Element, EventView, tag_value};
 use crate::wot::{self, Wot};
 
 /// Bumped when the layout changes incompatibly.
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 
 pub const STAMP_LEN: usize = 10;
 pub type Stamp = [u8; STAMP_LEN];

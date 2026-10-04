@@ -489,7 +489,7 @@ impl SearchIndex {
     }
 
     /// Run a search filter: the best matches by relevance, or with
-    /// `sort:new`, the newest, or with `sort:top` or `sort:hot`, the best
+    /// `sort:new`, the newest, or with a ranked sort, the best
     /// [ranked](crate::rank) of up to [`MAX_HITS`] matches.
     pub fn run<'t>(
         &self,
@@ -1020,6 +1020,14 @@ mod tests {
         assert_eq!(
             f.search(json!({"search": "cat sort:top distinct:author", "limit": 2})),
             ids(&[&four, &one])
+        );
+        // Only the argued over are controversial; the rest, newest first.
+        let reply = signed(7, 600, 1, vec![vec!["e", &two.id, "", "root"]], "no");
+        put(&f.store, &reply);
+        put(&f.store, &react(8, &two));
+        assert_eq!(
+            f.search(json!({"search": "cat sort:controversial"})),
+            ids(&[&two, &three, &one, &four])
         );
     }
 

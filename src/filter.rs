@@ -70,12 +70,18 @@ pub enum Sort {
     Top,
     /// `sort:hot`: likewise, but newer counts for more.
     Hot,
+    /// `sort:controversial`: as much commented on as reacted to.
+    Controversial,
+    /// `sort:rising`: engaged with fastest for its age, this past week.
+    Rising,
+    /// `sort:zaps`: the most zapped, by people the relay trusts.
+    Zaps,
 }
 
 impl Sort {
     /// Whether matches are [ranked](crate::rank).
     pub fn is_ranked(self) -> bool {
-        matches!(self, Sort::Top | Sort::Hot)
+        !matches!(self, Sort::Relevance | Sort::New)
     }
 }
 
@@ -167,16 +173,19 @@ impl Filter {
             }
         }
 
+        let mut sorts = 0;
         if let Some(value) = search {
             let profiles = filter.kinds.as_deref() == Some(&[0]);
-            filter.search = parse_search(value, profiles)?;
+            (filter.search, sorts) = parse_search(value, profiles)?;
         }
         filter.tags.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         filter.never = filter.ids.as_ref().is_some_and(Vec::is_empty)
             || filter.authors.as_ref().is_some_and(Vec::is_empty)
             || filter.kinds.as_ref().is_some_and(Vec::is_empty)
             || filter.tags.iter().any(|(_, values)| values.is_empty())
-            || filter.since > filter.until;
+            || filter.since > filter.until
+            // Which order is meant is anyone's guess.
+            || sorts > 1;
         Ok(filter)
     }
 
@@ -245,10 +254,11 @@ impl Filter {
 /// understands. Any other `key:value` is an extension it doesn't, which
 /// NIP-50 says to ignore. With nothing left to look up or check, it's no
 /// search at all. One of `profiles`, a filter of only kind 0, autocompletes
-/// unless it says otherwise.
-fn parse_search(value: &Value, profiles: bool) -> Result<Option<Search>, String> {
+/// unless it says otherwise. With the search, how many `sort:`s it has.
+fn parse_search(value: &Value, profiles: bool) -> Result<(Option<Search>, usize), String> {
     let text = value.as_str().ok_or("invalid: search must be a string")?;
     let mut sort = None;
+    let mut sorts = 0;
     let mut autocomplete = None;
     let mut distinct_author = false;
     let mut conditions = Vec::new();
@@ -256,14 +266,17 @@ fn parse_search(value: &Value, profiles: bool) -> Result<Option<Search>, String>
     let mut excluded = Vec::new();
     for word in text.split_whitespace() {
         match extension(word) {
-            // The first one counts.
             Some(("sort", order)) => {
-                sort = sort.or(match order {
+                sorts += 1;
+                sort = match order {
                     "new" => Some(Sort::New),
                     "top" => Some(Sort::Top),
                     "hot" => Some(Sort::Hot),
+                    "controversial" => Some(Sort::Controversial),
+                    "rising" => Some(Sort::Rising),
+                    "zaps" => Some(Sort::Zaps),
                     _ => None,
-                })
+                }
             }
             // The first one counts.
             Some(("autocomplete", "true")) => autocomplete = autocomplete.or(Some(true)),
@@ -307,7 +320,7 @@ fn parse_search(value: &Value, profiles: bool) -> Result<Option<Search>, String>
         || !search.conditions.is_empty()
         || distinct_author
         || search.sort.is_ranked();
-    Ok(something.then_some(search))
+    Ok((something.then_some(search), sorts))
 }
 
 /// A NIP-50 extension's key and value. Not a URL's scheme and the rest.
@@ -479,9 +492,24 @@ mod tests {
         assert_eq!(parsed.terms, ["com", "https", "nostr", "x"]);
         assert_eq!(parsed.sort, Sort::New);
         assert_eq!(search("rust").unwrap().sort, Sort::Relevance);
-        assert_eq!(search("rust sort:hot sort:new").unwrap().sort, Sort::Hot);
         assert_eq!(search("sort:top").unwrap().sort, Sort::Top);
         assert_eq!(search("rust sort:best").unwrap().sort, Sort::Relevance);
+        for (order, sort) in [
+            ("controversial", Sort::Controversial),
+            ("rising", Sort::Rising),
+            ("zaps", Sort::Zaps),
+        ] {
+            assert_eq!(search(&format!("sort:{order}")).unwrap().sort, sort);
+        }
+        // Two orders, even the same or unknown ones, match nothing.
+        for text in [
+            "rust sort:hot sort:new",
+            "sort:top sort:top",
+            "sort:x sort:y",
+        ] {
+            assert!(parse(&json!({"search": text})).unwrap().never, "{text}");
+        }
+        assert!(!parse(&json!({"search": "sort:top"})).unwrap().never);
         assert!(!parsed.autocomplete);
         let parsed = search("Jac autocomplete:true sort:new").unwrap();
         assert!(parsed.autocomplete && parsed.sort == Sort::New);
