@@ -43,12 +43,13 @@ pub struct Search {
     /// Empty when the search only excludes.
     pub terms: Vec<String>,
     /// From `-word`s: an event with every term of any of these doesn't
-    /// match. Usually one term each; `-e-cash` makes two. Never with
-    /// autocomplete.
+    /// match. Usually one term each; `-e-cash` makes two.
     pub excluded: Vec<Vec<String>>,
     /// The order to find matches in.
     pub sort: Sort,
-    /// `autocomplete:true`: the terms are prefixes of names and titles.
+    /// The terms, and those excluded, are prefixes of names and titles.
+    /// On for filters of only kind 0 unless `autocomplete:false`, and for
+    /// others with `autocomplete:true`.
     pub autocomplete: bool,
     /// The other extensions, which an event must meet all of. Sorted.
     pub conditions: Vec<Condition>,
@@ -105,6 +106,8 @@ impl Filter {
             until: u32::MAX,
             ..Filter::default()
         };
+        // Parsed last: whether it autocompletes depends on the kinds.
+        let mut search = None;
 
         for (name, value) in fields {
             match name.as_str() {
@@ -127,7 +130,7 @@ impl Filter {
                 }
                 "since" => filter.since = timestamp(name, value)?,
                 "until" => filter.until = timestamp(name, value)?,
-                "search" => filter.search = parse_search(value)?,
+                "search" => search = Some(value),
                 "limit" => {
                     filter.limit = Some(
                         value
@@ -164,6 +167,10 @@ impl Filter {
             }
         }
 
+        if let Some(value) = search {
+            let profiles = filter.kinds.as_deref() == Some(&[0]);
+            filter.search = parse_search(value, profiles)?;
+        }
         filter.tags.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         filter.never = filter.ids.as_ref().is_some_and(Vec::is_empty)
             || filter.authors.as_ref().is_some_and(Vec::is_empty)
@@ -179,7 +186,7 @@ impl Filter {
                 .search
                 .as_ref()
                 .is_none_or(|search| match search.autocomplete {
-                    true => search::matches_prefixes(&search.terms, event),
+                    true => search::matches_prefixes(&search.terms, &search.excluded, event),
                     false => search::matches(&search.terms, &search.excluded, event),
                 })
     }
@@ -237,11 +244,12 @@ impl Filter {
 /// A search's terms, the words it excludes, and the extensions it
 /// understands. Any other `key:value` is an extension it doesn't, which
 /// NIP-50 says to ignore. With nothing left to look up or check, it's no
-/// search at all.
-fn parse_search(value: &Value) -> Result<Option<Search>, String> {
+/// search at all. One of `profiles`, a filter of only kind 0, autocompletes
+/// unless it says otherwise.
+fn parse_search(value: &Value, profiles: bool) -> Result<Option<Search>, String> {
     let text = value.as_str().ok_or("invalid: search must be a string")?;
     let mut sort = None;
-    let mut autocomplete = false;
+    let mut autocomplete = None;
     let mut distinct_author = false;
     let mut conditions = Vec::new();
     let mut words = Vec::new();
@@ -257,7 +265,9 @@ fn parse_search(value: &Value) -> Result<Option<Search>, String> {
                     _ => None,
                 })
             }
-            Some(("autocomplete", "true")) => autocomplete = true,
+            // The first one counts.
+            Some(("autocomplete", "true")) => autocomplete = autocomplete.or(Some(true)),
+            Some(("autocomplete", "false")) => autocomplete = autocomplete.or(Some(false)),
             Some(("distinct", "author")) => distinct_author = true,
             Some((key, value)) => conditions.extend(Condition::parse(key, value)),
             None => match word.strip_prefix('-') {
@@ -272,9 +282,6 @@ fn parse_search(value: &Value) -> Result<Option<Search>, String> {
                 None => words.push(word),
             },
         }
-    }
-    if autocomplete {
-        excluded.clear();
     }
     excluded.sort_unstable();
     excluded.dedup();
@@ -292,7 +299,7 @@ fn parse_search(value: &Value) -> Result<Option<Search>, String> {
         terms,
         excluded,
         sort: sort.unwrap_or_default(),
-        autocomplete,
+        autocomplete: autocomplete.unwrap_or(profiles),
         conditions,
         distinct_author,
     };
@@ -453,6 +460,16 @@ mod tests {
         );
         assert!(matches(autocomplete("nan fac"), &article));
         assert!(!matches(autocomplete("bod"), &article));
+        // Exclusions are prefixes of names too.
+        assert!(!matches(autocomplete("jac -dor"), &event));
+        assert!(matches(autocomplete("jac -bitcoin"), &event));
+        assert!(!matches(autocomplete("-jack-dor"), &event));
+        assert!(matches(autocomplete("-jack-bit"), &event));
+        // Profile searches autocomplete by default.
+        assert!(matches(json!({"search": "jac", "kinds": [0]}), &event));
+        assert!(!matches(json!({"search": "bitcoin", "kinds": [0]}), &event));
+        let plain = json!({"search": "bitcoin autocomplete:false", "kinds": [0]});
+        assert!(matches(plain, &event));
     }
 
     #[test]
@@ -475,10 +492,24 @@ mod tests {
         let parsed = search("-bitcoin").unwrap();
         assert!(parsed.terms.is_empty());
         assert_eq!(parsed.excluded, [vec!["bitcoin"]]);
-        // Autocomplete ignores exclusions.
         let parsed = search("jac -dorsey autocomplete:true").unwrap();
-        assert!(parsed.excluded.is_empty());
-        assert!(search("-dorsey autocomplete:true").is_none());
+        assert_eq!(parsed.excluded, [vec!["dorsey"]]);
+        // Only kind 0 autocompletes unless told not to; the first says.
+        let of_kinds = |text: &str, kinds| {
+            parse(&json!({"search": text, "kinds": kinds}))
+                .unwrap()
+                .search
+                .unwrap()
+        };
+        assert!(of_kinds("jac", json!([0])).autocomplete);
+        assert!(!of_kinds("jac", json!([0, 1])).autocomplete);
+        assert!(!of_kinds("jac", json!([1])).autocomplete);
+        assert!(!of_kinds("jac autocomplete:false", json!([0])).autocomplete);
+        assert!(!of_kinds("jac autocomplete:false autocomplete:true", json!([0])).autocomplete);
+        assert!(of_kinds("jac autocomplete:true", json!([1])).autocomplete);
+        // Whichever order the fields come in.
+        let filter: Value = serde_json::from_str(r#"{"search": "jac", "kinds": [0]}"#).unwrap();
+        assert!(parse(&filter).unwrap().search.unwrap().autocomplete);
         // Only extensions that change nothing, or only punctuation: no
         // search.
         assert!(search("sort:new include:spam").is_none());

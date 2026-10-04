@@ -32,12 +32,14 @@
 //!
 //! [conditions]: crate::facets
 //!
-//! With `autocomplete:true`, a search looks instead at the names people
-//! look things up by — a profile's name, display name, and NIP-05, and any
-//! event's title — and its terms are prefixes. Those are indexed in a field
-//! of their own as every prefix of every word, up to [`MAX_PREFIX`]
-//! characters, so a prefix is looked up like any term. Names are indexed
-//! whatever the kind: the searchable kinds only limit ordinary search.
+//! An autocomplete search looks instead at the names people look things up
+//! by — a profile's name, display name, and NIP-05, and any event's title —
+//! and its terms, and those it excludes, are prefixes. A search of only
+//! kind 0 autocompletes unless it says `autocomplete:false`; any other with
+//! `autocomplete:true`. Names are indexed in a field of their own as every
+//! prefix of every word, up to [`MAX_PREFIX`] characters, so a prefix is
+//! looked up like any term. Names are indexed whatever the kind: the
+//! searchable kinds only limit ordinary search.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -209,15 +211,14 @@ pub fn names(view: &EventView) -> String {
 }
 
 /// Whether every term of an autocomplete search begins a word of an
-/// event's names.
-pub fn matches_prefixes(terms: &[String], view: &EventView) -> bool {
-    if terms.is_empty() {
+/// event's names, and not every term of any group it excludes does.
+pub fn matches_prefixes(terms: &[String], excluded: &[Vec<String>], view: &EventView) -> bool {
+    if terms.is_empty() && excluded.is_empty() {
         return true;
     }
     let have = tokens(&names(view));
-    terms
-        .iter()
-        .all(|term| have.iter().any(|word| word.starts_with(term.as_str())))
+    let begins = |term: &String| have.iter().any(|word| word.starts_with(term.as_str()));
+    terms.iter().all(begins) && !excluded.iter().any(|group| group.iter().all(begins))
 }
 
 /// Every prefix of every word of `text`, up to [`MAX_PREFIX`] characters,
@@ -439,8 +440,16 @@ impl SearchIndex {
             })
             .collect();
         for group in &search.excluded {
+            // Prefixes longer than are indexed would exclude words they
+            // don't begin: those hits are checked by hand instead.
+            if search.autocomplete && group.iter().any(|term| prefix(term) != term) {
+                continue;
+            }
             let mut terms = group.iter().map(|term| {
-                let term = Term::from_field_text(f.text, term);
+                let term = match search.autocomplete {
+                    true => Term::from_field_text(f.names, term),
+                    false => Term::from_field_text(f.text, term),
+                };
                 Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>
             });
             let query = match group.len() {
@@ -1230,6 +1239,16 @@ mod tests {
         assert!(f.search(autocomplete("orsey")).is_empty());
         // Ordinary search still finds the bio.
         assert_eq!(f.search(json!({"search": "bitcoin"})).len(), 3);
+        // Exclusions are prefixes of names too.
+        assert_eq!(f.search(autocomplete("ali -won")), [ali.id.as_str()]);
+        assert_eq!(f.search(autocomplete("ali -wonderlands")).len(), 2);
+        assert_eq!(f.search(autocomplete("ali -alice-fan")), [ali.id.as_str()]);
+        // Profiles autocomplete unless told not to.
+        let profiles = |text: &str| json!({"search": text, "kinds": [0]});
+        assert_eq!(f.search(profiles("jac")), [jack.id.as_str()]);
+        assert!(f.search(profiles("bitcoin")).is_empty());
+        assert_eq!(f.search(profiles("bitcoin autocomplete:false")).len(), 3);
+        assert!(f.search(profiles("jac autocomplete:false")).is_empty());
 
         // Any kind with a title, searchable or not; but only its title.
         let listing = signed(
@@ -1259,6 +1278,9 @@ mod tests {
             [long.id.as_str()]
         );
         assert!(f.search(autocomplete("supercalifragilisticky")).is_empty());
+        let excluding = |rest: &str| f.search(autocomplete(&format!("sup -{rest}")));
+        assert!(excluding("supercalifragilisticexpi").is_empty());
+        assert_eq!(excluding("supercalifragilisticky"), [long.id.as_str()]);
 
         // Not hidden kinds, indexed or not yet.
         let settings = signed(
