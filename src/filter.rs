@@ -225,11 +225,47 @@ impl Filter {
         if !self.wants_kind(event.kind()) {
             return false;
         }
-        self.tags.iter().all(|(name, values)| {
-            event.tag_values().any(|(n, value)| {
-                n == name && values.binary_search_by(|v| value.compare(v)).is_ok()
-            })
-        })
+        self.matches_tags(event)
+    }
+
+    /// Whether the event has a value the filter wants of every tag it
+    /// names. The event's tags are gone through once, each looked up by
+    /// its name, however many tags the filter names.
+    fn matches_tags(&self, event: &EventView) -> bool {
+        let n = self.tags.len();
+        if n == 0 {
+            return true;
+        }
+        if n > 64 {
+            // More than the bits to note them in: one pass per tag.
+            return self.tags.iter().all(|(name, values)| {
+                event.tag_values().any(|(n, value)| {
+                    n == name && values.binary_search_by(|v| value.compare(v)).is_ok()
+                })
+            });
+        }
+        let wanted = u64::MAX >> (64 - n);
+        let mut found = 0u64;
+        for (name, value) in event.tag_values() {
+            let Ok(i) = self
+                .tags
+                .binary_search_by(|(tag, _)| tag.as_str().cmp(name))
+            else {
+                continue;
+            };
+            if found & (1 << i) == 0
+                && self.tags[i]
+                    .1
+                    .binary_search_by(|v| value.compare(v))
+                    .is_ok()
+            {
+                found |= 1 << i;
+                if found == wanted {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Whether events of a kind can match.
@@ -412,6 +448,10 @@ mod tests {
         assert!(!matches(json!({"kinds": [7]}), &event));
         assert!(matches(json!({"#e": [hex], "#t": ["rust", "go"]}), &event));
         assert!(!matches(json!({"#e": [hex], "#t": ["go"]}), &event));
+        assert!(matches(
+            json!({"#title": ["x"], "#t": ["nostr"], "#e": [hex]}),
+            &event
+        ));
         assert!(!matches(json!({"#e": [hex.to_uppercase()]}), &event));
         assert!(matches(json!({"since": 100, "until": 100}), &event));
         assert!(!matches(json!({"since": 101}), &event));
