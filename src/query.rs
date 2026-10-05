@@ -44,8 +44,10 @@ use crate::store::{
     stamp_created_at, stamp_seq, tag_key, tag_key_kind,
 };
 
-/// The most author × kind keys a filter may be planned over together.
-const MAX_AUTHOR_KINDS: usize = 1024;
+/// The most author × kind keys a filter may be planned over together, if
+/// it has more than one kind. With one, there are no more of them than
+/// authors.
+const MAX_AUTHOR_KINDS: usize = 4096;
 
 /// The most records one filter may examine. Only filters whose fields the
 /// index can't pin down examine records that don't match, and this bounds
@@ -217,7 +219,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
     let no_tags = filter.tags.is_empty() && filter.search.is_none();
 
     if let (Some(authors), Some(kinds)) = (&filter.authors, &filter.kinds)
-        && authors.len() * kinds.len() <= MAX_AUTHOR_KINDS
+        && (kinds.len() == 1 || authors.len() * kinds.len() <= MAX_AUTHOR_KINDS)
     {
         let keys = authors
             .iter()
@@ -728,6 +730,13 @@ mod tests {
         let p = plan_for(json!({"authors": [alice], "kinds": kinds}));
         assert_eq!(p.db, store.tables.authors);
         assert!(p.exact && p.kinds.is_some());
+        // But one kind's keys are never more than the authors'.
+        let authors: Vec<String> = (0..MAX_AUTHOR_KINDS + 1)
+            .map(|i| format!("{i:064x}"))
+            .chain([alice.clone()])
+            .collect();
+        let p = plan_for(json!({"authors": authors, "kinds": [1]}));
+        assert_eq!(p.db, store.tables.author_kinds);
         assert_eq!(plan_for(json!({"since": 5})).keys, [CREATED]);
         // A search is checked whatever the index.
         assert!(!plan_for(json!({"kinds": [1], "search": "-x"})).exact);
