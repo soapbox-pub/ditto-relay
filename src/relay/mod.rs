@@ -11,10 +11,11 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -243,8 +244,14 @@ fn is_protected(ev: &Event) -> bool {
         .any(|tag| tag.first().is_some_and(|name| name == "-"))
 }
 
-/// Outgoing queue depth per connection before we apply backpressure.
-const OUTBOX_SIZE: usize = 1024;
+/// How long one write to a client may take — one message, or a query's
+/// results all together — before it's taken to have stopped reading and
+/// is dropped.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often a client is pinged. One not heard from in two of these, pong
+/// or otherwise, has gone without closing, and is dropped.
+const PING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The most live events held for a subscription while its query runs.
 /// Past this it's closed, and its client can ask again.
@@ -312,7 +319,7 @@ struct Connection {
     subs: HashMap<String, Subscription>,
     /// Stops every query of the connection's once it's gone.
     cancel: CancellationToken,
-    outbox: mpsc::Sender<String>,
+    sink: SplitSink<WebSocket, Message>,
     ip: IpAddr,
     /// What this connection signs to authenticate (NIP-42), once it's
     /// been asked to: only to publish a NIP-70 protected event.
@@ -327,25 +334,17 @@ struct Disconnect;
 impl Connection {
     async fn run(socket: WebSocket, state: AppState, ip: IpAddr) {
         let _connected = Connected::new();
-        let (mut sink, mut stream) = socket.split();
-        let (outbox, mut outbox_rx) = mpsc::channel::<String>(OUTBOX_SIZE);
-
-        let sender = tokio::spawn(async move {
-            while let Some(msg) = outbox_rx.recv().await {
-                if sink.send(Message::Text(msg.into())).await.is_err() {
-                    break;
-                }
-            }
-            let _ = sink.close().await;
-        });
-
+        let (sink, mut stream) = socket.split();
+        let start = tokio::time::Instant::now() + PING_INTERVAL;
+        let mut ping = tokio::time::interval_at(start, PING_INTERVAL);
+        let mut heard = Instant::now();
         let mut live = state.live.subscribe();
         let mut queries = JoinSet::new();
         let mut conn = Connection {
             state,
             subs: HashMap::new(),
             cancel: CancellationToken::new(),
-            outbox,
+            sink,
             ip,
             challenge: None,
             authed: HashSet::new(),
@@ -353,12 +352,22 @@ impl Connection {
 
         loop {
             let result = tokio::select! {
-                msg = stream.next() => match msg {
-                    Some(Ok(Message::Text(text))) => conn.on_message(text.as_str(), &mut queries).await,
-                    Some(Ok(Message::Binary(_))) => conn.notice("error: binary messages are not supported").await,
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => Ok(()),
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Disconnect),
-                },
+                _ = ping.tick() => {
+                    if heard.elapsed() > 2 * PING_INTERVAL {
+                        tracing::debug!("dropping a client that went silent");
+                        break;
+                    }
+                    write_within(conn.sink.send(Message::Ping(Default::default()))).await
+                }
+                msg = stream.next() => {
+                    heard = Instant::now();
+                    match msg {
+                        Some(Ok(Message::Text(text))) => conn.on_message(text.as_str(), &mut queries).await,
+                        Some(Ok(Message::Binary(_))) => conn.notice("error: binary messages are not supported").await,
+                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => Ok(()),
+                        Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Disconnect),
+                    }
+                }
                 ev = live.recv() => match ev {
                     Ok(ev) => conn.on_live_event(&ev).await,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -384,34 +393,31 @@ impl Connection {
         // Dropping `queries` drops their tasks, but not what they left
         // running on the blocking pool.
         conn.cancel.cancel();
-        drop(conn);
-        let _ = sender.await;
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, conn.sink.close()).await;
     }
 
-    async fn send_raw(&self, text: String) -> Result<(), Disconnect> {
-        self.outbox.send(text).await.map_err(|_| Disconnect)
+    async fn send_raw(&mut self, text: String) -> Result<(), Disconnect> {
+        write_within(self.sink.send(Message::Text(text.into()))).await
     }
 
-    async fn send(&self, msg: &impl Serialize) -> Result<(), Disconnect> {
+    async fn send(&mut self, msg: &impl Serialize) -> Result<(), Disconnect> {
         let text = serde_json::to_string(msg).expect("relay message serialization cannot fail");
         self.send_raw(text).await
     }
 
-    /// `["EVENT", sub_id, event]`, with the event already serialized.
-    async fn send_event(&self, sub_id: &str, json: &str) -> Result<(), Disconnect> {
-        let sub_id = serde_json::to_string(sub_id).expect("strings serialize");
-        self.send_raw(format!("[\"EVENT\",{sub_id},{json}]")).await
+    async fn send_event(&mut self, sub_id: &str, json: &str) -> Result<(), Disconnect> {
+        self.send_raw(event_message(sub_id, json)).await
     }
 
-    async fn notice(&self, msg: &str) -> Result<(), Disconnect> {
+    async fn notice(&mut self, msg: &str) -> Result<(), Disconnect> {
         self.send(&("NOTICE", msg)).await
     }
 
-    async fn ok(&self, id: &str, accepted: bool, msg: &str) -> Result<(), Disconnect> {
+    async fn ok(&mut self, id: &str, accepted: bool, msg: &str) -> Result<(), Disconnect> {
         self.send(&("OK", id, accepted, msg)).await
     }
 
-    async fn closed(&self, sub_id: &str, msg: &str) -> Result<(), Disconnect> {
+    async fn closed(&mut self, sub_id: &str, msg: &str) -> Result<(), Disconnect> {
         self.send(&("CLOSED", sub_id, msg)).await
     }
 
@@ -704,17 +710,26 @@ impl Connection {
         };
         sub.floor = results.next_seq;
         let pending = sub.pending.take().unwrap_or_default();
-        for json in &results.events {
-            self.send_event(&name, json).await?;
-        }
-        self.send(&("EOSE", &*name)).await?;
-        for ev in pending {
-            // Stored events the query could see were sent with it.
-            if ev.seq.is_none_or(|seq| seq >= results.next_seq) {
-                self.send_event(&name, &ev.json).await?;
+        let sink = &mut self.sink;
+        // All of it within one timeout, so a client reading just fast enough
+        // to keep each message from timing out can't hold its results long.
+        write_within(async move {
+            for json in &results.events {
+                sink.feed(Message::Text(event_message(&name, json).into()))
+                    .await?;
             }
-        }
-        Ok(())
+            let eose = serde_json::to_string(&("EOSE", &*name)).expect("strings serialize");
+            sink.feed(Message::Text(eose.into())).await?;
+            for ev in pending {
+                // Stored events the query could see were sent with it.
+                if ev.seq.is_none_or(|seq| seq >= results.next_seq) {
+                    sink.feed(Message::Text(event_message(&name, &ev.json).into()))
+                        .await?;
+                }
+            }
+            sink.flush().await
+        })
+        .await
     }
 
     /// A REQ's or COUNT's filters, or why they're refused.
@@ -852,6 +867,20 @@ impl Connection {
             self.closed(&sub_id, msg).await?;
         }
         Ok(())
+    }
+}
+
+/// `["EVENT", sub_id, event]`, with the event already serialized.
+fn event_message(sub_id: &str, json: &str) -> String {
+    let sub_id = serde_json::to_string(sub_id).expect("strings serialize");
+    format!("[\"EVENT\",{sub_id},{json}]")
+}
+
+/// A write to a client, within [`WRITE_TIMEOUT`].
+async fn write_within<T, E>(write: impl Future<Output = Result<T, E>>) -> Result<T, Disconnect> {
+    match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+        Ok(Ok(written)) => Ok(written),
+        _ => Err(Disconnect),
     }
 }
 
