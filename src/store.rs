@@ -355,6 +355,7 @@ impl Store {
     pub fn open(
         dir: &Path,
         map_size: usize,
+        sync: bool,
         indexed_tags: IndexedTags,
         history: History,
         wot: Option<Wot>,
@@ -363,7 +364,7 @@ impl Store {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("Could not create the database directory {}", dir.display())
         })?;
-        let env = Env::open(dir, map_size, 32, 1024)
+        let env = Env::open(dir, map_size, sync, 32, 1024)
             .with_context(|| format!("Could not open the database at {}", dir.display()))?;
         let tables = Tables {
             events: env.create_db("events", DbFlags::INTEGER_KEY)?,
@@ -1566,6 +1567,7 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             map_size,
+            true,
             test_tags(),
             history,
             None,
@@ -1882,6 +1884,7 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
+            true,
             test_tags(),
             history,
             None,
@@ -1901,6 +1904,7 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
+            true,
             test_tags(),
             history,
             None,

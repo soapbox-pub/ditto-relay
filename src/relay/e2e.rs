@@ -29,6 +29,7 @@ fn config() -> Config {
         metrics_bind: None,
         db_path: PathBuf::new(),
         map_size: 1 << 26,
+        lmdb_sync: true,
         url: "ws://relay.test".into(),
         public_url: "http://relay.test".into(),
         name: "test".into(),

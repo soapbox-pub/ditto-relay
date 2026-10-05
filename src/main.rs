@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(Store::open(
         &config.db_path,
         config.map_size,
+        config.lmdb_sync,
         indexed_tags,
         history,
         Wot::new(

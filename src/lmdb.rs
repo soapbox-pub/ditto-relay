@@ -137,7 +137,15 @@ unsafe impl Sync for Env {}
 
 impl Env {
     /// Open (creating if need be) the environment in the directory `path`.
-    pub fn open(path: &Path, map_size: usize, max_dbs: u32, max_readers: u32) -> Result<Env> {
+    /// Without `sync`, commits write into the map and return, and the
+    /// kernel flushes it when it likes.
+    pub fn open(
+        path: &Path,
+        map_size: usize,
+        sync: bool,
+        max_dbs: u32,
+        max_readers: u32,
+    ) -> Result<Env> {
         let path =
             CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
         let mut ptr = ptr::null_mut();
@@ -151,12 +159,16 @@ impl Env {
             // NOTLS: read transactions belong to no thread, so they can run on
             // any blocking-pool thread. NORDAHEAD: lookups are random, so
             // read-ahead mostly wastes page cache once the map outgrows RAM.
-            check(ffi::mdb_env_open(
-                ptr,
-                path.as_ptr(),
-                ffi::MDB_NOTLS | ffi::MDB_NORDAHEAD,
-                0o600,
-            ))?;
+            let mut flags = ffi::MDB_NOTLS | ffi::MDB_NORDAHEAD;
+            if !sync {
+                // Writing each dirty page with its own pwrite, as LMDB
+                // otherwise does, is most of what a commit costs, and on
+                // ZFS most of what the writer does. Writing into the map
+                // instead, the kernel flushes a page rewritten by many
+                // commits once.
+                flags |= ffi::MDB_WRITEMAP | ffi::MDB_MAPASYNC;
+            }
+            check(ffi::mdb_env_open(ptr, path.as_ptr(), flags, 0o600))?;
             Ok(env)
         }
     }
@@ -441,7 +453,7 @@ mod tests {
 
     fn open() -> (tempfile::TempDir, Env) {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), 1 << 24, 4, 16).unwrap();
+        let env = Env::open(dir.path(), 1 << 24, true, 4, 16).unwrap();
         (dir, env)
     }
 
@@ -464,6 +476,23 @@ mod tests {
             env.read_txn().unwrap().get(db, b"a").unwrap(),
             Some(&b"2"[..])
         );
+    }
+
+    /// Writing into the map, commits outlive the environment all the same.
+    #[test]
+    fn keeps_writes_without_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), 1 << 24, false, 4, 16).unwrap();
+        let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
+        let mut txn = env.write_txn().unwrap();
+        txn.put(db, b"a", &[7; 10_000]).unwrap();
+        txn.commit().unwrap();
+        drop(env);
+
+        let env = Env::open(dir.path(), 1 << 24, true, 4, 16).unwrap();
+        let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
+        let txn = env.read_txn().unwrap();
+        assert_eq!(txn.get(db, b"a").unwrap(), Some(&[7; 10_000][..]));
     }
 
     #[test]

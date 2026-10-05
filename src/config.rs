@@ -16,6 +16,11 @@ pub struct Config {
     pub db_path: PathBuf,
     /// LMDB map size in bytes. This is virtual address space, not disk usage.
     pub map_size: usize,
+    /// Whether each write is on disk before it's answered. Without, LMDB
+    /// writes into its map and leaves flushing it to the kernel, which
+    /// makes writes several times faster, but a crash of the machine (not
+    /// just the relay) can lose recent writes or corrupt the database.
+    pub lmdb_sync: bool,
     /// The relay's own URL, which NIP-42 authentication (to publish NIP-70
     /// protected events) and NIP-62 requests to vanish name it by.
     pub url: String,
@@ -119,6 +124,7 @@ impl Config {
             },
             db_path: env("RELAY_DB_PATH", PathBuf::from("./data/db"))?,
             map_size: env("RELAY_MAP_SIZE", 1 << 40)?,
+            lmdb_sync: env("RELAY_LMDB_SYNC", true)?,
             url,
             public_url,
             name: env("RELAY_NAME", "Ditto Relay".to_string())?,
