@@ -14,10 +14,17 @@
 //!
 //! | kind  | `d`                  | counts                                       |
 //! |-------|----------------------|----------------------------------------------|
-//! | 30382 | pubkey               | followers, posts                             |
+//! | 30382 | pubkey               | followers, trust, posts                      |
 //! | 30383 | event id             | comments, quotes, reposts, reactions, zaps   |
 //! | 30384 | `kind:pubkey:d`      | the same, by `a` tags                        |
 //! | 30385 | NIP-73 identifier    | comments, reactions, reposts, by `i` and `I` |
+//!
+//! With a [web of trust](crate::wot), a user's `rank` is their weight in it
+//! out of 100, and at least 1 if they have any: what their engagement
+//! counts for, so 100 for
+//! anyone trusted as much as one of the `full_trust` most trusted people,
+//! and 0 for anyone trusted less than the least weight counted. Unlike a
+//! count, a rank of 0 says something, so it's kept.
 //!
 //! A count of 0 is left out, and an assertion with nothing in it isn't made.
 
@@ -76,7 +83,10 @@ pub fn run(
                 ADDRESS => address(store, txn, d, &text)?,
                 _ => identifier(store, txn, d)?,
             };
-            let stats: Vec<_> = stats.into_iter().filter(|(_, n)| *n > 0).collect();
+            let stats: Vec<_> = stats
+                .into_iter()
+                .filter(|&(name, n)| n > 0 || name == "rank")
+                .collect();
             if stats.is_empty() {
                 continue;
             }
@@ -117,11 +127,16 @@ fn user(store: &Store, txn: &Txn, pubkey: &[u8]) -> Result<Stats> {
     if !is_hex(pubkey) {
         return Ok(Vec::new());
     }
-    let posts = [&pubkey[1..], &1u16.to_be_bytes()].concat();
-    Ok(vec![
-        ("followers", tagged(store, txn, "p", pubkey, &[3])?),
-        ("post_cnt", count(txn, store.tables.author_kinds, &posts)?),
-    ])
+    let key: &[u8; 32] = pubkey[1..].try_into().unwrap();
+    let posts = [key, &1u16.to_be_bytes()[..]].concat();
+    let mut stats = vec![("followers", tagged(store, txn, "p", pubkey, &[3])?)];
+    if let Some(wot) = store.wot() {
+        let weight = f64::from(wot.weight(store, txn, key)?);
+        let trust = ((weight * 100.0).round() as u64).max(u64::from(weight > 0.0));
+        stats.push(("rank", trust));
+    }
+    stats.push(("post_cnt", count(txn, store.tables.author_kinds, &posts)?));
+    Ok(stats)
 }
 
 fn event(store: &Store, txn: &Txn, id: &[u8]) -> Result<Stats> {
@@ -284,6 +299,44 @@ mod tests {
             stats(&store, USER, &pk),
             of(&[("followers", 1), ("post_cnt", 2)])
         );
+    }
+
+    #[test]
+    fn ranks_users_by_trust() {
+        use crate::rank::Rank;
+        use crate::store::History;
+        use crate::store::tests::test_tags;
+        use crate::wot::Wot;
+
+        let pubkey = |seed| signed(seed, 0, 0, vec![], "").pubkey;
+        let seed: [u8; 32] = hex::decode(pubkey(1)).unwrap().try_into().unwrap();
+        // One person's worth of trust weighs fully, so few have it all.
+        let wot = Wot::new(vec![seed], 0.85, 1, 0.01, 10_000).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::new(true, vec![], 20);
+        let store = Store::open(
+            dir.path(),
+            1 << 26,
+            test_tags(),
+            history,
+            Some(wot),
+            Rank::default(),
+        )
+        .unwrap();
+        put(&store, &signed(1, 100, 3, vec![vec!["p", &pubkey(2)]], ""));
+        while store.turn().unwrap() {}
+
+        let rank = |seed| {
+            let found = stats(&store, USER, &pubkey(seed));
+            let rank = found.iter().find(|(name, _)| name == "rank").unwrap();
+            rank.1.parse::<u64>().unwrap()
+        };
+        assert_eq!(rank(1), 100);
+        // The seed's follow has some of its trust, not all.
+        let followed = rank(2);
+        assert!(0 < followed && followed < 100, "{followed}");
+        // Nobody trusts a stranger, and the assertion says so.
+        assert_eq!(stats(&store, USER, &pubkey(3)), of(&[("rank", 0)]));
     }
 
     #[test]
