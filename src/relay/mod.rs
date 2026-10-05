@@ -674,6 +674,9 @@ impl Connection {
 }
 
 #[cfg(test)]
+mod e2e;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::tests::signed;
