@@ -375,6 +375,7 @@ impl<'t> Cursor<'t> {
         self.op(None, None, ffi::MDB_FIRST)
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Entry<'t>>> {
         self.op(None, None, ffi::MDB_NEXT)
     }

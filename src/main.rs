@@ -1,24 +1,3 @@
-mod analysis;
-mod auth;
-mod config;
-mod event;
-mod facets;
-mod filter;
-mod hll;
-mod landing;
-mod lmdb;
-mod metrics;
-mod nip85;
-mod plugin;
-mod query;
-mod rank;
-mod record;
-mod relay;
-mod search;
-mod store;
-mod trends;
-mod wot;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,12 +5,13 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-use crate::rank::Rank;
-use crate::relay::AppState;
-use crate::search::SearchIndex;
-use crate::store::{History, IndexedTags, Store};
-use crate::wot::Wot;
+use ditto_relay_rs::config::Config;
+use ditto_relay_rs::rank::Rank;
+use ditto_relay_rs::relay::AppState;
+use ditto_relay_rs::search::SearchIndex;
+use ditto_relay_rs::store::{History, IndexedTags, Store};
+use ditto_relay_rs::wot::Wot;
+use ditto_relay_rs::{facets, metrics, relay, trends};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

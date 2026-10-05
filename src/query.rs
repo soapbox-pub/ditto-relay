@@ -403,6 +403,7 @@ fn scan<'t>(
             found.push((seq, view));
         }
     }
+    METRICS.events_examined.add(examined.min(MAX_EXAMINED) as u64);
     Ok(())
 }
 
@@ -577,6 +578,7 @@ fn collect(
     if seqs.len() > MAX_EXAMINED {
         return Err(TooExpensive.into());
     }
+    METRICS.events_examined.add(seqs.len() as u64);
     for seq in seqs {
         if store
             .load(txn, seq)?

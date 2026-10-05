@@ -36,7 +36,7 @@ impl Counter {
         self.0.fetch_add(n, Ordering::Relaxed);
     }
 
-    fn get(&self) -> u64 {
+    pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
 }
@@ -102,6 +102,8 @@ pub struct Metrics {
     /// Filters that examined as many events as they may before finding
     /// their limit, so may have missed some.
     pub filters_cut_short: Counter,
+    /// Stored events loaded to answer REQs and COUNTs, matching or not.
+    pub events_examined: Counter,
     pub counts_refused: Counter,
     pub errors_write: Counter,
     pub errors_query: Counter,
@@ -125,6 +127,7 @@ pub static METRICS: Metrics = Metrics {
     reqs: Timer::new(),
     counts: Timer::new(),
     filters_cut_short: Counter::new(),
+    events_examined: Counter::new(),
     counts_refused: Counter::new(),
     errors_write: Counter::new(),
     errors_query: Counter::new(),
@@ -137,6 +140,7 @@ pub static METRICS: Metrics = Metrics {
 pub struct Connected;
 
 impl Connected {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         METRICS.connections.inc();
         Self
@@ -224,6 +228,12 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
         "counter",
         "REQ filters that gave up examining events before reaching their limit, so may have missed some.",
         m.filters_cut_short.get() as f64,
+    );
+    out.one(
+        "events_examined_total",
+        "counter",
+        "Stored events loaded to answer REQs and COUNTs, matching or not. Far more than are sent means the indexes aren't narrowing filters down.",
+        m.events_examined.get() as f64,
     );
     out.one(
         "counts_refused_total",
