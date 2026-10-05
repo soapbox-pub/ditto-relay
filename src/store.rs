@@ -1313,20 +1313,26 @@ fn sweep(store: &Store) -> Result<Vec<u64>> {
     }
 }
 
-/// Store a batch of jobs in one transaction and answer each. One event's
-/// failure fails the transaction, and with it every other event in it, so
-/// a batch that fails is tried again an event at a time: only the event
-/// that can't be stored is refused.
-fn write(store: &Store, batch: Vec<WriteJob>, tell: &impl Fn(Vec<u64>, bool)) {
+/// The events a write stored, by sequence number, and what it removed.
+pub type Written = (Vec<(u64, Arc<Vec<u8>>)>, Vec<u64>);
+
+/// Store a batch of jobs in one transaction, answer each, and `tell` what
+/// was written. One event's failure fails the transaction, and with it
+/// every other event in it, so a batch that fails is tried again an event
+/// at a time: only the event that can't be stored is refused.
+fn write(store: &Store, batch: Vec<WriteJob>, tell: &impl Fn(Written)) {
     let now = crate::event::now();
     let records = batch.iter().map(|(record, _)| record.as_slice());
     let err = match store.write_batch(records, now) {
         Ok(Batch { outcomes, removed }) => {
-            let stored = outcomes.iter().any(|o| matches!(o, Outcome::Stored(_)));
-            tell(removed, stored);
-            for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
+            let mut stored = Vec::new();
+            for ((record, reply), outcome) in batch.into_iter().zip(outcomes) {
+                if let Outcome::Stored(seq) = outcome {
+                    stored.push((seq, record));
+                }
                 let _ = reply.send(Ok(outcome));
             }
+            tell((stored, removed));
             return;
         }
         Err(err) => err,
@@ -1366,18 +1372,26 @@ pub struct Writer {
 
 impl Writer {
     /// Start the writer. With `indexer`, the search indexer is told after
-    /// each write that changed anything, and what it removed.
-    pub fn spawn(store: Arc<Store>, indexer: Option<std::sync::mpsc::Sender<Vec<u64>>>) -> Self {
+    /// each write that changed anything, and what it removed. `stored` is
+    /// handed every batch of events stored, once they're committed.
+    pub fn spawn(
+        store: Arc<Store>,
+        indexer: Option<std::sync::mpsc::Sender<Vec<u64>>>,
+        stored: impl Fn(Vec<(u64, Arc<Vec<u8>>)>) + Send + 'static,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
         let writer = Self {
             tx,
             store: store.clone(),
         };
-        let tell = move |removed: Vec<u64>, stored: bool| {
+        let tell = move |(events, removed): Written| {
             if let Some(indexer) = &indexer
-                && (stored || !removed.is_empty())
+                && (!events.is_empty() || !removed.is_empty())
             {
                 let _ = indexer.send(removed);
+            }
+            if !events.is_empty() {
+                stored(events);
             }
         };
 
@@ -1396,7 +1410,7 @@ impl Writer {
                 loop {
                     if Instant::now() >= next_sweep {
                         match sweep(&store) {
-                            Ok(removed) => tell(removed, false),
+                            Ok(removed) => tell((Vec::new(), removed)),
                             Err(err) => tracing::error!("sweeping expired events failed: {err}"),
                         }
                         // Expired follow lists move trust.
@@ -1493,7 +1507,7 @@ pub mod tests {
                 ((Arc::new(record::encode(event)), reply), rx)
             })
             .unzip();
-        write(&store, jobs, &|_, _| {});
+        write(&store, jobs, &|_| {});
         let outcomes: Vec<_> = replies
             .into_iter()
             .map(|mut rx| rx.try_recv().unwrap().ok())

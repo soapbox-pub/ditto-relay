@@ -336,6 +336,48 @@ async fn answers_every_req_sent_at_once() {
     }
 }
 
+/// An event stored while a REQ's query waits to run is sent once: with
+/// the stored results, which see it, and not again as a live event.
+#[tokio::test]
+async fn sends_events_stored_while_a_query_waits_once() {
+    let relay = Relay::start().await;
+    let mut reader = relay.connect().await;
+    let mut writer = relay.connect().await;
+    // Every core busy, so the REQ's query waits its turn.
+    let queries = relay.state.queries.clone();
+    let busy = queries.acquire_many(super::cores() as u32).await.unwrap();
+    reader.send(json!(["REQ", "s", {"kinds": [1]}])).await;
+    // Live by now.
+    tokio::time::sleep(QUIET).await;
+    let waited = note(1, "stored while the query waited");
+    writer.publish(&waited).await;
+    drop(busy);
+
+    assert_eq!(reader.event("s").await, waited.id);
+    let eose = reader.next().await;
+    assert_eq!(eose[0], "EOSE", "{eose}");
+    reader.quiet().await;
+    let after = note(2, "after");
+    writer.publish(&after).await;
+    assert_eq!(reader.event("s").await, after.id);
+    reader.quiet().await;
+}
+
+#[tokio::test]
+async fn closes_the_subscription_a_bad_req_would_replace() {
+    let relay = Relay::start().await;
+    let mut reader = relay.connect().await;
+    let mut writer = relay.connect().await;
+    reader.req("s", &[json!({"kinds": [1]})]).await;
+    reader
+        .send(json!(["REQ", "s", {"#unindexed": ["x"]}]))
+        .await;
+    let closed = reader.next().await;
+    assert_eq!(closed[0], "CLOSED", "{closed}");
+    writer.publish(&note(1, "after")).await;
+    reader.quiet().await;
+}
+
 #[tokio::test]
 async fn sends_what_the_relay_publishes_itself() {
     let relay = Relay::start().await;

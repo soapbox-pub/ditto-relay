@@ -110,8 +110,14 @@ pub struct Metrics {
     pub errors_panic: Counter,
     /// The write policy plugin dying, hanging, or answering nonsense.
     pub errors_plugin: Counter,
-    /// Live events slow connections fell too far behind to be sent.
-    pub live_dropped: Counter,
+    /// Batches of new events waiting for the live subscription threads.
+    pub live_queue: Gauge,
+    /// Clients dropped for falling too far behind on their live events.
+    pub dropped_behind: Counter,
+    /// Clients dropped for not reading what was written to them.
+    pub dropped_stalled: Counter,
+    /// Clients dropped for going silent without closing.
+    pub dropped_silent: Counter,
 }
 
 pub static METRICS: Metrics = Metrics {
@@ -133,7 +139,10 @@ pub static METRICS: Metrics = Metrics {
     errors_query: Counter::new(),
     errors_panic: Counter::new(),
     errors_plugin: Counter::new(),
-    live_dropped: Counter::new(),
+    live_queue: Gauge::new(),
+    dropped_behind: Counter::new(),
+    dropped_stalled: Counter::new(),
+    dropped_silent: Counter::new(),
 };
 
 /// Counts a connection open for as long as it's held.
@@ -253,10 +262,20 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
         ],
     );
     out.one(
-        "live_dropped_total",
+        "live_queue",
+        "gauge",
+        "Batches of new events waiting to be matched against live subscriptions.",
+        m.live_queue.get() as f64,
+    );
+    out.metric(
+        "clients_dropped_total",
         "counter",
-        "Live events not sent to connections that fell too far behind.",
-        m.live_dropped.get() as f64,
+        "Connections the relay dropped, by why.",
+        &[
+            (r#"reason="behind""#, m.dropped_behind.get() as f64),
+            (r#"reason="stalled""#, m.dropped_stalled.get() as f64),
+            (r#"reason="silent""#, m.dropped_silent.get() as f64),
+        ],
     );
 
     let usage = store.usage()?;

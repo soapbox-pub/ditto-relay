@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -15,7 +16,7 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +31,9 @@ use crate::query::{self, Cancelled, Count, Results, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
+use monitors::{ConnId, Hub, Link, Live, Outbound};
+
+mod monitors;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,8 +42,10 @@ pub struct AppState {
     pub writer: Writer,
     /// For NIP-50 search, if it's on.
     pub search: Option<Arc<SearchIndex>>,
-    /// Every accepted event, for live subscriptions.
-    pub live: broadcast::Sender<Arc<LiveEvent>>,
+    /// Live subscriptions, which every new event is matched against.
+    hub: Hub,
+    /// The next connection's id.
+    next_conn: Arc<AtomicU64>,
     /// Decides which events to take, if there is one.
     plugin: Option<Plugin>,
     /// A place per core for checking signatures, which keeps a flood of
@@ -51,14 +57,6 @@ pub struct AppState {
     /// The NIP-11 information document, and the landing page made from it.
     nip11: Arc<str>,
     landing: Arc<str>,
-}
-
-/// An accepted event, encoded once for every subscription it's sent to.
-pub struct LiveEvent {
-    /// Its sequence number, if it was stored (ephemeral events aren't).
-    seq: Option<u64>,
-    record: Arc<Vec<u8>>,
-    json: String,
 }
 
 impl AppState {
@@ -75,35 +73,36 @@ impl AppState {
             let timeout = Duration::from_secs(config.write_policy_timeout_seconds);
             Plugin::spawn(command, timeout)
         });
+        let hub = Hub::spawn((cores() / 2).clamp(1, 8));
+        let live = hub.clone();
+        let stored = move |events: Vec<(u64, Arc<Vec<u8>>)>| {
+            let events = events.into_iter();
+            live.broadcast(
+                events
+                    .map(|(seq, record)| Live::new(record, Some(seq)))
+                    .collect(),
+            );
+        };
         Self {
             plugin,
             nip11: info.to_string().into(),
             landing,
             config: Arc::new(config),
-            writer: Writer::spawn(store.clone(), indexer),
+            writer: Writer::spawn(store.clone(), indexer, stored),
             store,
             search,
-            live: broadcast::channel(8192).0,
+            hub,
+            next_conn: Arc::new(AtomicU64::new(1)),
             verifiers: Arc::new(Semaphore::new(cores())),
             queries: Arc::new(Semaphore::new(cores())),
         }
     }
 
-    /// Store an event of the relay's own and send it to live subscriptions.
+    /// Store an event of the relay's own, which the writer sends to live
+    /// subscriptions like any other.
     pub async fn publish(&self, ev: Event) -> anyhow::Result<Outcome> {
         let record = Arc::new(tokio::task::spawn_blocking(move || record::encode(&ev)).await?);
-        let outcome = self.writer.write(record.clone()).await?;
-        if let Outcome::Stored(seq) = outcome {
-            let json = EventView::new(&record)
-                .expect("an encoded record")
-                .to_json();
-            let _ = self.live.send(Arc::new(LiveEvent {
-                seq: Some(seq),
-                record,
-                json,
-            }));
-        }
-        Ok(outcome)
+        self.writer.write(record).await
     }
 }
 
@@ -253,18 +252,21 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// or otherwise, has gone without closing, and is dropped.
 const PING_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Live events waiting to go out to one client. One that falls this far
+/// behind is dropped: holding more for it would be without end.
+const OUTBOUND: usize = 16_384;
+
 /// The most live events held for a subscription while its query runs.
 /// Past this it's closed, and its client can ask again.
-const MAX_PENDING: usize = 16_384;
+const MAX_PENDING: usize = OUTBOUND;
 
 struct Subscription {
     /// This REQ's own name: a later REQ of the same id gets a new one, so
     /// results meant for the one it replaced can be told apart.
     name: Arc<str>,
-    filters: Vec<Filter>,
-    /// Live events that arrived while the query ran, held until its EOSE.
-    /// None once it's sent.
-    pending: Option<Vec<Arc<LiveEvent>>>,
+    /// Live events that arrived while the query ran, by sequence number,
+    /// held until its EOSE. None once it's sent.
+    pending: Option<Vec<(Option<u64>, Arc<str>)>>,
     /// Stored events below this sequence number were visible to the
     /// initial query, so they've been sent already (or didn't match).
     floor: u64,
@@ -315,6 +317,7 @@ async fn run_query<T: Send + 'static>(
 
 struct Connection {
     state: AppState,
+    id: ConnId,
     /// By subscription id.
     subs: HashMap<String, Subscription>,
     /// Stops every query of the connection's once it's gone.
@@ -329,19 +332,28 @@ struct Connection {
 }
 
 /// The connection should be torn down.
-struct Disconnect;
+#[derive(Debug, PartialEq, Eq)]
+enum Disconnect {
+    /// It's closed, or broken.
+    Gone,
+    /// A write to it didn't finish in time.
+    Stalled,
+}
 
 impl Connection {
     async fn run(socket: WebSocket, state: AppState, ip: IpAddr) {
         let _connected = Connected::new();
         let (sink, mut stream) = socket.split();
+        let id = state.next_conn.fetch_add(1, Ordering::Relaxed);
+        let (link, mut outbound, overflow) = Link::new(OUTBOUND);
+        state.hub.connect(id, link).await;
         let start = tokio::time::Instant::now() + PING_INTERVAL;
         let mut ping = tokio::time::interval_at(start, PING_INTERVAL);
         let mut heard = Instant::now();
-        let mut live = state.live.subscribe();
         let mut queries = JoinSet::new();
         let mut conn = Connection {
             state,
+            id,
             subs: HashMap::new(),
             cancel: CancellationToken::new(),
             sink,
@@ -352,9 +364,15 @@ impl Connection {
 
         loop {
             let result = tokio::select! {
+                _ = overflow.cancelled() => {
+                    tracing::debug!("dropping a client that fell too far behind");
+                    METRICS.dropped_behind.inc();
+                    break;
+                }
                 _ = ping.tick() => {
                     if heard.elapsed() > 2 * PING_INTERVAL {
                         tracing::debug!("dropping a client that went silent");
+                        METRICS.dropped_silent.inc();
                         break;
                     }
                     write_within(conn.sink.send(Message::Ping(Default::default()))).await
@@ -365,18 +383,10 @@ impl Connection {
                         Some(Ok(Message::Text(text))) => conn.on_message(text.as_str(), &mut queries).await,
                         Some(Ok(Message::Binary(_))) => conn.notice("error: binary messages are not supported").await,
                         Some(Ok(Message::Ping(_) | Message::Pong(_))) => Ok(()),
-                        Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Disconnect),
+                        Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Disconnect::Gone),
                     }
                 }
-                ev = live.recv() => match ev {
-                    Ok(ev) => conn.on_live_event(&ev).await,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("connection lagged, dropped {n} live events");
-                        METRICS.live_dropped.add(n);
-                        Ok(())
-                    }
-                    Err(broadcast::error::RecvError::Closed) => Err(Disconnect),
-                },
+                Some(outbound) = outbound.recv() => conn.on_outbound(outbound).await,
                 Some(done) = queries.join_next(), if !queries.is_empty() => match done {
                     Ok(Done::Req(name, results)) => conn.on_results(name, results).await,
                     Ok(Done::Count(id, count)) => conn.on_count_done(&id, count).await,
@@ -385,7 +395,11 @@ impl Connection {
                     Err(_) => Ok(()),
                 },
             };
-            if result.is_err() {
+            if let Err(disconnect) = result {
+                if disconnect == Disconnect::Stalled {
+                    tracing::debug!("dropping a client that stopped reading");
+                    METRICS.dropped_stalled.inc();
+                }
                 break;
             }
         }
@@ -393,6 +407,7 @@ impl Connection {
         // Dropping `queries` drops their tasks, but not what they left
         // running on the blocking pool.
         conn.cancel.cancel();
+        conn.state.hub.disconnect(id).await;
         let _ = tokio::time::timeout(WRITE_TIMEOUT, conn.sink.close()).await;
     }
 
@@ -437,7 +452,7 @@ impl Connection {
             Some("AUTH") => self.on_auth(msg.get_mut(1).map(Value::take)).await,
             Some("CLOSE") => match msg.get(1).and_then(Value::as_str) {
                 Some(sub_id) => {
-                    self.subs.remove(sub_id);
+                    self.end(sub_id).await;
                     Ok(())
                 }
                 None => {
@@ -588,26 +603,14 @@ impl Connection {
         if view.is_expired(now) {
             return (false, EXPIRED.into());
         }
-        let json = view.to_json();
         if ephemeral {
-            let _ = self.state.live.send(Arc::new(LiveEvent {
-                seq: None,
-                record,
-                json,
-            }));
+            self.state.hub.publish(vec![Live::new(record, None)]).await;
             return (true, "".into());
         }
 
-        match self.state.writer.write(record.clone()).await {
-            Ok(Outcome::Stored(seq)) => {
-                let live = LiveEvent {
-                    seq: Some(seq),
-                    record,
-                    json,
-                };
-                let _ = self.state.live.send(Arc::new(live));
-                (true, "".into())
-            }
+        // The writer sends what it stores to live subscriptions.
+        match self.state.writer.write(record).await {
+            Ok(Outcome::Stored(_)) => (true, "".into()),
             // Kept, but old news: not sent to live subscriptions.
             Ok(Outcome::Archived(_)) => (true, "".into()),
             Ok(Outcome::Duplicate) => (true, DUPLICATE.into()),
@@ -641,31 +644,45 @@ impl Connection {
 
         let filters = match self.filters(&args[1..]) {
             Ok(filters) => filters,
-            Err(msg) => return self.closed(sub_id, &msg).await,
+            Err(msg) => {
+                // Whatever it would have replaced is closed too.
+                self.end(sub_id).await;
+                return self.closed(sub_id, &msg).await;
+            }
         };
         if !self.subs.contains_key(sub_id) && self.subs.len() >= config.max_subscriptions {
             return self.closed(sub_id, "error: too many subscriptions").await;
         }
 
-        // A REQ reusing an id replaces that subscription, stopping its query.
-        // Live events that arrive while this one's runs are held for it.
+        // A REQ reusing an id replaces that subscription, stopping its
+        // query. It goes live before its own query reads the store: every
+        // event stored after the query's snapshot reaches it. Those that
+        // arrive while the query runs are held until its EOSE, and those
+        // the query saw are dropped, then and after.
         let name: Arc<str> = sub_id.into();
         let cancel = self.cancel.child_token();
         self.subs.insert(
             sub_id.to_string(),
             Subscription {
                 name: name.clone(),
-                filters: filters.clone(),
                 pending: Some(Vec::new()),
                 floor: 0,
                 cancel: cancel.clone(),
             },
         );
+        let installed = self
+            .state
+            .hub
+            .subscribe(self.id, name.clone(), filters.clone())
+            .await;
         let state = self.state.clone();
         queries.spawn(async move {
             let (store, search) = (state.store.clone(), state.search.clone());
             let start = Instant::now();
             let stop = cancel.clone();
+            if cancel.run_until_cancelled(installed).await.is_none() {
+                return Done::Req(name, Err(Cancelled.into()));
+            }
             let results = run_query(&state, &cancel, move || {
                 query::run(
                     &store,
@@ -704,7 +721,7 @@ impl Connection {
             Err(err) => {
                 tracing::error!("query failed: {err:#}");
                 METRICS.errors_query.inc();
-                self.subs.remove(&*name);
+                self.end(&name).await;
                 return self.closed(&name, "error: query failed").await;
             }
         };
@@ -720,10 +737,10 @@ impl Connection {
             }
             let eose = serde_json::to_string(&("EOSE", &*name)).expect("strings serialize");
             sink.feed(Message::Text(eose.into())).await?;
-            for ev in pending {
+            for (seq, json) in pending {
                 // Stored events the query could see were sent with it.
-                if ev.seq.is_none_or(|seq| seq >= results.next_seq) {
-                    sink.feed(Message::Text(event_message(&name, &ev.json).into()))
+                if seq.is_none_or(|seq| seq >= results.next_seq) {
+                    sink.feed(Message::Text(event_message(&name, &json).into()))
                         .await?;
                 }
             }
@@ -842,31 +859,38 @@ impl Connection {
         }
     }
 
-    async fn on_live_event(&mut self, ev: &Arc<LiveEvent>) -> Result<(), Disconnect> {
-        let view = EventView::new(&ev.record).expect("an encoded record");
-        let mut send = Vec::new();
-        let mut overflowed = Vec::new();
-        for (sub_id, sub) in &mut self.subs {
-            if !sub.filters.iter().any(|f| f.matches(&view)) {
-                continue;
+    /// Close a subscription, stopping its query. One the connection doesn't
+    /// have costs nothing, so a flood of them can't crowd the shards' queues.
+    async fn end(&mut self, sub_id: &str) {
+        if self.subs.remove(sub_id).is_some() {
+            self.state.hub.unsubscribe(self.id, sub_id).await;
+        }
+    }
+
+    /// A new event for one of the connection's subscriptions.
+    async fn on_outbound(&mut self, outbound: Outbound) -> Result<(), Disconnect> {
+        let Outbound { sub, seq, json } = outbound;
+        let Some(state) = self
+            .subs
+            .get_mut(&*sub)
+            .filter(|state| Arc::ptr_eq(&state.name, &sub))
+        else {
+            return Ok(());
+        };
+        match &mut state.pending {
+            Some(pending) if pending.len() >= MAX_PENDING => {
+                self.end(&sub).await;
+                let msg = "error: too many new events arrived while the query ran; ask again";
+                self.closed(&sub, msg).await
             }
-            match &mut sub.pending {
-                Some(pending) if pending.len() >= MAX_PENDING => overflowed.push(sub_id.clone()),
-                Some(pending) => pending.push(ev.clone()),
-                // Already covered by the subscription's initial query.
-                None if ev.seq.is_some_and(|seq| seq < sub.floor) => {}
-                None => send.push(sub_id.clone()),
+            Some(pending) => {
+                pending.push((seq, json));
+                Ok(())
             }
+            // Already covered by the subscription's initial query.
+            None if seq.is_some_and(|seq| seq < state.floor) => Ok(()),
+            None => self.send_event(&sub, &json).await,
         }
-        for sub_id in send {
-            self.send_event(&sub_id, &ev.json).await?;
-        }
-        for sub_id in overflowed {
-            self.subs.remove(&sub_id);
-            let msg = "error: too many new events arrived while the query ran; ask again";
-            self.closed(&sub_id, msg).await?;
-        }
-        Ok(())
     }
 }
 
@@ -880,7 +904,8 @@ fn event_message(sub_id: &str, json: &str) -> String {
 async fn write_within<T, E>(write: impl Future<Output = Result<T, E>>) -> Result<T, Disconnect> {
     match tokio::time::timeout(WRITE_TIMEOUT, write).await {
         Ok(Ok(written)) => Ok(written),
-        _ => Err(Disconnect),
+        Ok(Err(_)) => Err(Disconnect::Gone),
+        Err(_) => Err(Disconnect::Stalled),
     }
 }
 
