@@ -206,6 +206,23 @@ async fn refuses_bad_signatures() {
 }
 
 #[tokio::test]
+async fn checks_the_signatures_of_stored_ids() {
+    let relay = Relay::start().await;
+    let mut client = relay.connect().await;
+    let ev = note(1, "hello");
+    client.publish(&ev).await;
+    // Another event's signature, which finds the stored event but isn't
+    // its own.
+    let mut forged = ev.clone();
+    forged.sig = note(1, "other").sig;
+    let (accepted, msg) = client.publish(&forged).await;
+    assert!(!accepted && msg.starts_with("invalid:"), "{msg}");
+    forged.sig = "zz".into();
+    let (accepted, msg) = client.publish(&forged).await;
+    assert!(!accepted && msg.starts_with("invalid:"), "{msg}");
+}
+
+#[tokio::test]
 async fn sends_new_events_to_subscriptions() {
     let relay = Relay::start().await;
     let mut reader = relay.connect().await;

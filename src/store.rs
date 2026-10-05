@@ -568,6 +568,14 @@ impl Store {
         Ok(None)
     }
 
+    /// A stored event's signature.
+    pub fn sig_of(&self, txn: &Txn, id: &[u8; 32]) -> Result<Option<[u8; 64]>> {
+        match self.seq_of(txn, id)? {
+            Some(seq) => Ok(self.load(txn, seq)?.map(|view| *view.sig())),
+            None => Ok(None),
+        }
+    }
+
     /// A stored event, unless it has expired.
     pub fn load<'t>(&self, txn: &'t Txn, seq: u64) -> Result<Option<EventView<'t>>> {
         let now = crate::event::now();

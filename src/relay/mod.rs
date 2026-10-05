@@ -14,7 +14,7 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 
 use crate::auth;
 use crate::config::Config;
@@ -39,6 +39,9 @@ pub struct AppState {
     pub live: broadcast::Sender<Arc<LiveEvent>>,
     /// Decides which events to take, if there is one.
     plugin: Option<Plugin>,
+    /// A place per core for checking signatures, which keeps a flood of
+    /// events from taking over the blocking pool.
+    verifiers: Arc<Semaphore>,
     /// The NIP-11 information document, and the landing page made from it.
     nip11: Arc<str>,
     landing: Arc<str>,
@@ -75,6 +78,7 @@ impl AppState {
             store,
             search,
             live: broadcast::channel(8192).0,
+            verifiers: Arc::new(Semaphore::new(cores())),
         }
     }
 
@@ -94,6 +98,11 @@ impl AppState {
         }
         Ok(outcome)
     }
+}
+
+/// How many threads can run at once.
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
 }
 
 pub fn router(state: AppState) -> Router {
@@ -207,6 +216,7 @@ fn nip11(config: &Config) -> Value {
 }
 
 const EXPIRED: &str = "invalid: event has expired";
+const DUPLICATE: &str = "duplicate: already have this event";
 
 /// NIP-62 requests to vanish.
 const VANISH: u16 = 62;
@@ -332,15 +342,15 @@ impl Connection {
     }
 
     async fn on_message(&mut self, text: &str) -> Result<(), Disconnect> {
-        let Ok(Value::Array(msg)) = serde_json::from_str::<Value>(text) else {
+        let Ok(Value::Array(mut msg)) = serde_json::from_str::<Value>(text) else {
             return self.notice("invalid: message must be a JSON array").await;
         };
 
         match msg.first().and_then(Value::as_str) {
-            Some("EVENT") => self.on_event(msg.get(1)).await,
+            Some("EVENT") => self.on_event(msg.get_mut(1).map(Value::take)).await,
             Some("REQ") => self.on_req(&msg[1..]).await,
             Some("COUNT") => self.on_count(&msg[1..]).await,
-            Some("AUTH") => self.on_auth(msg.get(1)).await,
+            Some("AUTH") => self.on_auth(msg.get_mut(1).map(Value::take)).await,
             Some("CLOSE") => match msg.get(1).and_then(Value::as_str) {
                 Some(sub_id) => {
                     self.subs.remove(sub_id);
@@ -355,7 +365,7 @@ impl Connection {
         }
     }
 
-    async fn on_event(&mut self, value: Option<&Value>) -> Result<(), Disconnect> {
+    async fn on_event(&mut self, value: Option<Value>) -> Result<(), Disconnect> {
         let Some(value) = value else {
             return self.notice("invalid: EVENT requires an event").await;
         };
@@ -364,9 +374,14 @@ impl Connection {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let (accepted, msg) = match self.check(value) {
+        let checked = match self.check(value) {
+            Ok(ev) => self.verify(ev).await,
+            Err(msg) => Err(msg),
+        };
+        let (accepted, msg) = match checked {
             Err(msg) => (false, msg),
-            Ok(ev) => match self.ask_plugin(&ev).await {
+            Ok(None) => (true, DUPLICATE.into()),
+            Ok(Some(ev)) => match self.ask_plugin(&ev).await {
                 Verdict::Accept => self.accept(&id, ev).await,
                 Verdict::Reject(msg) => (false, msg.into()),
                 Verdict::ShadowReject(msg) => {
@@ -391,15 +406,15 @@ impl Connection {
     }
 
     /// An event, if it's one the relay could take, or a NIP-01 OK message
-    /// saying why not.
-    fn check(&self, value: &Value) -> Result<Event, Cow<'static, str>> {
-        let ev: Event = serde_json::from_value(value.clone())
-            .map_err(|err| Cow::Owned(format!("invalid: {err}")))?;
-        ev.verify()?;
+    /// saying why not. Its signature is checked apart, by [`Self::verify`].
+    fn check(&self, value: Value) -> Result<Event, Cow<'static, str>> {
+        let ev: Event =
+            serde_json::from_value(value).map_err(|err| Cow::Owned(format!("invalid: {err}")))?;
         if !event::is_relayed(ev.kind) {
             return Err(format!("blocked: kind {} is not relayed", ev.kind).into());
         }
-        let author = event::decode_hex(&ev.pubkey).expect("verified");
+        let author = event::decode_hex(&ev.pubkey)
+            .ok_or("invalid: pubkey must be 64 lowercase hex chars")?;
         if is_protected(&ev) && !self.authed.contains(&author) {
             return Err("auth-required: this event may only be published by its author".into());
         }
@@ -410,6 +425,37 @@ impl Connection {
             return Err("invalid: this request to vanish is for other relays".into());
         }
         Ok(ev)
+    }
+
+    /// The event if its id and signature are good, or None if it's stored
+    /// already. Both checks run on the blocking pool: the lookup can stall
+    /// on disk, and the signature takes a while.
+    async fn verify(&self, ev: Event) -> Result<Option<Event>, Cow<'static, str>> {
+        let Ok(_place) = self.state.verifiers.acquire().await else {
+            return Err("error: shutting down".into());
+        };
+        let store = self.state.store.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            // Events are resent all the time, and each would cost a
+            // signature check, so look first: one with the stored copy's
+            // signature is that event, verified when it was stored.
+            let id = event::decode_hex::<32>(&ev.id);
+            let sig = event::decode_hex::<64>(&ev.sig);
+            if let (Some(id), Some(sig)) = (id, sig) {
+                let stored = store.read().and_then(|txn| store.sig_of(&txn, &id));
+                if stored.ok().flatten() == Some(sig) {
+                    return Ok(None);
+                }
+            }
+            ev.verify()?;
+            Ok(Some(ev))
+        })
+        .await;
+        verified.unwrap_or_else(|err| {
+            tracing::error!("verifying an event panicked: {err}");
+            METRICS.errors_panic.inc();
+            Err("error: failed to check event".into())
+        })
     }
 
     /// What the write policy plugin makes of an event, if there is one.
@@ -480,7 +526,7 @@ impl Connection {
             }
             // Kept, but old news: not sent to live subscriptions.
             Ok(Outcome::Archived(_)) => (true, "".into()),
-            Ok(Outcome::Duplicate) => (true, "duplicate: already have this event".into()),
+            Ok(Outcome::Duplicate) => (true, DUPLICATE.into()),
             Ok(Outcome::Expired) => (false, EXPIRED.into()),
             Ok(Outcome::Deleted) => (false, "blocked: this event has been deleted".into()),
             Ok(Outcome::Replaced) => (
@@ -587,7 +633,7 @@ impl Connection {
     }
 
     /// NIP-42: `["AUTH", event]`.
-    async fn on_auth(&mut self, value: Option<&Value>) -> Result<(), Disconnect> {
+    async fn on_auth(&mut self, value: Option<Value>) -> Result<(), Disconnect> {
         let Some(value) = value else {
             return self.notice("invalid: AUTH requires an event").await;
         };
@@ -596,7 +642,7 @@ impl Connection {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let ev: Event = match serde_json::from_value(value.clone()) {
+        let ev: Event = match serde_json::from_value(value) {
             Ok(ev) => ev,
             Err(err) => return self.ok(&id, false, &format!("invalid: {err}")).await,
         };
