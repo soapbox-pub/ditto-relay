@@ -942,6 +942,41 @@ pub fn index(store: &Store, txn: &mut RwTxn, seq: u64, view: &EventView) -> Resu
     Ok(())
 }
 
+/// Read what [`index`] will for an event, so its pages are in memory: see
+/// [`Store::prefetch`].
+pub fn prefetch(store: &Store, txn: &Txn, view: &EventView) -> Result<()> {
+    let half_life = store.rank().half_life;
+    let refile = |score: &Score| -> Result<()> {
+        let mut cursor = txn.cursor(store.tables.ranked)?;
+        for (mode, rank) in score.ranks(half_life) {
+            let key = ranked_key(mode, score.kind);
+            cursor.get_both_range(&key, &ranked_value(rank, score.seq))?;
+        }
+        Ok(())
+    };
+    if let Some(score) = score_of(store, txn, view.id())? {
+        refile(&score)?;
+    }
+    let zap = zap(view);
+    for engagement in engagements_with(view, zap.as_ref()) {
+        let id = engagement.target.id();
+        pair(store, txn, &engagement.engager, &id)?;
+        match score_of(store, txn, &id)? {
+            Some(score) => refile(&score)?,
+            None => drop(seen(store, txn, &engagement.target)?),
+        }
+    }
+    for zapped in zap.iter().flat_map(|zap| {
+        let event = zap.event.as_ref().map(Zapped::Event);
+        event
+            .into_iter()
+            .chain(zap.address.as_deref().map(Zapped::Address))
+    }) {
+        zaps_under(store, txn, &zapped.key())?;
+    }
+    Ok(())
+}
+
 /// An event under `seq` has been taken out of the indexes: undo [`index`].
 pub fn unindex(store: &Store, txn: &mut RwTxn, seq: u64, view: &EventView) -> Result<()> {
     let (id, author) = (view.id(), view.pubkey());

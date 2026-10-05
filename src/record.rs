@@ -195,6 +195,20 @@ fn get_varint(buf: &mut &[u8]) -> Option<u64> {
     None
 }
 
+/// A record's author, unless it has expired by `now`, read from its header
+/// alone: of a record too big for a page, without touching the pages its
+/// tags and content are on, nor checking them.
+pub fn author_unless_expired(buf: &[u8], now: u32) -> Option<&[u8; 32]> {
+    let fixed: &[u8; FIXED] = buf.get(..FIXED)?.try_into().ok()?;
+    if fixed[0] & FLAG_EXPIRATION != 0 {
+        let at = u32::from_le_bytes(buf.get(FIXED..FIXED + 4)?.try_into().ok()?);
+        if at <= now {
+            return None;
+        }
+    }
+    fixed[33..65].try_into().ok()
+}
+
 /// A stored event, read in place.
 #[derive(Clone, Copy, Debug)]
 pub struct EventView<'a> {
@@ -616,6 +630,18 @@ mod tests {
         let record = encode(event);
         let view = EventView::new(&record).unwrap();
         serde_json::from_str(&view.to_json()).unwrap()
+    }
+
+    #[test]
+    fn reads_the_author_from_the_header() {
+        let lasting = signed(1, 100, 1, vec![], &"x".repeat(5000));
+        let record = encode(&lasting);
+        let view = EventView::new(&record).unwrap();
+        assert_eq!(author_unless_expired(&record, 200), Some(view.pubkey()));
+        let expiring = signed(1, 100, 1, vec![vec!["expiration", "150"]], "");
+        let record = encode(&expiring);
+        assert!(author_unless_expired(&record, 149).is_some());
+        assert_eq!(author_unless_expired(&record, 150), None);
     }
 
     #[test]

@@ -107,7 +107,7 @@ use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
 use crate::metrics::METRICS;
 use crate::rank::{self, Rank};
-use crate::record::{Element, EventView, tag_value};
+use crate::record::{self, Element, EventView, tag_value};
 use crate::wot::{self, Wot};
 
 pub const STAMP_LEN: usize = 10;
@@ -125,6 +125,10 @@ pub const MAX_TAG_NAME: usize = 64;
 
 /// How many events a tag key has before its HyperLogLog is kept.
 pub const HLL_THRESHOLD: usize = 1000;
+
+/// How far short of [`HLL_THRESHOLD`] a key's events are read ahead, as
+/// the events filed before it in the writer's queue may bring it there.
+const HLL_PREFETCH_MARGIN: usize = 50;
 
 /// Longer `d` tags are hashed in addresses, to fit in a key.
 const MAX_ADDRESS_D: usize = 256;
@@ -595,6 +599,59 @@ impl Store {
         Ok(batch)
     }
 
+    /// Read, in a read transaction, what [`insert`](Self::insert)ing a
+    /// record will, so the pages it needs are in memory by the time the
+    /// writer gets to it. The writer is one thread, and waits on each page
+    /// it finds missing in turn; prefetching from many threads at once
+    /// keeps the disk busy with many reads in flight instead. Only a
+    /// deletion's or a vanish request's targets, and the web of trust,
+    /// aren't read ahead.
+    pub fn prefetch(&self, txn: &Txn, record: &[u8]) -> Result<()> {
+        let Some(view) = EventView::new(record) else {
+            return Ok(());
+        };
+        if self.contains(txn, view.id())? || self.is_deleted(txn, &view)? {
+            return Ok(());
+        }
+        let t = self.tables;
+        let at = stamp(view.created_at(), 0);
+        // Each key's entries, around where this one goes. A missing key or
+        // entry is still found missing by reading the pages it'd be on.
+        let seek = |db: Db, key: &[u8], entry: &[u8]| -> Result<()> {
+            txn.cursor(db)?.get_both_range(key, entry).map(drop)
+        };
+        if let Some(address) = address_of(&view) {
+            txn.cursor(t.history)?.set(&address)?;
+            // What it replaces is taken out of the indexes.
+            if let Some(seq) = self.replaceable_seq(txn, &address)?
+                && let Some(old) = self.load(txn, seq)?
+            {
+                let old_at = stamp(old.created_at(), seq);
+                for (db, key) in self.index_keys(&old) {
+                    seek(db, &key, &old_at)?;
+                }
+                seek(t.authors, old.pubkey(), &kinded(&old_at, old.kind()))?;
+            }
+        }
+        seek(t.authors, view.pubkey(), &kinded(&at, view.kind()))?;
+        for (db, key) in self.index_keys(&view) {
+            seek(db, &key, &at)?;
+        }
+        for (key, _) in self.tag_keys(&view) {
+            // A key about to reach the threshold has its events read to
+            // sketch them: read them too.
+            if txn.get(t.hll, &key)?.is_none() {
+                let mut cursor = txn.cursor(t.tags)?;
+                if cursor.set(&key)?.is_some()
+                    && cursor.count()? + HLL_PREFETCH_MARGIN >= HLL_THRESHOLD
+                {
+                    self.sketch_from_events(txn, &key)?;
+                }
+            }
+        }
+        rank::prefetch(self, txn, &view)
+    }
+
     /// Offer an encoded event to the store at `now`, applying replacement,
     /// and note in `removed` any event it replaces. The caller has checked
     /// it's valid.
@@ -1021,9 +1078,12 @@ impl Store {
         Ok(())
     }
 
-    /// Sketch a tag key's authors from its events.
+    /// Sketch a tag key's authors from its events. Only their headers are
+    /// read: a key reaching the threshold has a thousand events, often big
+    /// ones, scattered about, and the writer waits on each.
     fn sketch_from_events(&self, txn: &Txn, key: &[u8]) -> Result<Registers> {
         let offset = hll::offset(&tag_key_value(key));
+        let now = crate::event::now();
         let mut registers = [0; hll::REGISTERS];
         let mut seqs = Vec::new();
         each_stamp(txn, self.tables.tags, key, 0, u32::MAX, |stamp| {
@@ -1031,8 +1091,9 @@ impl Store {
             true
         })?;
         for seq in seqs {
-            if let Some(view) = self.load(txn, seq)? {
-                hll::add(&mut registers, offset, view.pubkey());
+            let record = txn.get(self.tables.events, &seq.to_ne_bytes())?;
+            if let Some(author) = record.and_then(|r| record::author_unless_expired(r, now)) {
+                hll::add(&mut registers, offset, author);
             }
         }
         Ok(registers)
@@ -1252,9 +1313,14 @@ const MAX_SWEEP: usize = 10_000;
 /// [`SWEEP_INTERVAL`] it also removes the events that have expired. After
 /// each batch, and whenever nothing's queued, it pushes the web of trust
 /// along a turn at a time until there's nothing left to push.
+///
+/// Each event's pages are [prefetched](Store::prefetch) on the blocking
+/// pool before it's queued, so events arriving together have their pages
+/// read in parallel rather than one after another by the writer.
 #[derive(Clone)]
 pub struct Writer {
     tx: std::sync::mpsc::Sender<WriteJob>,
+    store: Arc<Store>,
 }
 
 impl Writer {
@@ -1262,6 +1328,10 @@ impl Writer {
     /// each write that changed anything, and what it removed.
     pub fn spawn(store: Arc<Store>, indexer: Option<std::sync::mpsc::Sender<Vec<u64>>>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
+        let writer = Self {
+            tx,
+            store: store.clone(),
+        };
         let tell = move |removed: Vec<u64>, stored: bool| {
             if let Some(indexer) = &indexer
                 && (stored || !removed.is_empty())
@@ -1343,12 +1413,21 @@ impl Writer {
             })
             .expect("failed to spawn writer thread");
 
-        Self { tx }
+        writer
     }
 
     /// Store an encoded record.
     pub async fn write(&self, record: Arc<Vec<u8>>) -> anyhow::Result<Outcome> {
         let start = Instant::now();
+        let (store, prefetched) = (self.store.clone(), record.clone());
+        let prefetch = tokio::task::spawn_blocking(move || {
+            let txn = store.read()?;
+            store.prefetch(&txn, &prefetched)
+        });
+        // Only a hint: the writer reads whatever it must anyway.
+        if let Ok(Err(err)) = prefetch.await {
+            tracing::debug!("prefetching failed: {err}");
+        }
         let (reply, rx) = oneshot::channel();
         METRICS.write_queue.inc();
         if self.tx.send((record, reply)).is_err() {
@@ -1492,6 +1571,41 @@ pub mod tests {
         assert!(IndexedTags::new(["x".into()]).is_err());
     }
 
+    /// Prefetching reads what storing will, and changes nothing.
+    #[test]
+    fn prefetches_without_changing_anything() {
+        let (_dir, store) = open();
+        let note = signed(1, 100, 1, vec![vec!["t", "x"]], "hi");
+        let reply = signed(
+            2,
+            110,
+            1,
+            vec![vec!["e", &note.id], vec!["p", &note.pubkey]],
+            "",
+        );
+        let reaction = signed(3, 120, 7, vec![vec!["e", &note.id]], "+");
+        let profiles = [100, 200].map(|at| signed(1, at, 0, vec![], &at.to_string()));
+        let deletion = signed(1, 300, 5, vec![vec!["e", &reply.id]], "");
+        let events = [
+            &note,
+            &reply,
+            &reaction,
+            &profiles[0],
+            &profiles[1],
+            &deletion,
+        ];
+        for event in events.iter().chain(&events) {
+            let record = record::encode(event);
+            let before = entries(&store);
+            let txn = store.read().unwrap();
+            store.prefetch(&txn, &record).unwrap();
+            drop(txn);
+            assert_eq!(entries(&store), before);
+            put(&store, event);
+        }
+        assert!(has(&store, &profiles[1]) && has(&store, &reaction));
+    }
+
     #[test]
     fn sketches_big_tag_keys() {
         let (_dir, store) = open();
@@ -1514,6 +1628,10 @@ pub mod tests {
                 .is_some()
         };
         for (i, event) in reactions.iter().enumerate() {
+            // Reading the key's events ahead as it nears the threshold.
+            let txn = store.read().unwrap();
+            store.prefetch(&txn, &record::encode(event)).unwrap();
+            drop(txn);
             put(&store, event);
             assert_eq!(stored(&store), i + 1 >= HLL_THRESHOLD, "{i}");
         }
