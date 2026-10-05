@@ -8,6 +8,7 @@ mod hll;
 mod landing;
 mod lmdb;
 mod metrics;
+mod plugin;
 mod query;
 mod rank;
 mod record;
@@ -16,6 +17,7 @@ mod search;
 mod store;
 mod wot;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,11 +96,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let app = relay::router(AppState::new(config, store, search));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     if let Some(metrics) = metrics {
         metrics.abort();
     }

@@ -71,6 +71,13 @@ pub struct Config {
     /// How far an engager's weight must move before what they've engaged
     /// with is rescored.
     pub rank_step: f64,
+    /// A strfry write policy plugin's command, run with `sh -c`.
+    pub write_policy_plugin: Option<String>,
+    /// How long the plugin may take to answer before it's restarted.
+    pub write_policy_timeout_seconds: u64,
+    /// The header a reverse proxy puts the client's IP in, such as
+    /// `x-real-ip` or `x-forwarded-for`.
+    pub real_ip_header: Option<String>,
 }
 
 impl Config {
@@ -119,6 +126,9 @@ impl Config {
             wot_budget: env("RELAY_WOT_BUDGET", 10_000)?,
             hot_half_life: env("RELAY_HOT_HALF_LIFE", 86_400)?,
             rank_step: env("RELAY_RANK_STEP", 0.05)?,
+            write_policy_plugin: optional("RELAY_WRITE_POLICY_PLUGIN"),
+            write_policy_timeout_seconds: env("RELAY_WRITE_POLICY_TIMEOUT_SECONDS", 10)?,
+            real_ip_header: optional("RELAY_REAL_IP_HEADER"),
             pubkey,
             contact: optional("RELAY_CONTACT"),
             max_message_size: env("RELAY_MAX_MESSAGE_SIZE", 4_000_000)?,

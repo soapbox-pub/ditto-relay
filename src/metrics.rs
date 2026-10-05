@@ -88,6 +88,10 @@ pub struct Metrics {
     pub events_duplicate: Counter,
     pub events_rejected: Counter,
     pub events_failed: Counter,
+    /// Refused by the write policy plugin, but said to be accepted.
+    pub events_shadow_rejected: Counter,
+    /// Time spent waiting on the write policy plugin.
+    pub plugin: Timer,
     /// Time from handing an event to the writer to hearing back.
     pub writes: Timer,
     /// Events waiting for the writer.
@@ -102,6 +106,8 @@ pub struct Metrics {
     pub errors_write: Counter,
     pub errors_query: Counter,
     pub errors_panic: Counter,
+    /// The write policy plugin dying, hanging, or answering nonsense.
+    pub errors_plugin: Counter,
     /// Live events slow connections fell too far behind to be sent.
     pub live_dropped: Counter,
 }
@@ -112,6 +118,8 @@ pub static METRICS: Metrics = Metrics {
     events_duplicate: Counter::new(),
     events_rejected: Counter::new(),
     events_failed: Counter::new(),
+    events_shadow_rejected: Counter::new(),
+    plugin: Timer::new(),
     writes: Timer::new(),
     write_queue: Gauge::new(),
     reqs: Timer::new(),
@@ -121,6 +129,7 @@ pub static METRICS: Metrics = Metrics {
     errors_write: Counter::new(),
     errors_query: Counter::new(),
     errors_panic: Counter::new(),
+    errors_plugin: Counter::new(),
     live_dropped: Counter::new(),
 };
 
@@ -194,8 +203,13 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
             (r#"result="duplicate""#, m.events_duplicate.get() as f64),
             (r#"result="rejected""#, m.events_rejected.get() as f64),
             (r#"result="failed""#, m.events_failed.get() as f64),
+            (
+                r#"result="shadow_rejected""#,
+                m.events_shadow_rejected.get() as f64,
+            ),
         ],
     );
+    out.timer("plugin_call", "Write policy plugin calls", &m.plugin);
     out.timer("write", "Events handed to the writer", &m.writes);
     out.one(
         "write_queue",
@@ -225,6 +239,7 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
             (r#"source="write""#, m.errors_write.get() as f64),
             (r#"source="query""#, m.errors_query.get() as f64),
             (r#"source="panic""#, m.errors_panic.get() as f64),
+            (r#"source="plugin""#, m.errors_plugin.get() as f64),
         ],
     );
     out.one(

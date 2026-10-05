@@ -1,12 +1,13 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -21,6 +22,7 @@ use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
 use crate::landing;
 use crate::metrics::{Connected, METRICS};
+use crate::plugin::{self, Plugin, Verdict};
 use crate::query::{self, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
@@ -35,6 +37,8 @@ pub struct AppState {
     pub search: Option<Arc<SearchIndex>>,
     /// Every accepted event, for live subscriptions.
     pub live: broadcast::Sender<Arc<LiveEvent>>,
+    /// Decides which events to take, if there is one.
+    plugin: Option<Plugin>,
     /// The NIP-11 information document, and the landing page made from it.
     nip11: Arc<str>,
     landing: Arc<str>,
@@ -58,7 +62,12 @@ impl AppState {
         let (search, indexer) = search.unzip();
         let info = nip11(&config);
         let landing = landing::render(&info, &config.url).into();
+        let plugin = config.write_policy_plugin.clone().map(|command| {
+            let timeout = Duration::from_secs(config.write_policy_timeout_seconds);
+            Plugin::spawn(command, timeout)
+        });
         Self {
+            plugin,
             nip11: info.to_string().into(),
             landing,
             config: Arc::new(config),
@@ -84,15 +93,17 @@ pub fn router(state: AppState) -> Router {
 
 async fn root(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     if let Ok(ws) = ws {
         let max = state.config.max_message_size;
+        let ip = client_ip(&state.config, &headers, peer);
         return ws
             .max_message_size(max)
             .max_frame_size(max)
-            .on_upgrade(move |socket| Connection::run(socket, state))
+            .on_upgrade(move |socket| Connection::run(socket, state, ip))
             .into_response();
     }
 
@@ -119,6 +130,21 @@ async fn root(
         state.landing.to_string(),
     )
         .into_response()
+}
+
+/// The client's IP: from the configured header if it's set and makes sense,
+/// else the peer's. Proxies append to `X-Forwarded-For`, so the last address
+/// in a list is the one the nearest proxy saw.
+fn client_ip(config: &Config, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    let Some(name) = &config.real_ip_header else {
+        return peer.ip();
+    };
+    let header = headers.get(name.as_str()).and_then(|v| v.to_str().ok());
+    let ip = header.and_then(|v| v.rsplit(',').next()?.trim().parse().ok());
+    if ip.is_none() {
+        tracing::warn!("couldn't parse an IP from {name}: {header:?}");
+    }
+    ip.unwrap_or(peer.ip())
 }
 
 fn nip11(config: &Config) -> Value {
@@ -194,6 +220,7 @@ struct Connection {
     state: AppState,
     subs: HashMap<String, Subscription>,
     outbox: mpsc::Sender<String>,
+    ip: IpAddr,
     /// What this connection signs to authenticate (NIP-42), once it's
     /// been asked to: only to publish a NIP-70 protected event.
     challenge: Option<String>,
@@ -205,7 +232,7 @@ struct Connection {
 struct Disconnect;
 
 impl Connection {
-    async fn run(socket: WebSocket, state: AppState) {
+    async fn run(socket: WebSocket, state: AppState, ip: IpAddr) {
         let _connected = Connected::new();
         let (mut sink, mut stream) = socket.split();
         let (outbox, mut outbox_rx) = mpsc::channel::<String>(OUTBOX_SIZE);
@@ -224,6 +251,7 @@ impl Connection {
             state,
             subs: HashMap::new(),
             outbox,
+            ip,
             challenge: None,
             authed: HashSet::new(),
         };
@@ -315,7 +343,17 @@ impl Connection {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let (accepted, msg) = self.judge(&id, value).await;
+        let (accepted, msg) = match self.check(value) {
+            Err(msg) => (false, msg),
+            Ok(ev) => match self.ask_plugin(&ev).await {
+                Verdict::Accept => self.accept(&id, ev).await,
+                Verdict::Reject(msg) => (false, msg.into()),
+                Verdict::ShadowReject(msg) => {
+                    METRICS.events_shadow_rejected.inc();
+                    return self.ok(&id, true, &msg).await;
+                }
+            },
+        };
         if msg.starts_with("auth-required:") && self.challenge.is_none() {
             let challenge = auth::challenge();
             self.send(&("AUTH", &challenge)).await?;
@@ -331,37 +369,59 @@ impl Connection {
         self.ok(&id, accepted, &msg).await
     }
 
-    /// Accept an event or not, storing it or sending it to live
-    /// subscriptions if so, with a NIP-01 OK message.
-    async fn judge(&mut self, id: &str, value: &Value) -> (bool, Cow<'static, str>) {
-        let rejected = |msg: String| (false, Cow::Owned(msg));
-        let ev: Event = match serde_json::from_value(value.clone()) {
-            Ok(ev) => ev,
-            Err(err) => return rejected(format!("invalid: {err}")),
-        };
-        if let Err(msg) = ev.verify() {
-            return rejected(msg);
-        }
+    /// An event, if it's one the relay could take, or a NIP-01 OK message
+    /// saying why not.
+    fn check(&self, value: &Value) -> Result<Event, Cow<'static, str>> {
+        let ev: Event = serde_json::from_value(value.clone())
+            .map_err(|err| Cow::Owned(format!("invalid: {err}")))?;
+        ev.verify()?;
         if !event::is_relayed(ev.kind) {
-            return rejected(format!("blocked: kind {} is not relayed", ev.kind));
+            return Err(format!("blocked: kind {} is not relayed", ev.kind).into());
         }
         let author = event::decode_hex(&ev.pubkey).expect("verified");
         if is_protected(&ev) && !self.authed.contains(&author) {
-            let msg = "auth-required: this event may only be published by its author";
-            return (false, msg.into());
+            return Err("auth-required: this event may only be published by its author".into());
         }
-        let now = event::now();
-        if ev.created_at > u64::from(now) + self.state.config.max_future_seconds {
-            return (false, "invalid: created_at is too far in the future".into());
+        if ev.created_at > u64::from(event::now()) + self.state.config.max_future_seconds {
+            return Err("invalid: created_at is too far in the future".into());
         }
-
         if ev.kind == VANISH && !addressed_to(&ev, &self.state.config.url) {
-            return (
-                false,
-                "invalid: this request to vanish is for other relays".into(),
-            );
+            return Err("invalid: this request to vanish is for other relays".into());
         }
+        Ok(ev)
+    }
 
+    /// What the write policy plugin makes of an event, if there is one.
+    async fn ask_plugin(&self, ev: &Event) -> Verdict {
+        let Some(plugin) = &self.state.plugin else {
+            return Verdict::Accept;
+        };
+        // strfry names one pubkey: the author's, if it's among them.
+        let author = event::decode_hex(&ev.pubkey).expect("verified");
+        let authed = match self.authed.contains(&author) {
+            true => Some(author),
+            false => self.authed.iter().next().copied(),
+        }
+        .map(hex::encode);
+        let source = plugin::Source {
+            ip: self.ip,
+            authed: authed.as_deref(),
+        };
+        let start = Instant::now();
+        let verdict = plugin.judge(ev, &source).await;
+        METRICS.plugin.since(start);
+        if let Verdict::Reject(msg) | Verdict::ShadowReject(msg) = &verdict
+            && !msg.is_empty()
+        {
+            tracing::debug!("write policy blocked event {}: {msg}", ev.id);
+        }
+        verdict
+    }
+
+    /// Stores an event, or sends it to live subscriptions, with a NIP-01
+    /// OK message.
+    async fn accept(&mut self, id: &str, ev: Event) -> (bool, Cow<'static, str>) {
+        let now = event::now();
         let ephemeral = ev.kind_class() == KindClass::Ephemeral;
         // Encoding guesses the event's language and sentiment, which takes
         // a while for long text.

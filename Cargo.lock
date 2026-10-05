@@ -419,6 +419,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "vader-parity",
