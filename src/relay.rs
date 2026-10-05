@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,13 +15,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::auth::{self, Access, Authed, Refusal};
+use crate::auth;
 use crate::config::Config;
 use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
 use crate::landing;
 use crate::metrics::{Connected, METRICS};
-use crate::query::{self, Restricted, TooExpensive};
+use crate::query::{self, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
@@ -29,8 +29,6 @@ use crate::store::{Outcome, Store, Writer};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    /// Who may read what.
-    pub access: Arc<Access>,
     pub store: Arc<Store>,
     pub writer: Writer,
     /// For NIP-50 search, if it's on.
@@ -63,7 +61,6 @@ impl AppState {
         Self {
             nip11: info.to_string().into(),
             landing,
-            access: Arc::new(Access::new(&config)),
             config: Arc::new(config),
             writer: Writer::spawn(store.clone(), indexer),
             store,
@@ -197,9 +194,11 @@ struct Connection {
     state: AppState,
     subs: HashMap<String, Subscription>,
     outbox: mpsc::Sender<String>,
-    /// What this connection signs to authenticate (NIP-42).
-    challenge: String,
-    authed: Authed,
+    /// What this connection signs to authenticate (NIP-42), once it's
+    /// been asked to: only to publish a NIP-70 protected event.
+    challenge: Option<String>,
+    /// The pubkeys the connection has authenticated as.
+    authed: HashSet<[u8; 32]>,
 }
 
 /// The connection should be torn down.
@@ -225,12 +224,9 @@ impl Connection {
             state,
             subs: HashMap::new(),
             outbox,
-            challenge: auth::challenge(),
-            authed: Authed::new(),
+            challenge: None,
+            authed: HashSet::new(),
         };
-        if conn.send(&("AUTH", &conn.challenge)).await.is_err() {
-            return;
-        }
 
         loop {
             let result = tokio::select! {
@@ -320,6 +316,11 @@ impl Connection {
             .unwrap_or_default()
             .to_string();
         let (accepted, msg) = self.judge(&id, value).await;
+        if msg.starts_with("auth-required:") && self.challenge.is_none() {
+            let challenge = auth::challenge();
+            self.send(&("AUTH", &challenge)).await?;
+            self.challenge = Some(challenge);
+        }
         let counter = match (accepted, msg.split_once(':').map(|(prefix, _)| prefix)) {
             (_, Some("duplicate")) => &METRICS.events_duplicate,
             (true, _) => &METRICS.events_accepted,
@@ -427,9 +428,6 @@ impl Connection {
             Ok(filters) => filters,
             Err(msg) => return self.closed(sub_id, &msg).await,
         };
-        if let Err(refusal) = self.check(&filters) {
-            return self.refuse(sub_id, refusal).await;
-        }
         if !self.subs.contains_key(sub_id) && self.subs.len() >= config.max_subscriptions {
             return self.closed(sub_id, "error: too many subscriptions").await;
         }
@@ -441,7 +439,6 @@ impl Connection {
         let store = self.state.store.clone();
         let search = self.state.search.clone();
         let query_filters = filters.clone();
-        let visible = self.visible();
         let start = Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             query::run(
@@ -450,7 +447,6 @@ impl Connection {
                 &query_filters,
                 config.default_limit,
                 config.max_limit,
-                visible,
             )
         })
         .await;
@@ -458,9 +454,6 @@ impl Connection {
 
         let results = match result {
             Ok(Ok(results)) => results,
-            Ok(Err(err)) if err.is::<Restricted>() => {
-                return self.refuse(sub_id, Refusal::Results).await;
-            }
             Ok(Err(err)) => {
                 tracing::error!("query failed: {err:#}");
                 METRICS.errors_query.inc();
@@ -497,9 +490,6 @@ impl Connection {
         if filters.len() > self.state.config.max_filters {
             return Err("invalid: too many filters".into());
         }
-        for filter in &mut filters {
-            self.state.access.hide(filter, &self.authed);
-        }
         // Only text needs the search index: extensions are looked up in
         // the LMDB.
         for filter in filters
@@ -512,25 +502,6 @@ impl Connection {
             }
         }
         Ok(filters)
-    }
-
-    /// Whether the connection may run some filters.
-    fn check(&self, filters: &[Filter]) -> Result<(), Refusal> {
-        filters
-            .iter()
-            .try_for_each(|filter| self.state.access.check(filter, &self.authed))
-    }
-
-    /// Which events the connection may see, for a query.
-    fn visible(&self) -> impl Fn(&EventView) -> bool + Send + 'static {
-        let access = self.state.access.clone();
-        let authed = self.authed.clone();
-        move |event| access.may_see(event, &authed)
-    }
-
-    /// Refuse a REQ or COUNT.
-    async fn refuse(&self, id: &str, refusal: Refusal) -> Result<(), Disconnect> {
-        self.closed(id, refusal.message(&self.authed)).await
     }
 
     /// NIP-42: `["AUTH", event]`.
@@ -547,7 +518,11 @@ impl Connection {
             Ok(ev) => ev,
             Err(err) => return self.ok(&id, false, &format!("invalid: {err}")).await,
         };
-        match auth::verify(&ev, &self.challenge, &self.state.config.url, event::now()) {
+        let Some(challenge) = &self.challenge else {
+            let msg = "invalid: no challenge has been issued";
+            return self.ok(&id, false, msg).await;
+        };
+        match auth::verify(&ev, challenge, &self.state.config.url, event::now()) {
             Ok(pubkey) => {
                 self.authed.insert(pubkey);
                 self.ok(&id, true, "").await
@@ -568,18 +543,13 @@ impl Connection {
             Ok(filters) => filters,
             Err(msg) => return self.closed(id, &msg).await,
         };
-        if let Err(refusal) = self.check(&filters) {
-            return self.refuse(id, refusal).await;
-        }
 
         let store = self.state.store.clone();
         let search = self.state.search.clone();
-        let visible = self.visible();
         let start = Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            query::count(&store, search.as_deref(), &filters, visible)
-        })
-        .await;
+        let result =
+            tokio::task::spawn_blocking(move || query::count(&store, search.as_deref(), &filters))
+                .await;
         METRICS.counts.since(start);
         match result {
             Ok(Ok(count)) => {
@@ -589,7 +559,6 @@ impl Connection {
                 }
                 self.send(&("COUNT", id, body)).await
             }
-            Ok(Err(err)) if err.is::<Restricted>() => self.refuse(id, Refusal::Results).await,
             Ok(Err(err)) if err.is::<TooExpensive>() => {
                 METRICS.counts_refused.inc();
                 self.closed(id, "unsupported: too expensive to count").await
@@ -609,9 +578,6 @@ impl Connection {
 
     async fn on_live_event(&self, ev: &LiveEvent) -> Result<(), Disconnect> {
         let view = EventView::new(&ev.record).expect("an encoded record");
-        if !self.state.access.may_see(&view, &self.authed) {
-            return Ok(());
-        }
         for (sub_id, sub) in &self.subs {
             // Already covered by the subscription's initial query.
             if ev.seq.is_some_and(|seq| seq < sub.next_seq) {

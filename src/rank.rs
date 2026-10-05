@@ -1176,7 +1176,7 @@ pub fn sort<'t>(
     // The best authors first.
     let authors: Option<HashMap<[u8; 32], u64>> = match by_author(filter, mode) {
         true => {
-            let authors = ranked_authors(store, txn, filter, mode)?;
+            let authors = ranked_authors(store, txn, mode)?;
             let n = authors.len() as u64;
             Some((0..).zip(authors).map(|(i, a)| (a, n - i)).collect())
         }
@@ -1224,7 +1224,7 @@ pub fn run<'t>(
     } else {
         let mut found = match by_author(filter, mode) {
             true => {
-                let authors = ranked_authors(store, txn, filter, mode)?;
+                let authors = ranked_authors(store, txn, mode)?;
                 profiles(store, txn, filter, &authors, limit)?
             }
             false => best(store, txn, filter, mode, limit, search.distinct_author)?,
@@ -1245,10 +1245,9 @@ pub fn run<'t>(
 }
 
 /// The authors of the best events of any kind in a mode, the best first.
-fn ranked_authors(store: &Store, txn: &Txn, filter: &Filter, mode: u8) -> Result<Vec<[u8; 32]>> {
+fn ranked_authors(store: &Store, txn: &Txn, mode: u8) -> Result<Vec<[u8; 32]>> {
     let any = Filter {
         until: u32::MAX,
-        hidden_kinds: filter.hidden_kinds.clone(),
         ..Filter::default()
     };
     let found = best(store, txn, &any, mode, RANKED_AUTHORS, true)?;
@@ -1516,7 +1515,7 @@ mod tests {
 
     fn ids(store: &Store, filter: Value) -> Vec<String> {
         let filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
-        crate::query::run(store, None, &[filter], 100, 500, |_| true)
+        crate::query::run(store, None, &[filter], 100, 500)
             .unwrap()
             .events
             .iter()
