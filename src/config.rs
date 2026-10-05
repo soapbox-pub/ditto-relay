@@ -28,9 +28,13 @@ pub struct Config {
     pub pubkey: Option<String>,
     /// How to reach the operator, for NIP-11.
     pub contact: Option<String>,
-    /// The relay's own key, which signs the NIP-85 assertions it serves.
-    /// None turns them off.
+    /// The relay's own key, which signs the NIP-85 assertions it serves
+    /// and the trends it labels. None turns them off.
     pub keypair: Option<Keypair>,
+    /// How many seconds apart trends are labeled. 0 turns them off.
+    pub trends_interval: u64,
+    /// How many seconds a trend label is kept.
+    pub trends_expiration: u32,
     pub max_message_size: usize,
     pub max_subscriptions: usize,
     pub max_filters: usize,
@@ -143,6 +147,9 @@ impl Config {
                 ),
                 None => None,
             },
+            trends_interval: env("RELAY_TRENDS_INTERVAL", 900)?,
+            // A week of sparklines, and a day to spare.
+            trends_expiration: env("RELAY_TRENDS_EXPIRATION", 8 * 86_400)?,
             max_message_size: env("RELAY_MAX_MESSAGE_SIZE", 4_000_000)?,
             max_subscriptions: env("RELAY_MAX_SUBSCRIPTIONS", 20)?,
             max_filters: env("RELAY_MAX_FILTERS", 100)?,

@@ -696,6 +696,12 @@ fn score_of(store: &Store, txn: &Txn, id: &[u8; 32]) -> Result<Option<Score>> {
     Ok(txn.get(store.tables.scores, id)?.and_then(Score::decode))
 }
 
+/// An event's score: its engagers' applied weights, in whole engagers.
+pub fn score(store: &Store, txn: &Txn, id: &[u8; 32]) -> Result<f64> {
+    let score = score_of(store, txn, id)?.map_or(0, |s| s.score);
+    Ok(score as f64 / FULL as f64)
+}
+
 /// Keep a target's new score, refiling it in `ranked`.
 fn set_score(
     store: &Store,

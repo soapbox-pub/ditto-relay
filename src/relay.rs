@@ -77,6 +77,23 @@ impl AppState {
             live: broadcast::channel(8192).0,
         }
     }
+
+    /// Store an event of the relay's own and send it to live subscriptions.
+    pub async fn publish(&self, ev: Event) -> anyhow::Result<Outcome> {
+        let record = Arc::new(tokio::task::spawn_blocking(move || record::encode(&ev)).await?);
+        let outcome = self.writer.write(record.clone()).await?;
+        if let Outcome::Stored(seq) = outcome {
+            let json = EventView::new(&record)
+                .expect("an encoded record")
+                .to_json();
+            let _ = self.live.send(Arc::new(LiveEvent {
+                seq: Some(seq),
+                record,
+                json,
+            }));
+        }
+        Ok(outcome)
+    }
 }
 
 pub fn router(state: AppState) -> Router {

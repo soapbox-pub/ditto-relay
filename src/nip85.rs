@@ -188,7 +188,7 @@ fn identifier(store: &Store, txn: &Txn, value: &[u8]) -> Result<Stats> {
 }
 
 /// How many events of `kinds` have a `name` tag of `value`.
-fn tagged(store: &Store, txn: &Txn, name: &str, value: &[u8], kinds: &[u16]) -> Result<u64> {
+pub fn tagged(store: &Store, txn: &Txn, name: &str, value: &[u8], kinds: &[u16]) -> Result<u64> {
     let mut total = 0;
     for &kind in kinds {
         total += count(txn, store.tables.tags, &tag_key(name, value, Some(kind)))?;

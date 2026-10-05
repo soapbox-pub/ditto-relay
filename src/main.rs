@@ -16,6 +16,7 @@ mod record;
 mod relay;
 mod search;
 mod store;
+mod trends;
 mod wot;
 
 use std::net::SocketAddr;
@@ -96,7 +97,9 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let app = relay::router(AppState::new(config, store, search));
+    let state = AppState::new(config, store, search);
+    trends::spawn(state.clone());
+    let app = relay::router(state);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
