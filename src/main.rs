@@ -79,18 +79,34 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(config, store, search);
     trends::spawn(state.clone());
-    let app = relay::router(state);
+    let shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        signal().await;
+        tracing::info!("shutting down");
+        shutdown.cancel();
+    });
+    let app = relay::router(state.clone());
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
     .await?;
+    state.shut_down().await;
     if let Some(metrics) = metrics {
         metrics.abort();
     }
+    tracing::info!("shut down");
 
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM from a service manager.
+async fn signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("a SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
 }

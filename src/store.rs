@@ -92,8 +92,9 @@
 //! forget, so one counts authors whose events have since gone too.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
@@ -1366,8 +1367,15 @@ const MAX_SWEEP: usize = 10_000;
 /// read in parallel rather than one after another by the writer.
 #[derive(Clone)]
 pub struct Writer {
-    tx: std::sync::mpsc::Sender<WriteJob>,
+    tx: std::sync::mpsc::Sender<Request>,
     store: Arc<Store>,
+    thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+enum Request {
+    Write(WriteJob),
+    /// Store what's queued before this, then stop.
+    Stop,
 }
 
 impl Writer {
@@ -1379,11 +1387,7 @@ impl Writer {
         indexer: Option<std::sync::mpsc::Sender<Vec<u64>>>,
         stored: impl Fn(Vec<(u64, Arc<Vec<u8>>)>) + Send + 'static,
     ) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
-        let writer = Self {
-            tx,
-            store: store.clone(),
-        };
+        let (tx, rx) = std::sync::mpsc::channel::<Request>();
         let tell = move |(events, removed): Written| {
             if let Some(indexer) = &indexer
                 && (!events.is_empty() || !removed.is_empty())
@@ -1395,7 +1399,8 @@ impl Writer {
             }
         };
 
-        std::thread::Builder::new()
+        let prefetching = store.clone();
+        let thread = std::thread::Builder::new()
             .name("lmdb-writer".into())
             .spawn(move || {
                 let mut next_sweep = Instant::now();
@@ -1422,10 +1427,11 @@ impl Writer {
                         false => next_sweep.saturating_duration_since(Instant::now()),
                     };
                     let first = match rx.recv_timeout(wait) {
-                        Ok(job) => {
+                        Ok(Request::Write(job)) => {
                             METRICS.write_queue.dec();
                             job
                         }
+                        Ok(Request::Stop) => break,
                         Err(RecvTimeoutError::Timeout) => {
                             if trust {
                                 turn(&mut trust);
@@ -1435,17 +1441,25 @@ impl Writer {
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
                     let mut batch = vec![first];
+                    let mut stop = false;
                     while batch.len() < MAX_WRITE_BATCH {
                         match rx.try_recv() {
-                            Ok(job) => {
+                            Ok(Request::Write(job)) => {
                                 METRICS.write_queue.dec();
                                 batch.push(job);
+                            }
+                            Ok(Request::Stop) => {
+                                stop = true;
+                                break;
                             }
                             Err(_) => break,
                         }
                     }
 
                     write(&store, batch, &tell);
+                    if stop {
+                        break;
+                    }
                     // A follow list in the batch may have moved trust; a
                     // turn between batches keeps it from falling behind.
                     turn(&mut trust);
@@ -1453,7 +1467,23 @@ impl Writer {
             })
             .expect("failed to spawn writer thread");
 
-        writer
+        Self {
+            tx,
+            store: prefetching,
+            thread: Arc::new(Mutex::new(Some(thread))),
+        }
+    }
+
+    /// Store what's been queued, then stop: later writes fail. Blocks until
+    /// the writer has stopped.
+    pub fn stop(&self) {
+        let _ = self.tx.send(Request::Stop);
+        let thread = self.thread.lock().expect("unpoisoned").take();
+        if let Some(thread) = thread
+            && thread.join().is_err()
+        {
+            tracing::error!("the writer thread panicked");
+        }
     }
 
     /// Store an encoded record.
@@ -1470,7 +1500,7 @@ impl Writer {
         }
         let (reply, rx) = oneshot::channel();
         METRICS.write_queue.inc();
-        if self.tx.send((record, reply)).is_err() {
+        if self.tx.send(Request::Write((record, reply))).is_err() {
             METRICS.write_queue.dec();
             bail!("writer thread is gone");
         }

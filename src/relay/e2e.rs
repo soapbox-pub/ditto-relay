@@ -389,6 +389,28 @@ async fn sends_what_the_relay_publishes_itself() {
 }
 
 #[tokio::test]
+async fn shuts_down_cleanly() {
+    let relay = Relay::start().await;
+    let mut client = relay.connect().await;
+    let ev = note(1, "before");
+    client.publish(&ev).await;
+    relay.state.shut_down().await;
+
+    // Closed.
+    let closed = tokio::time::timeout(WAIT, client.ws.next()).await.unwrap();
+    assert!(
+        matches!(closed, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
+        "{closed:?}"
+    );
+    // Stored, and the writer is gone.
+    let txn = relay.state.store.read().unwrap();
+    let id = event::decode_hex(&ev.id).unwrap();
+    assert!(relay.state.store.contains(&txn, &id).unwrap());
+    let record = Arc::new(crate::record::encode(&note(2, "after")));
+    assert!(relay.state.writer.write(record).await.is_err());
+}
+
+#[tokio::test]
 async fn counts() {
     let relay = Relay::start().await;
     let mut client = relay.connect().await;

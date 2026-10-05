@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::auth;
 use crate::config::Config;
@@ -46,6 +47,10 @@ pub struct AppState {
     hub: Hub,
     /// The next connection's id.
     next_conn: Arc<AtomicU64>,
+    /// Cancelled to shut the relay down.
+    pub shutdown: CancellationToken,
+    /// Every open connection, to wait for at shutdown.
+    connections: TaskTracker,
     /// Decides which events to take, if there is one.
     plugin: Option<Plugin>,
     /// A place per core for checking signatures, which keeps a flood of
@@ -93,9 +98,29 @@ impl AppState {
             search,
             hub,
             next_conn: Arc::new(AtomicU64::new(1)),
+            shutdown: CancellationToken::new(),
+            connections: TaskTracker::new(),
             verifiers: Arc::new(Semaphore::new(cores())),
             queries: Arc::new(Semaphore::new(cores())),
         }
+    }
+
+    /// Shut down: close every connection, each once it's done with the
+    /// message it's on, then store what's queued and stop the writer.
+    pub async fn shut_down(&self) {
+        self.shutdown.cancel();
+        self.connections.close();
+        if tokio::time::timeout(CLOSE_TIMEOUT, self.connections.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "{} connections didn't close in time",
+                self.connections.len()
+            );
+        }
+        let writer = self.writer.clone();
+        let _ = tokio::task::spawn_blocking(move || writer.stop()).await;
     }
 
     /// Store an event of the relay's own, which the writer sends to live
@@ -135,7 +160,10 @@ async fn root(
         return ws
             .max_message_size(max)
             .max_frame_size(max)
-            .on_upgrade(move |socket| Connection::run(socket, state, ip))
+            .on_upgrade(move |socket| {
+                let connections = state.connections.clone();
+                connections.track_future(Connection::run(socket, state, ip))
+            })
             .into_response();
     }
 
@@ -248,6 +276,9 @@ fn is_protected(ev: &Event) -> bool {
 /// is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long connections get to close at shutdown.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How often a client is pinged. One not heard from in two of these, pong
 /// or otherwise, has gone without closing, and is dropped.
 const PING_INTERVAL: Duration = Duration::from_secs(60);
@@ -320,7 +351,8 @@ struct Connection {
     id: ConnId,
     /// By subscription id.
     subs: HashMap<String, Subscription>,
-    /// Stops every query of the connection's once it's gone.
+    /// Stops every query of the connection's once it's gone, or the relay
+    /// is shutting down.
     cancel: CancellationToken,
     sink: SplitSink<WebSocket, Message>,
     ip: IpAddr,
@@ -351,11 +383,12 @@ impl Connection {
         let mut ping = tokio::time::interval_at(start, PING_INTERVAL);
         let mut heard = Instant::now();
         let mut queries = JoinSet::new();
+        let shutdown = state.shutdown.clone();
         let mut conn = Connection {
+            cancel: shutdown.child_token(),
             state,
             id,
             subs: HashMap::new(),
-            cancel: CancellationToken::new(),
             sink,
             ip,
             challenge: None,
@@ -364,6 +397,7 @@ impl Connection {
 
         loop {
             let result = tokio::select! {
+                _ = shutdown.cancelled() => break,
                 _ = overflow.cancelled() => {
                     tracing::debug!("dropping a client that fell too far behind");
                     METRICS.dropped_behind.inc();

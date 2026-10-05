@@ -20,7 +20,7 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 tantivy = "0.26"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "process", "io-util", "time"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 vader-parity = "0.1.0"
