@@ -14,6 +14,7 @@
 //! is less than 20, `-tag:content-warning` lacks the tag. Conditions on the
 //! same key don't replace each other; an event must meet all of them.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use crate::analysis::Sentiment;
@@ -123,7 +124,10 @@ pub fn keys(view: &EventView, indexed: &IndexedTags) -> Vec<Vec<u8>> {
     if media.video {
         keys.push(key(VIDEO, &[], kind));
     }
-    for (facet, value) in [(PROTOCOL, protocol(view)), (CLIENT, client(view))] {
+    for (facet, value) in [
+        (PROTOCOL, protocol(view).map(Cow::Borrowed)),
+        (CLIENT, client(view)),
+    ] {
         if let Some(value) = value.filter(|v| v.len() <= MAX_INDEXED_TAG) {
             keys.push(key(facet, value.as_bytes(), kind));
         }
@@ -260,26 +264,29 @@ pub fn is_nsfw(view: &EventView) -> bool {
 }
 
 /// The third element of the first tag named `name` with one.
-fn third<'a>(view: &EventView<'a>, name: &str) -> Option<&'a str> {
+fn third<'a>(view: &EventView<'a>, name: &str) -> Option<Element<'a>> {
     view.tags().find_map(|mut tag| {
         if tag.next()? != Element::Text(name) {
             return None;
         }
-        match tag.nth(1)? {
-            Element::Text(text) => Some(text),
-            Element::Hex(_) => None,
-        }
+        tag.nth(1)
     })
 }
 
 /// The protocol a NIP-48 `proxy` tag says an event was bridged from.
 pub fn protocol<'a>(view: &EventView<'a>) -> Option<&'a str> {
-    third(view, "proxy")
+    match third(view, "proxy")? {
+        Element::Text(text) => Some(text),
+        _ => None,
+    }
 }
 
 /// The NIP-89 address of the client a `client` tag names.
-pub fn client<'a>(view: &EventView<'a>) -> Option<&'a str> {
-    third(view, "client")
+pub fn client<'a>(view: &EventView<'a>) -> Option<Cow<'a, str>> {
+    match third(view, "client")? {
+        Element::Hex(_) => None,
+        address => Some(address.to_text()),
+    }
 }
 
 /// Whether an event has a tag named `name`, with a value or without.
@@ -384,7 +391,7 @@ impl Condition {
                 is != *negated
             }
             Condition::Client { address, negated } => {
-                (client(view) == Some(address.as_str())) != *negated
+                (client(view).as_deref() == Some(address.as_str())) != *negated
             }
             Condition::Tag { name, negated } => has_tag(view, name) != *negated,
             Condition::Language { code, negated } => {
@@ -566,7 +573,7 @@ mod tests {
         );
         with(&event, |v| {
             assert_eq!(protocol(v), Some("activitypub"));
-            assert_eq!(client(v), Some("31990:ab:ditto"));
+            assert_eq!(client(v).as_deref(), Some("31990:ab:ditto"));
             assert!(has_tag(v, "content-warning") && !has_tag(v, "t"));
         });
     }

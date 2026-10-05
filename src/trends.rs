@@ -33,7 +33,6 @@ use crate::filter::Filter;
 use crate::lmdb::Txn;
 use crate::nip85::tagged;
 use crate::rank;
-use crate::record::Element;
 use crate::relay::AppState;
 use crate::store::{MAX_INDEXED_TAG, Store, each_stamp, stamp_seq};
 
@@ -77,8 +76,7 @@ pub fn hashtags(store: &Store, txn: &Txn, now: u32) -> anyhow::Result<Vec<Row>> 
         let mut tags: Vec<String> = view
             .tag_values()
             .filter_map(|(name, value)| match (name, value) {
-                ("t", Element::Text(text)) => Some(text.to_lowercase()),
-                ("t", Element::Hex(bytes)) => Some(hex::encode(bytes)),
+                ("t", value) => Some(value.to_text().to_lowercase()),
                 _ => None,
             })
             .filter(|tag| !tag.is_empty() && tag.len() <= MAX_INDEXED_TAG)

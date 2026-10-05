@@ -494,7 +494,9 @@ fn zap(view: &EventView) -> Option<Zap> {
                 msats: sats.parse::<u128>().ok()?.checked_mul(1000)?,
                 event: id_tag(view, "e", false).copied(),
                 address: match view.tag("a") {
-                    Some(Element::Text(address)) => Some(address.to_string()),
+                    Some(address @ (Element::Text(_) | Element::Address { .. })) => {
+                        Some(address.to_text().into_owned())
+                    }
                     _ => None,
                 },
                 recipients: ids(view, "p").copied().collect(),

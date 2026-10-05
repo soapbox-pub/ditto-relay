@@ -109,11 +109,8 @@ pub fn run(
 
 /// A `d` value, in [`record::tag_value`] form, as text.
 fn d_text(value: &[u8]) -> Option<String> {
-    match value.split_first()? {
-        (1, bytes) => Some(hex::encode(bytes)),
-        (_, text) if !text.is_empty() => String::from_utf8(text.to_vec()).ok(),
-        _ => None,
-    }
+    let text = record::tag_value_element(value)?.to_text();
+    (!text.is_empty()).then(|| text.into_owned())
 }
 
 /// Whether a `d` value is an id or a pubkey.

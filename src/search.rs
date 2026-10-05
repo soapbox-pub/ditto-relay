@@ -41,7 +41,6 @@
 //! looked up like any term. Names are indexed whatever the kind: the
 //! searchable kinds only limit ordinary search.
 
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
@@ -52,8 +51,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
@@ -144,10 +141,7 @@ pub fn text(view: &EventView) -> String {
         out.push_str(text);
     };
     // Short words can be base64 too, and kept as the bytes they spell.
-    let content = match view.content() {
-        Content::Text(text) => Cow::Borrowed(text),
-        Content::Base64(bytes) => Cow::Owned(STANDARD.encode(bytes)),
-    };
+    let content = view.content().to_text();
     if view.kind() == 0 {
         if let Ok(Value::Object(profile)) = serde_json::from_str(&content) {
             for field in PROFILE_FIELDS {

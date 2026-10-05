@@ -807,7 +807,7 @@ impl Store {
         for (name, value) in deletion.tag_values() {
             match (name, value) {
                 ("e", Element::Hex(id)) => ids.push(id),
-                ("a", Element::Text(text)) => addresses.extend(parse_address(text, author)),
+                ("a", value) => addresses.extend(parse_address(&value.to_text(), author)),
                 _ => {}
             }
         }
@@ -967,11 +967,10 @@ impl Store {
             }
             let mut encoded = Vec::with_capacity(value.encoded_len());
             value.encode(&mut encoded);
-            let text = match value {
-                Element::Hex(bytes) => hex::encode(bytes),
-                Element::Text(text) => text.to_string(),
-            };
-            keys.push((tag_key(name, &encoded, Some(view.kind())), text));
+            keys.push((
+                tag_key(name, &encoded, Some(view.kind())),
+                value.to_text().into_owned(),
+            ));
         }
         keys.sort_unstable();
         keys.dedup();
@@ -1158,11 +1157,9 @@ fn parse_address(text: &str, author: &[u8; 32]) -> Option<Vec<u8>> {
 /// An event's address as an `a` tag names it: `kind:pubkey:d`.
 fn address_text(view: &EventView) -> Option<String> {
     let d = match KindClass::of(view.kind()) {
-        KindClass::Addressable => match view.tag("d") {
-            Some(Element::Text(text)) => text.to_string(),
-            Some(Element::Hex(bytes)) => hex::encode(bytes),
-            None => String::new(),
-        },
+        KindClass::Addressable => view
+            .tag("d")
+            .map_or_else(String::new, |d| d.to_text().into_owned()),
         KindClass::Replaceable => String::new(),
         _ => return None,
     };
@@ -1195,8 +1192,8 @@ pub fn address(pubkey: &[u8; 32], kind: u16, d: &[u8]) -> Vec<u8> {
     out.extend_from_slice(pubkey);
     out.extend_from_slice(&kind.to_be_bytes());
     if d.len() > MAX_ADDRESS_D {
-        // Can't collide with a short one: those start with 0 or 1.
-        out.push(2);
+        // Can't collide with a short one: those start with 0, 1, or 2.
+        out.push(u8::MAX);
         out.extend_from_slice(&Sha256::digest(d));
     } else {
         out.extend_from_slice(d);

@@ -1,13 +1,11 @@
 //! NIP-01 filters: parsed once into sorted sets, then matched against stored
 //! records without decoding them.
 
-use std::cmp::Ordering;
-
 use serde_json::Value;
 
 use crate::event::is_hex64;
 use crate::facets::Condition;
-use crate::record::{Element, EventView, tag_value};
+use crate::record::{EventView, tag_value};
 use crate::search;
 use crate::store::{IndexedTags, MAX_INDEXED_TAG};
 
@@ -229,7 +227,7 @@ impl Filter {
         }
         self.tags.iter().all(|(name, values)| {
             event.tag_values().any(|(n, value)| {
-                n == name && values.binary_search_by(|v| compare(v, &value)).is_ok()
+                n == name && values.binary_search_by(|v| value.compare(v)).is_ok()
             })
         })
     }
@@ -327,18 +325,6 @@ fn extension(word: &str) -> Option<(&str, &str)> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'-');
     (key_ok && !value.is_empty() && !value.starts_with("//")).then_some((key, value))
-}
-
-/// Compare an encoded tag value with an element, as if it were encoded too.
-fn compare(encoded: &[u8], element: &Element) -> Ordering {
-    let (flag, bytes) = match element {
-        Element::Hex(bytes) => (1, &bytes[..]),
-        Element::Text(text) => (0, text.as_bytes()),
-    };
-    match encoded.split_first() {
-        None => Ordering::Less,
-        Some((f, rest)) => f.cmp(&flag).then_with(|| rest.cmp(bytes)),
-    }
 }
 
 fn list<'a>(name: &str, value: &'a Value, max: usize) -> Result<&'a Vec<Value>, String> {

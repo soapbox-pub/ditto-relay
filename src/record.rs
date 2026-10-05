@@ -5,6 +5,7 @@
 //! flags      u8         bit 0: an expiration follows the fixed header
 //!                       bit 1: the content is base64, kept as its bytes
 //!                       bit 2: an analysis follows the fixed header
+//!                       bit 3: the content is NIP-04, kept as its bytes
 //! id         [u8; 32]
 //! pubkey     [u8; 32]
 //! sig        [u8; 64]
@@ -15,20 +16,28 @@
 //!                       sentiment (see `Sentiment::to_byte`, or 0)
 //! tags_len   varint     bytes of tags that follow
 //! tags       varint count, then per tag: varint count, then per element
-//!            varint (len << 1 | hex), then the bytes
-//! content    the rest: UTF-8, or the bytes base64 content decodes to
+//!            varint (len << 1 | packed), then the bytes: UTF-8, or if
+//!            packed, 32 bytes of hex, or an address (kind u16 BE, pubkey
+//!            [u8; 32], then the `d` tag's UTF-8)
+//! content    the rest: UTF-8, the bytes base64 content decodes to, or
+//!            NIP-04's ciphertext bytes then its 16-byte IV
 //! ```
 //!
 //! Ids, keys, and signatures are raw bytes rather than hex, and so is any
 //! tag element that is exactly 64 lowercase hex digits — event and pubkey
-//! references, mostly — flagged so it reads back as the same text. Content
-//! that is base64 is kept as the bytes it spells, a quarter smaller. Either
-//! only applies when the text written back is exactly what was signed.
+//! references, mostly — flagged so it reads back as the same text. So is the
+//! pubkey of one that is an address, `kind:pubkey:d`. Content that is base64
+//! is kept as the bytes it spells, a quarter smaller, and so is NIP-04's
+//! `base64?iv=base64`. Each only applies when the text written back is
+//! exactly what was signed.
 //! Nothing is kept twice: the JSON is written from the record when it's sent.
 //!
 //! The NIP-40 expiration is in the header so that checking it, which every
 //! read does, needn't walk the tags. So is the event's [analysis], guessed
 //! once when it's encoded, so it's the same guess every time it's read.
+
+use std::borrow::Cow;
+use std::cmp::Ordering;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -39,7 +48,12 @@ use crate::event::{Event, is_hex64};
 const FLAG_EXPIRATION: u8 = 1;
 const FLAG_BASE64: u8 = 2;
 const FLAG_ANALYSIS: u8 = 4;
+const FLAG_NIP04: u8 = 8;
 const FIXED: usize = 1 + 32 + 32 + 64 + 4 + 2;
+/// A packed address's kind and pubkey, before its `d` tag.
+const ADDRESS_FIXED: usize = 2 + 32;
+const NIP04_IV: &str = "?iv=";
+const NIP04_IV_LEN: usize = 16;
 
 /// Encode an event, with its [analysis]. It must already be valid: ids and
 /// keys hex, numbers in range (see [`Event::verify`]).
@@ -55,13 +69,16 @@ pub fn encode(event: &Event) -> Vec<u8> {
 fn encode_with(event: &Event, analysis: Analysis) -> Vec<u8> {
     let expiration = expiration(event);
     let mut out = Vec::with_capacity(FIXED + 8 + event.content.len() + event.tags.len() * 40);
-    let base64 = decode_base64(&event.content);
-    let mut flags = 0;
+    let (content_flag, content) = match decode_base64(&event.content) {
+        Some(bytes) => (FLAG_BASE64, Some(bytes)),
+        None => match decode_nip04(&event.content) {
+            Some(bytes) => (FLAG_NIP04, Some(bytes)),
+            None => (0, None),
+        },
+    };
+    let mut flags = content_flag;
     if expiration.is_some() {
         flags |= FLAG_EXPIRATION;
-    }
-    if base64.is_some() {
-        flags |= FLAG_BASE64;
     }
     if !analysis.is_empty() {
         flags |= FLAG_ANALYSIS;
@@ -88,6 +105,11 @@ fn encode_with(event: &Event, analysis: Analysis) -> Vec<u8> {
             if is_hex64(element) {
                 put_varint(&mut tags, 32 << 1 | 1);
                 push_hex(&mut tags, element);
+            } else if let Some((kind, pubkey, d)) = parse_address(element) {
+                put_varint(&mut tags, ((ADDRESS_FIXED + d.len()) as u64) << 1 | 1);
+                tags.extend_from_slice(&kind.to_be_bytes());
+                push_hex(&mut tags, pubkey);
+                tags.extend_from_slice(d.as_bytes());
             } else {
                 put_varint(&mut tags, (element.len() as u64) << 1);
                 tags.extend_from_slice(element.as_bytes());
@@ -96,7 +118,7 @@ fn encode_with(event: &Event, analysis: Analysis) -> Vec<u8> {
     }
     put_varint(&mut out, tags.len() as u64);
     out.extend_from_slice(&tags);
-    match base64 {
+    match content {
         Some(bytes) => out.extend_from_slice(&bytes),
         None => out.extend_from_slice(event.content.as_bytes()),
     }
@@ -111,6 +133,29 @@ fn decode_base64(content: &str) -> Option<Vec<u8>> {
     }
     let bytes = STANDARD.decode(content).ok()?;
     (STANDARD.encode(&bytes) == content).then_some(bytes)
+}
+
+/// NIP-04 content, `base64?iv=base64`, as the ciphertext's bytes then the
+/// IV's, if both parts are base64 that encodes back to exactly itself.
+fn decode_nip04(content: &str) -> Option<Vec<u8>> {
+    let (ciphertext, iv) = content.split_once(NIP04_IV)?;
+    let mut bytes = decode_base64(ciphertext)?;
+    let iv = decode_base64(iv)?;
+    if iv.len() != NIP04_IV_LEN {
+        return None;
+    }
+    bytes.extend_from_slice(&iv);
+    Some(bytes)
+}
+
+/// The kind, pubkey, and `d` tag of an address, `kind:pubkey:d`, if it
+/// reads back as exactly itself: the kind in plain decimal, the pubkey in
+/// lowercase hex.
+fn parse_address(text: &str) -> Option<(u16, &str, &str)> {
+    let (kind_text, rest) = text.split_once(':')?;
+    let (pubkey, d) = rest.split_once(':')?;
+    let kind: u16 = kind_text.parse().ok()?;
+    (kind.to_string() == kind_text && is_hex64(pubkey)).then_some((kind, pubkey, d))
 }
 
 /// The NIP-40 expiration, if the event has one that will ever arrive.
@@ -166,6 +211,48 @@ pub enum Content<'a> {
     Text(&'a str),
     /// Base64, as the bytes it spells.
     Base64(&'a [u8]),
+    /// NIP-04's `base64?iv=base64`, as the bytes each part spells.
+    Nip04 {
+        ciphertext: &'a [u8],
+        iv: &'a [u8; NIP04_IV_LEN],
+    },
+}
+
+impl<'a> Content<'a> {
+    /// The content as it was signed.
+    pub fn to_text(self) -> Cow<'a, str> {
+        match self {
+            Content::Text(text) => Cow::Borrowed(text),
+            _ => {
+                let mut out = String::with_capacity(self.text_len());
+                self.push_text(&mut out);
+                Cow::Owned(out)
+            }
+        }
+    }
+
+    fn push_text(self, out: &mut String) {
+        match self {
+            Content::Text(text) => out.push_str(text),
+            Content::Base64(bytes) => STANDARD.encode_string(bytes, out),
+            Content::Nip04 { ciphertext, iv } => {
+                STANDARD.encode_string(ciphertext, out);
+                out.push_str(NIP04_IV);
+                STANDARD.encode_string(iv, out);
+            }
+        }
+    }
+
+    /// The length of [`to_text`](Content::to_text), without making it.
+    fn text_len(self) -> usize {
+        match self {
+            Content::Text(text) => text.len(),
+            Content::Base64(bytes) => bytes.len().div_ceil(3) * 4,
+            Content::Nip04 { ciphertext, iv } => {
+                ciphertext.len().div_ceil(3) * 4 + NIP04_IV.len() + iv.len().div_ceil(3) * 4
+            }
+        }
+    }
 }
 
 impl<'a> EventView<'a> {
@@ -195,6 +282,9 @@ impl<'a> EventView<'a> {
         let content = &rest[tags_len..];
         let content = if fixed[0] & FLAG_BASE64 != 0 {
             Content::Base64(content)
+        } else if fixed[0] & FLAG_NIP04 != 0 {
+            let (ciphertext, iv) = content.split_last_chunk::<NIP04_IV_LEN>()?;
+            Content::Nip04 { ciphertext, iv }
         } else {
             Content::Text(std::str::from_utf8(content).ok()?)
         };
@@ -273,10 +363,7 @@ impl<'a> EventView<'a> {
 
     /// The event as NIP-01 JSON.
     pub fn to_json(self) -> String {
-        let content_len = match self.content {
-            Content::Text(text) => text.len(),
-            Content::Base64(bytes) => bytes.len().div_ceil(3) * 4,
-        };
+        let content_len = self.content.text_len();
         let mut out = String::with_capacity(FIXED * 2 + content_len + self.tags.len() * 2 + 96);
         out.push_str("{\"id\":\"");
         push_hex_str(&mut out, self.id());
@@ -303,6 +390,7 @@ impl<'a> EventView<'a> {
                         push_hex_str(&mut out, bytes);
                         out.push('"');
                     }
+                    Element::Address { .. } => push_json_str(&mut out, &element.to_text()),
                 }
             }
             out.push(']');
@@ -310,10 +398,10 @@ impl<'a> EventView<'a> {
         out.push_str("],\"content\":");
         match self.content {
             Content::Text(text) => push_json_str(&mut out, text),
-            Content::Base64(bytes) => {
-                // Nothing in base64 needs escaping.
+            // Nothing in base64 needs escaping.
+            content => {
                 out.push('"');
-                STANDARD.encode_string(bytes, &mut out);
+                content.push_text(&mut out);
                 out.push('"');
             }
         }
@@ -387,10 +475,10 @@ impl<'a> Iterator for Elements<'a> {
         let len = usize::try_from(header >> 1).ok()?;
         let bytes = self.buf.get(..len)?;
         self.buf = &self.buf[len..];
-        if header & 1 == 1 {
-            Some(Element::Hex(bytes.try_into().ok()?))
-        } else {
-            Some(Element::Text(std::str::from_utf8(bytes).ok()?))
+        match (header & 1 == 1, len) {
+            (true, 32) => Some(Element::Hex(bytes.try_into().ok()?)),
+            (true, _) => address_element(bytes),
+            (false, _) => Some(Element::Text(std::str::from_utf8(bytes).ok()?)),
         }
     }
 }
@@ -401,50 +489,119 @@ pub enum Element<'a> {
     Text(&'a str),
     /// 64 lowercase hex digits, as the bytes they spell.
     Hex(&'a [u8; 32]),
+    /// An address, `kind:pubkey:d`, its pubkey as the bytes it spells.
+    Address {
+        kind: u16,
+        pubkey: &'a [u8; 32],
+        d: &'a str,
+    },
 }
 
-impl Element<'_> {
+impl<'a> Element<'a> {
+    const TEXT: u8 = 0;
+    const HEX: u8 = 1;
+    const ADDRESS: u8 = 2;
+
     /// The form tag values are indexed and compared in. See [`tag_value`].
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Element::Hex(bytes) => {
-                out.push(1);
+                out.push(Self::HEX);
                 out.extend_from_slice(*bytes);
             }
+            Element::Address { kind, pubkey, d } => {
+                out.push(Self::ADDRESS);
+                out.extend_from_slice(&kind.to_be_bytes());
+                out.extend_from_slice(*pubkey);
+                out.extend_from_slice(d.as_bytes());
+            }
             Element::Text(text) => {
-                out.push(0);
+                out.push(Self::TEXT);
                 out.extend_from_slice(text.as_bytes());
             }
+        }
+    }
+
+    /// Compare a value in [`tag_value`] form with this one, as if it were
+    /// encoded too.
+    pub fn compare(&self, encoded: &[u8]) -> Ordering {
+        let Some((&flag, rest)) = encoded.split_first() else {
+            return Ordering::Less;
+        };
+        match self {
+            Element::Text(text) => flag
+                .cmp(&Self::TEXT)
+                .then_with(|| rest.cmp(text.as_bytes())),
+            Element::Hex(bytes) => flag.cmp(&Self::HEX).then_with(|| rest.cmp(&bytes[..])),
+            Element::Address { kind, pubkey, d } => flag.cmp(&Self::ADDRESS).then_with(|| {
+                let parts = [&kind.to_be_bytes()[..], &pubkey[..], d.as_bytes()];
+                rest.iter().cmp(parts.into_iter().flatten())
+            }),
         }
     }
 
     /// Whether this is the value `encoded` (in [`tag_value`] form).
     #[cfg(test)]
     pub fn is(&self, encoded: &[u8]) -> bool {
-        match (self, encoded.split_first()) {
-            (Element::Hex(bytes), Some((1, rest))) => rest == bytes.as_slice(),
-            (Element::Text(text), Some((0, rest))) => rest == text.as_bytes(),
-            _ => false,
-        }
+        self.compare(encoded) == Ordering::Equal
     }
 
     pub fn encoded_len(&self) -> usize {
         1 + match self {
             Element::Hex(_) => 32,
+            Element::Address { d, .. } => ADDRESS_FIXED + d.len(),
             Element::Text(text) => text.len(),
+        }
+    }
+
+    /// The element as it was signed.
+    pub fn to_text(self) -> Cow<'a, str> {
+        match self {
+            Element::Text(text) => Cow::Borrowed(text),
+            Element::Hex(bytes) => Cow::Owned(hex::encode(bytes)),
+            Element::Address { kind, pubkey, d } => {
+                Cow::Owned(format!("{kind}:{}:{d}", hex::encode(pubkey)))
+            }
         }
     }
 }
 
+/// A packed address: kind, pubkey, then the `d` tag.
+fn address_element(bytes: &[u8]) -> Option<Element<'_>> {
+    let (kind, rest) = bytes.split_first_chunk::<2>()?;
+    let (pubkey, d) = rest.split_first_chunk::<32>()?;
+    Some(Element::Address {
+        kind: u16::from_be_bytes(*kind),
+        pubkey,
+        d: std::str::from_utf8(d).ok()?,
+    })
+}
+
+/// A value in [`tag_value`] form, as the element it is.
+pub fn tag_value_element(encoded: &[u8]) -> Option<Element<'_>> {
+    match encoded.split_first()? {
+        (&Element::TEXT, text) => Some(Element::Text(std::str::from_utf8(text).ok()?)),
+        (&Element::HEX, bytes) => Some(Element::Hex(bytes.try_into().ok()?)),
+        (&Element::ADDRESS, bytes) => address_element(bytes),
+        _ => None,
+    }
+}
+
 /// A tag value from a filter, in the form stored elements compare in: hex
-/// as its bytes, flagged 1, and any other text flagged 0.
+/// as its bytes, flagged 1, an address with its pubkey as bytes, flagged 2,
+/// and any other text flagged 0.
 pub fn tag_value(value: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(33);
     if is_hex64(value) {
-        out.push(1);
+        out.push(Element::HEX);
         push_hex(&mut out, value);
+    } else if let Some((kind, pubkey, d)) = parse_address(value) {
+        out.push(Element::ADDRESS);
+        out.extend_from_slice(&kind.to_be_bytes());
+        push_hex(&mut out, pubkey);
+        out.extend_from_slice(d.as_bytes());
     } else {
-        out.push(0);
+        out.push(Element::TEXT);
         out.extend_from_slice(value.as_bytes());
     }
     out
@@ -565,6 +722,110 @@ mod tests {
                 "{content:?}"
             );
             assert_eq!(roundtrip(&event), event, "{content:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_nip04_content_as_bytes() {
+        let ciphertext = STANDARD.encode((0..160u32).map(|i| (i * 13) as u8).collect::<Vec<_>>());
+        let iv = STANDARD.encode([7u8; 16]);
+        let content = format!("{ciphertext}?iv={iv}");
+        let event = signed(2, 1_700_000_000, 4, vec![], &content);
+        let record = encode(&event);
+        let view = EventView::new(&record).unwrap();
+        assert_eq!(
+            view.content(),
+            Content::Nip04 {
+                ciphertext: &STANDARD.decode(&ciphertext).unwrap(),
+                iv: &[7; 16],
+            }
+        );
+        assert_eq!(view.content().to_text(), content);
+        assert!(record.len() < FIXED + 1 + 160 + 16 + 4);
+        let back = roundtrip(&event);
+        assert_eq!(back, event);
+        assert_eq!(back.verify(), Ok(()));
+
+        // Only NIP-04 that reads back exactly as it was signed.
+        for content in [
+            format!("{ciphertext}?iv={}", STANDARD.encode([7u8; 15])),
+            format!("{ciphertext}?iv={iv}?iv={iv}"),
+            format!("{ciphertext}?iv={iv}\n"),
+            format!("{}?iv={iv}", ciphertext.trim_end_matches('=')),
+            format!("?iv={iv}"),
+            format!("{ciphertext}?IV={iv}"),
+        ] {
+            let event = signed(2, 1_700_000_000, 4, vec![], &content);
+            let record = encode(&event);
+            assert!(
+                matches!(EventView::new(&record).unwrap().content(), Content::Text(_)),
+                "{content:?}"
+            );
+            assert_eq!(roundtrip(&event), event, "{content:?}");
+        }
+    }
+
+    #[test]
+    fn packs_addresses() {
+        let hex = "ef".repeat(32);
+        let address = format!("30023:{hex}:my:article");
+        let event = signed(
+            2,
+            1_700_000_000,
+            7,
+            vec![
+                vec!["a", &address],
+                vec!["a", &format!("10000:{hex}:")],
+                vec!["client", "Ditto", &format!("31990:{hex}:ditto")],
+                // Not as it would read back, so kept as text.
+                vec!["a", &format!("030023:{hex}:x")],
+                vec!["a", &format!("+1:{hex}:x")],
+                vec!["a", &format!("70000:{hex}:x")],
+                vec!["a", &format!("1:{}:x", hex.to_uppercase())],
+                vec!["a", &format!("1:{hex}")],
+            ],
+            "",
+        );
+        let back = roundtrip(&event);
+        assert_eq!(back, event);
+        assert_eq!(back.verify(), Ok(()));
+
+        let record = encode(&event);
+        let view = EventView::new(&record).unwrap();
+        let values: Vec<_> = view.tag_values().map(|(_, value)| value).collect();
+        let pubkey: [u8; 32] = hex::decode(&hex).unwrap().try_into().unwrap();
+        assert_eq!(
+            values[0],
+            Element::Address {
+                kind: 30_023,
+                pubkey: &pubkey,
+                d: "my:article"
+            }
+        );
+        assert_eq!(values[0].to_text(), address);
+        assert!(values[0].is(&tag_value(&address)));
+        assert_eq!(values[0].encoded_len(), tag_value(&address).len());
+        assert!(!values[0].is(&tag_value(&format!("30023:{hex}:my"))));
+        assert!(matches!(values[1], Element::Address { d: "", .. }));
+        assert!(values[3..].iter().all(|v| matches!(v, Element::Text(_))));
+        assert!(values[3].is(&tag_value(&format!("030023:{hex}:x"))));
+
+        // Comparison agrees with the encoded bytes' order.
+        let mut encoded: Vec<_> = values
+            .iter()
+            .map(|v| {
+                let mut out = Vec::new();
+                v.encode(&mut out);
+                out
+            })
+            .collect();
+        encoded.sort();
+        for value in &values {
+            for other in &encoded {
+                let mut mine = Vec::new();
+                value.encode(&mut mine);
+                assert_eq!(value.compare(other), other.cmp(&mine));
+            }
         }
     }
 
