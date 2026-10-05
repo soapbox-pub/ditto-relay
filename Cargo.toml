@@ -29,4 +29,6 @@ whatlang = "0.18.0"
 [dev-dependencies]
 rand = "0.10.3"
 tempfile = "3.27.0"
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+# A TLS provider, for wss:// in examples/import.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
