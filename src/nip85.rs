@@ -221,7 +221,16 @@ mod tests {
     /// The assertions a filter gets, each checked.
     fn ask(store: &Store, filter: Value) -> Vec<Event> {
         let filter = Filter::parse(&filter, &store.indexed_tags, MAX_VALUES).unwrap();
-        let results = crate::query::run(store, None, Some(&relay()), &[filter], 100, 500).unwrap();
+        let results = crate::query::run(
+            store,
+            None,
+            Some(&relay()),
+            &[filter],
+            100,
+            500,
+            &Default::default(),
+        )
+        .unwrap();
         results
             .events
             .iter()
@@ -478,7 +487,16 @@ mod tests {
             .iter()
             .map(|f| Filter::parse(f, &store.indexed_tags, MAX_VALUES).unwrap())
             .collect();
-        let results = crate::query::run(&store, None, Some(&relay()), &filters, 100, 500).unwrap();
+        let results = crate::query::run(
+            &store,
+            None,
+            Some(&relay()),
+            &filters,
+            100,
+            500,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(results.events.len(), 1);
     }
 }

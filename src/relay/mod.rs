@@ -15,6 +15,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::auth;
 use crate::config::Config;
@@ -23,7 +25,7 @@ use crate::filter::Filter;
 use crate::landing;
 use crate::metrics::{Connected, METRICS};
 use crate::plugin::{self, Plugin, Verdict};
-use crate::query::{self, TooExpensive};
+use crate::query::{self, Cancelled, Count, Results, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
@@ -42,6 +44,9 @@ pub struct AppState {
     /// A place per core for checking signatures, which keeps a flood of
     /// events from taking over the blocking pool.
     verifiers: Arc<Semaphore>,
+    /// A place per core for queries. A REQ or COUNT waits its turn, rather
+    /// than being refused, when every core is busy.
+    queries: Arc<Semaphore>,
     /// The NIP-11 information document, and the landing page made from it.
     nip11: Arc<str>,
     landing: Arc<str>,
@@ -79,6 +84,7 @@ impl AppState {
             search,
             live: broadcast::channel(8192).0,
             verifiers: Arc::new(Semaphore::new(cores())),
+            queries: Arc::new(Semaphore::new(cores())),
         }
     }
 
@@ -240,16 +246,72 @@ fn is_protected(ev: &Event) -> bool {
 /// Outgoing queue depth per connection before we apply backpressure.
 const OUTBOX_SIZE: usize = 1024;
 
+/// The most live events held for a subscription while its query runs.
+/// Past this it's closed, and its client can ask again.
+const MAX_PENDING: usize = 16_384;
+
 struct Subscription {
+    /// This REQ's own name: a later REQ of the same id gets a new one, so
+    /// results meant for the one it replaced can be told apart.
+    name: Arc<str>,
     filters: Vec<Filter>,
-    /// Stored events below this sequence number were visible to the initial
-    /// query, so they've been sent already (or didn't match).
-    next_seq: u64,
+    /// Live events that arrived while the query ran, held until its EOSE.
+    /// None once it's sent.
+    pending: Option<Vec<Arc<LiveEvent>>>,
+    /// Stored events below this sequence number were visible to the
+    /// initial query, so they've been sent already (or didn't match).
+    floor: u64,
+    /// Stops its query.
+    cancel: CancellationToken,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// A finished query: a REQ's, by its subscription's name, or a COUNT's,
+/// by its id.
+enum Done {
+    Req(Arc<str>, anyhow::Result<Results>),
+    /// Boxed: a count's HyperLogLog is big.
+    Count(String, anyhow::Result<Box<Count>>),
+}
+
+/// Run a query on the blocking pool when a core is free, unless `cancel`
+/// is cancelled first.
+async fn run_query<T: Send + 'static>(
+    state: &AppState,
+    cancel: &CancellationToken,
+    query: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let run = async {
+        let place = state.queries.clone().acquire_owned().await?;
+        tokio::task::spawn_blocking(move || {
+            // Held until the query stops, which may be a moment after
+            // it's cancelled.
+            let _place = place;
+            query()
+        })
+        .await
+        .unwrap_or_else(|err| {
+            METRICS.errors_panic.inc();
+            Err(anyhow::anyhow!("query task panicked: {err}"))
+        })
+    };
+    cancel
+        .run_until_cancelled(run)
+        .await
+        .unwrap_or_else(|| Err(Cancelled.into()))
 }
 
 struct Connection {
     state: AppState,
+    /// By subscription id.
     subs: HashMap<String, Subscription>,
+    /// Stops every query of the connection's once it's gone.
+    cancel: CancellationToken,
     outbox: mpsc::Sender<String>,
     ip: IpAddr,
     /// What this connection signs to authenticate (NIP-42), once it's
@@ -278,9 +340,11 @@ impl Connection {
         });
 
         let mut live = state.live.subscribe();
+        let mut queries = JoinSet::new();
         let mut conn = Connection {
             state,
             subs: HashMap::new(),
+            cancel: CancellationToken::new(),
             outbox,
             ip,
             challenge: None,
@@ -290,7 +354,7 @@ impl Connection {
         loop {
             let result = tokio::select! {
                 msg = stream.next() => match msg {
-                    Some(Ok(Message::Text(text))) => conn.on_message(text.as_str()).await,
+                    Some(Ok(Message::Text(text))) => conn.on_message(text.as_str(), &mut queries).await,
                     Some(Ok(Message::Binary(_))) => conn.notice("error: binary messages are not supported").await,
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => Ok(()),
                     Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Disconnect),
@@ -304,12 +368,22 @@ impl Connection {
                     }
                     Err(broadcast::error::RecvError::Closed) => Err(Disconnect),
                 },
+                Some(done) = queries.join_next(), if !queries.is_empty() => match done {
+                    Ok(Done::Req(name, results)) => conn.on_results(name, results).await,
+                    Ok(Done::Count(id, count)) => conn.on_count_done(&id, count).await,
+                    // Cancelled tasks aren't aborted, and the others catch
+                    // their panics.
+                    Err(_) => Ok(()),
+                },
             };
             if result.is_err() {
                 break;
             }
         }
 
+        // Dropping `queries` drops their tasks, but not what they left
+        // running on the blocking pool.
+        conn.cancel.cancel();
         drop(conn);
         let _ = sender.await;
     }
@@ -341,15 +415,19 @@ impl Connection {
         self.send(&("CLOSED", sub_id, msg)).await
     }
 
-    async fn on_message(&mut self, text: &str) -> Result<(), Disconnect> {
+    async fn on_message(
+        &mut self,
+        text: &str,
+        queries: &mut JoinSet<Done>,
+    ) -> Result<(), Disconnect> {
         let Ok(Value::Array(mut msg)) = serde_json::from_str::<Value>(text) else {
             return self.notice("invalid: message must be a JSON array").await;
         };
 
         match msg.first().and_then(Value::as_str) {
             Some("EVENT") => self.on_event(msg.get_mut(1).map(Value::take)).await,
-            Some("REQ") => self.on_req(&msg[1..]).await,
-            Some("COUNT") => self.on_count(&msg[1..]).await,
+            Some("REQ") => self.on_req(&msg[1..], queries).await,
+            Some("COUNT") => self.on_count(&msg[1..], queries).await,
             Some("AUTH") => self.on_auth(msg.get_mut(1).map(Value::take)).await,
             Some("CLOSE") => match msg.get(1).and_then(Value::as_str) {
                 Some(sub_id) => {
@@ -541,7 +619,11 @@ impl Connection {
         }
     }
 
-    async fn on_req(&mut self, args: &[Value]) -> Result<(), Disconnect> {
+    async fn on_req(
+        &mut self,
+        args: &[Value],
+        queries: &mut JoinSet<Done>,
+    ) -> Result<(), Disconnect> {
         let config = self.state.config.clone();
 
         let Some(sub_id) = args.first().and_then(Value::as_str) else {
@@ -558,53 +640,81 @@ impl Connection {
         if !self.subs.contains_key(sub_id) && self.subs.len() >= config.max_subscriptions {
             return self.closed(sub_id, "error: too many subscriptions").await;
         }
-        // A REQ reusing an id replaces that subscription.
-        self.subs.remove(sub_id);
 
-        // Live events published while this runs wait in the broadcast
-        // receiver, and are checked against the subscription after it's added.
-        let store = self.state.store.clone();
-        let search = self.state.search.clone();
-        let query_filters = filters.clone();
-        let start = Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            query::run(
-                &store,
-                search.as_deref(),
-                config.keypair.as_ref(),
-                &query_filters,
-                config.default_limit,
-                config.max_limit,
-            )
-        })
-        .await;
-        METRICS.reqs.since(start);
-
-        let results = match result {
-            Ok(Ok(results)) => results,
-            Ok(Err(err)) => {
-                tracing::error!("query failed: {err:#}");
-                METRICS.errors_query.inc();
-                return self.closed(sub_id, "error: query failed").await;
-            }
-            Err(err) => {
-                tracing::error!("query task panicked: {err}");
-                METRICS.errors_panic.inc();
-                return self.closed(sub_id, "error: query failed").await;
-            }
-        };
-
+        // A REQ reusing an id replaces that subscription, stopping its query.
+        // Live events that arrive while this one's runs are held for it.
+        let name: Arc<str> = sub_id.into();
+        let cancel = self.cancel.child_token();
         self.subs.insert(
             sub_id.to_string(),
             Subscription {
-                filters,
-                next_seq: results.next_seq,
+                name: name.clone(),
+                filters: filters.clone(),
+                pending: Some(Vec::new()),
+                floor: 0,
+                cancel: cancel.clone(),
             },
         );
+        let state = self.state.clone();
+        queries.spawn(async move {
+            let (store, search) = (state.store.clone(), state.search.clone());
+            let start = Instant::now();
+            let stop = cancel.clone();
+            let results = run_query(&state, &cancel, move || {
+                query::run(
+                    &store,
+                    search.as_deref(),
+                    config.keypair.as_ref(),
+                    &filters,
+                    config.default_limit,
+                    config.max_limit,
+                    &stop,
+                )
+            })
+            .await;
+            METRICS.reqs.since(start);
+            Done::Req(name, results)
+        });
+        Ok(())
+    }
+
+    /// A REQ's results: its stored events, EOSE, then the live events that
+    /// came while it ran.
+    async fn on_results(
+        &mut self,
+        name: Arc<str>,
+        results: anyhow::Result<Results>,
+    ) -> Result<(), Disconnect> {
+        // Closed or replaced while it ran.
+        let Some(sub) = self
+            .subs
+            .get_mut(&*name)
+            .filter(|sub| Arc::ptr_eq(&sub.name, &name))
+        else {
+            return Ok(());
+        };
+        let results = match results {
+            Ok(results) => results,
+            Err(err) => {
+                tracing::error!("query failed: {err:#}");
+                METRICS.errors_query.inc();
+                self.subs.remove(&*name);
+                return self.closed(&name, "error: query failed").await;
+            }
+        };
+        sub.floor = results.next_seq;
+        let pending = sub.pending.take().unwrap_or_default();
         for json in &results.events {
-            self.send_event(sub_id, json).await?;
+            self.send_event(&name, json).await?;
         }
-        self.send(&("EOSE", sub_id)).await
+        self.send(&("EOSE", &*name)).await?;
+        for ev in pending {
+            // Stored events the query could see were sent with it.
+            if ev.seq.is_none_or(|seq| seq >= results.next_seq) {
+                self.send_event(&name, &ev.json).await?;
+            }
+        }
+        Ok(())
     }
 
     /// A REQ's or COUNT's filters, or why they're refused.
@@ -660,7 +770,11 @@ impl Connection {
     }
 
     /// NIP-45: `["COUNT", id, filters...]`.
-    async fn on_count(&mut self, args: &[Value]) -> Result<(), Disconnect> {
+    async fn on_count(
+        &mut self,
+        args: &[Value],
+        queries: &mut JoinSet<Done>,
+    ) -> Result<(), Disconnect> {
         let Some(id) = args.first().and_then(Value::as_str) else {
             return self.notice("invalid: COUNT requires a query id").await;
         };
@@ -672,48 +786,70 @@ impl Connection {
             Err(msg) => return self.closed(id, &msg).await,
         };
 
-        let store = self.state.store.clone();
-        let search = self.state.search.clone();
-        let start = Instant::now();
-        let result =
-            tokio::task::spawn_blocking(move || query::count(&store, search.as_deref(), &filters))
-                .await;
-        METRICS.counts.since(start);
-        match result {
-            Ok(Ok(count)) => {
+        let (state, id) = (self.state.clone(), id.to_string());
+        let cancel = self.cancel.clone();
+        queries.spawn(async move {
+            let (store, search) = (state.store.clone(), state.search.clone());
+            let start = Instant::now();
+            let stop = cancel.clone();
+            let count = run_query(&state, &cancel, move || {
+                query::count(&store, search.as_deref(), &filters, &stop).map(Box::new)
+            })
+            .await;
+            METRICS.counts.since(start);
+            Done::Count(id, count)
+        });
+        Ok(())
+    }
+
+    async fn on_count_done(
+        &mut self,
+        id: &str,
+        count: anyhow::Result<Box<Count>>,
+    ) -> Result<(), Disconnect> {
+        match count {
+            Ok(count) => {
                 let mut body = json!({"count": count.count});
                 if let Some(registers) = count.hll {
                     body["hll"] = hex::encode(registers).into();
                 }
                 self.send(&("COUNT", id, body)).await
             }
-            Ok(Err(err)) if err.is::<TooExpensive>() => {
+            Err(err) if err.is::<TooExpensive>() => {
                 METRICS.counts_refused.inc();
                 self.closed(id, "unsupported: too expensive to count").await
             }
-            Ok(Err(err)) => {
+            Err(err) => {
                 tracing::error!("count failed: {err:#}");
                 METRICS.errors_query.inc();
-                self.closed(id, "error: count failed").await
-            }
-            Err(err) => {
-                tracing::error!("count task panicked: {err}");
-                METRICS.errors_panic.inc();
                 self.closed(id, "error: count failed").await
             }
         }
     }
 
-    async fn on_live_event(&self, ev: &LiveEvent) -> Result<(), Disconnect> {
+    async fn on_live_event(&mut self, ev: &Arc<LiveEvent>) -> Result<(), Disconnect> {
         let view = EventView::new(&ev.record).expect("an encoded record");
-        for (sub_id, sub) in &self.subs {
-            // Already covered by the subscription's initial query.
-            if ev.seq.is_some_and(|seq| seq < sub.next_seq) {
+        let mut send = Vec::new();
+        let mut overflowed = Vec::new();
+        for (sub_id, sub) in &mut self.subs {
+            if !sub.filters.iter().any(|f| f.matches(&view)) {
                 continue;
             }
-            if sub.filters.iter().any(|f| f.matches(&view)) {
-                self.send_event(sub_id, &ev.json).await?;
+            match &mut sub.pending {
+                Some(pending) if pending.len() >= MAX_PENDING => overflowed.push(sub_id.clone()),
+                Some(pending) => pending.push(ev.clone()),
+                // Already covered by the subscription's initial query.
+                None if ev.seq.is_some_and(|seq| seq < sub.floor) => {}
+                None => send.push(sub_id.clone()),
             }
+        }
+        for sub_id in send {
+            self.send_event(&sub_id, &ev.json).await?;
+        }
+        for sub_id in overflowed {
+            self.subs.remove(&sub_id);
+            let msg = "error: too many new events arrived while the query ran; ask again";
+            self.closed(&sub_id, msg).await?;
         }
         Ok(())
     }

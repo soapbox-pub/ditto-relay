@@ -78,6 +78,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::analysis::Sentiment;
 use crate::event::{Event, KindClass, decode_hex};
@@ -1328,6 +1329,7 @@ pub fn run<'t>(
     txn: &'t Txn,
     filter: &Filter,
     limit: usize,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<Vec<(u64, EventView<'t>)>> {
     let search = filter.search.as_ref().expect("a ranked search");
     let mode = mode(store, filter, search.sort);
@@ -1343,7 +1345,7 @@ pub fn run<'t>(
     };
     let narrow = filter.ids.is_some() || filter.authors.is_some() || !filter.tags.is_empty();
     let mut found = if narrow {
-        let mut found = crate::query::run_filter(store, txn, &plain, MAX_EXAMINED)?;
+        let mut found = crate::query::run_filter(store, txn, &plain, MAX_EXAMINED, cancel)?;
         sort(store, txn, filter, search.sort, &mut found)?;
         found
     } else {
@@ -1356,7 +1358,7 @@ pub fn run<'t>(
         };
         if found.len() < limit {
             let seen: HashSet<u64> = found.iter().map(|(seq, _)| *seq).collect();
-            let newest = crate::query::run_filter(store, txn, &plain, limit + seen.len())?;
+            let newest = crate::query::run_filter(store, txn, &plain, limit + seen.len(), cancel)?;
             found.extend(newest.into_iter().filter(|(seq, _)| !seen.contains(seq)));
         }
         found
@@ -1640,7 +1642,7 @@ mod tests {
 
     fn ids(store: &Store, filter: Value) -> Vec<String> {
         let filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
-        crate::query::run(store, None, None, &[filter], 100, 500)
+        crate::query::run(store, None, None, &[filter], 100, 500, &Default::default())
             .unwrap()
             .events
             .iter()

@@ -298,6 +298,45 @@ async fn sends_each_event_once() {
 }
 
 #[tokio::test]
+async fn answers_every_req_sent_at_once() {
+    let relay = Relay::start().await;
+    let mut client = relay.connect().await;
+    let notes: Vec<Event> = (1..=10).map(|seed| note(seed, "n")).collect();
+    for ev in &notes {
+        client.publish(ev).await;
+    }
+    for (i, ev) in notes.iter().enumerate() {
+        let sub = format!("s{i}");
+        client
+            .send(json!(["REQ", sub, {"authors": [ev.pubkey]}]))
+            .await;
+    }
+    client.send(json!(["COUNT", "c", {"kinds": [1]}])).await;
+
+    let mut found = std::collections::HashMap::new();
+    let mut ended = 0;
+    let mut counted = false;
+    while ended < notes.len() || !counted {
+        let msg = client.next().await;
+        match msg[0].as_str().unwrap() {
+            "EVENT" => {
+                let sub = msg[1].as_str().unwrap().to_string();
+                assert!(found.insert(sub, msg[2]["id"].clone()).is_none());
+            }
+            "EOSE" => ended += 1,
+            "COUNT" => {
+                assert_eq!(msg[2]["count"], notes.len());
+                counted = true;
+            }
+            _ => panic!("unexpected message {msg}"),
+        }
+    }
+    for (i, ev) in notes.iter().enumerate() {
+        assert_eq!(found[&format!("s{i}")], ev.id.as_str());
+    }
+}
+
+#[tokio::test]
 async fn sends_what_the_relay_publishes_itself() {
     let relay = Relay::start().await;
     let mut reader = relay.connect().await;

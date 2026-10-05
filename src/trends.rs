@@ -160,7 +160,7 @@ pub fn posts(store: &Store, txn: &Txn) -> anyhow::Result<Vec<Row>> {
     let filter = Filter::parse(&filter, &store.indexed_tags, POSTS).map_err(anyhow::Error::msg)?;
     let mut rows = Vec::new();
     // Too few ranked are made up with the newest, which aren't trending.
-    for (_, view) in rank::run(store, txn, &filter, POSTS)? {
+    for (_, view) in rank::run(store, txn, &filter, POSTS, &Default::default())? {
         let id = view.id();
         let weight = rank::score(store, txn, id)?;
         if weight <= 0.0 {
@@ -428,7 +428,8 @@ mod tests {
     /// The events a filter finds.
     fn query(store: &Store, filter: Value) -> Vec<Event> {
         let filter = Filter::parse(&filter, &store.indexed_tags, MAX_VALUES).unwrap();
-        let results = crate::query::run(store, None, None, &[filter], 100, 500).unwrap();
+        let results =
+            crate::query::run(store, None, None, &[filter], 100, 500, &Default::default()).unwrap();
         results
             .events
             .iter()

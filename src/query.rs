@@ -27,10 +27,16 @@
 //! counts of the keys; otherwise the stamps between the bounds are walked,
 //! a page at a time. Only filters no index pins down load events, and only
 //! so many; past that, the relay declines.
+//!
+//! A query stops as soon as nobody wants its results — its subscription
+//! closed or replaced, or its client gone — rather than running on to its
+//! limits: scans and walks look every so often whether it's been
+//! cancelled.
 
 use std::collections::{BinaryHeap, HashSet};
 
 use secp256k1::Keypair;
+use tokio_util::sync::CancellationToken;
 
 use crate::event::KindClass;
 use crate::filter::Filter;
@@ -57,6 +63,22 @@ pub const MAX_EXAMINED: usize = 100_000;
 /// The most stamps a count may walk.
 const MAX_WALKED: usize = 2_000_000;
 
+/// How many records a scan examines, or stamps a walk goes through,
+/// between looks at whether its query's been cancelled.
+const CANCEL_CHECK: usize = 256;
+
+/// A query stopped because nobody wants its results any more.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
 /// The most extra events read past the limit to order a tie at the boundary.
 const MAX_TIES: usize = 1000;
 
@@ -71,7 +93,8 @@ pub struct Results {
 /// Run a REQ's filters. Each one's limit defaults to `default_limit` and is
 /// capped at `max_limit`. Search filters find nothing without `search`.
 /// With the relay's `keypair`, the [NIP-85](crate::nip85) assertions they
-/// ask it for are made and follow what's stored.
+/// ask it for are made and follow what's stored. Fails with [`Cancelled`]
+/// once `cancel` is.
 pub fn run(
     store: &Store,
     search: Option<&SearchIndex>,
@@ -79,6 +102,7 @@ pub fn run(
     filters: &[Filter],
     default_limit: u64,
     max_limit: u64,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<Results> {
     let txn = store.read()?;
     let next_seq = store.next_seq(&txn)?;
@@ -88,6 +112,9 @@ pub fn run(
     let now = crate::event::now();
     let mut events = Vec::new();
     for filter in filters {
+        if cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
         let limit = filter.limit.unwrap_or(default_limit).min(max_limit) as usize;
         if filter.never || limit == 0 {
             continue;
@@ -98,9 +125,9 @@ pub fn run(
                 None => Vec::new(),
             },
             (Some(query), _) if query.sort.is_ranked() => {
-                crate::rank::run(store, &txn, filter, limit)?
+                crate::rank::run(store, &txn, filter, limit, cancel)?
             }
-            _ => run_filter(store, &txn, filter, limit)?,
+            _ => run_filter(store, &txn, filter, limit, cancel)?,
         };
         let left = limit - found.len().min(limit);
         for (seq, view) in found {
@@ -116,14 +143,20 @@ pub fn run(
             }
         }
     }
+    if cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
     Ok(Results { next_seq, events })
 }
 
+/// A filter's newest matches, up to `limit` (and any tied with the last).
+/// Stops early, with what it's found so far, once `cancel` is cancelled.
 pub fn run_filter<'t>(
     store: &Store,
     txn: &'t Txn,
     filter: &Filter,
     limit: usize,
+    cancel: &CancellationToken,
 ) -> Result<Vec<(u64, EventView<'t>)>> {
     let mut found = Vec::new();
 
@@ -138,7 +171,7 @@ pub fn run_filter<'t>(
         }
     } else {
         let plan = plan(store, txn, filter)?;
-        scan(store, txn, filter, &plan, limit, &mut found)?;
+        scan(store, txn, filter, &plan, limit, cancel, &mut found)?;
     }
 
     // Newest first; on a tie, the lowest id first (NIP-01).
@@ -397,6 +430,7 @@ fn scan<'t>(
     filter: &Filter,
     plan: &Plan,
     limit: usize,
+    cancel: &CancellationToken,
     found: &mut Vec<(u64, EventView<'t>)>,
 ) -> Result<()> {
     let mut sources = Vec::new();
@@ -440,6 +474,9 @@ fn scan<'t>(
             METRICS.filters_cut_short.inc();
             break;
         }
+        if examined % CANCEL_CHECK == 0 && cancel.is_cancelled() {
+            break;
+        }
 
         let seq = stamp_seq(&stamp);
         let Some(view) = store.load(txn, seq)? else {
@@ -476,18 +513,33 @@ impl std::fmt::Display for TooExpensive {
 impl std::error::Error for TooExpensive {}
 
 /// Count the events matching any of a COUNT's filters. Fails with
-/// [`TooExpensive`] when that's too much work.
+/// [`TooExpensive`] when that's too much work, and with [`Cancelled`] once
+/// `cancel` is.
 pub fn count(
     store: &Store,
     search: Option<&SearchIndex>,
     filters: &[Filter],
+    cancel: &CancellationToken,
+) -> anyhow::Result<Count> {
+    let count = count_unless_cancelled(store, search, filters, cancel)?;
+    match cancel.is_cancelled() {
+        true => Err(Cancelled.into()),
+        false => Ok(count),
+    }
+}
+
+fn count_unless_cancelled(
+    store: &Store,
+    search: Option<&SearchIndex>,
+    filters: &[Filter],
+    cancel: &CancellationToken,
 ) -> anyhow::Result<Count> {
     let txn = store.read()?;
     let [filter] = filters else {
         // Events matching two filters count once.
         let mut seqs = HashSet::new();
         for filter in filters.iter().filter(|f| !f.never) {
-            collect(store, &txn, search, filter, &mut seqs)?;
+            collect(store, &txn, search, filter, cancel, &mut seqs)?;
         }
         return Ok(Count {
             count: seqs.len() as u64,
@@ -512,7 +564,7 @@ pub fn count(
     };
     let Some(plan) = plan.filter(|plan| plan.exact) else {
         let mut seqs = HashSet::new();
-        collect(store, &txn, search, filter, &mut seqs)?;
+        collect(store, &txn, search, filter, cancel, &mut seqs)?;
         let hll = match &filter.first_tag {
             Some(value) => Some(sketch(store, &txn, value, &seqs)?),
             None => None,
@@ -536,11 +588,11 @@ pub fn count(
         total
     } else if plan.disjoint {
         let mut total = 0;
-        walk(&txn, filter, &plan, |_| total += 1)?;
+        walk(&txn, filter, &plan, cancel, |_| total += 1)?;
         total
     } else {
         let mut seqs = HashSet::new();
-        walk(&txn, filter, &plan, |seq| {
+        walk(&txn, filter, &plan, cancel, |seq| {
             seqs.insert(seq);
         })?;
         seqs.len() as u64
@@ -558,7 +610,7 @@ pub fn count(
         }
         Some(value) if count as usize <= MAX_EXAMINED => {
             let mut seqs = HashSet::new();
-            walk(&txn, filter, &plan, |seq| {
+            walk(&txn, filter, &plan, cancel, |seq| {
                 seqs.insert(seq);
             })?;
             Some(sketch(store, &txn, value, &seqs)?)
@@ -570,8 +622,14 @@ pub fn count(
 
 /// Call `f` with the sequence number of each stamp of a plan's keys within
 /// the filter's time bounds, of the kinds it wants, walking up to
-/// [`MAX_WALKED`] of them.
-fn walk(txn: &Txn, filter: &Filter, plan: &Plan, mut f: impl FnMut(u64)) -> anyhow::Result<()> {
+/// [`MAX_WALKED`] of them, until `cancel` is cancelled.
+fn walk(
+    txn: &Txn,
+    filter: &Filter,
+    plan: &Plan,
+    cancel: &CancellationToken,
+    mut f: impl FnMut(u64),
+) -> anyhow::Result<()> {
     let mut walked = 0;
     for key in &plan.keys {
         each_stamp(txn, plan.db, key, filter.since, filter.until, |entry| {
@@ -579,10 +637,13 @@ fn walk(txn: &Txn, filter: &Filter, plan: &Plan, mut f: impl FnMut(u64)) -> anyh
             if plan.wants(entry) {
                 f(stamp_seq(entry));
             }
-            walked <= MAX_WALKED
+            walked <= MAX_WALKED && (walked % CANCEL_CHECK != 0 || !cancel.is_cancelled())
         })?;
         if walked > MAX_WALKED {
             return Err(TooExpensive.into());
+        }
+        if cancel.is_cancelled() {
+            return Err(Cancelled.into());
         }
     }
     Ok(())
@@ -594,6 +655,7 @@ fn collect(
     txn: &Txn,
     search: Option<&SearchIndex>,
     filter: &Filter,
+    cancel: &CancellationToken,
     out: &mut HashSet<u64>,
 ) -> anyhow::Result<()> {
     if let Some(ids) = &filter.ids {
@@ -615,12 +677,12 @@ fn collect(
     }
     let plan = plan(store, txn, filter)?;
     if plan.exact {
-        return walk(txn, filter, &plan, |seq| {
+        return walk(txn, filter, &plan, cancel, |seq| {
             out.insert(seq);
         });
     }
     let mut seqs = Vec::new();
-    walk(txn, filter, &plan, |seq| {
+    walk(txn, filter, &plan, cancel, |seq| {
         if !out.contains(&seq) {
             seqs.push(seq);
         }
@@ -674,7 +736,16 @@ mod tests {
     }
 
     fn found(store: &Store, filters: &[Filter], max_limit: u64) -> Vec<String> {
-        let results = run(store, None, None, filters, max_limit, max_limit).unwrap();
+        let results = run(
+            store,
+            None,
+            None,
+            filters,
+            max_limit,
+            max_limit,
+            &Default::default(),
+        )
+        .unwrap();
         results
             .events
             .iter()
@@ -911,7 +982,13 @@ mod tests {
 
             // Counted, with every match's author sketched.
             let parsed = parse(&filter);
-            let counted = count(&store, None, std::slice::from_ref(&parsed)).unwrap();
+            let counted = count(
+                &store,
+                None,
+                std::slice::from_ref(&parsed),
+                &Default::default(),
+            )
+            .unwrap();
             let hll = parsed.first_tag.as_ref().map(|value| {
                 let mut registers = [0; hll::REGISTERS];
                 for event in &expected {
@@ -934,7 +1011,7 @@ mod tests {
                 .map(|e| e.id.as_str())
                 .collect();
             let filters = [parsed.clone(), parse(&other)];
-            let counted = count(&store, None, &filters).unwrap();
+            let counted = count(&store, None, &filters, &Default::default()).unwrap();
             assert_eq!(counted.count, union.len() as u64, "{filter} {other}");
 
             expected.sort_by(|a, b| {
@@ -982,6 +1059,7 @@ mod tests {
             store,
             None,
             &[Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap()],
+            &Default::default(),
         )
         .unwrap()
     }
@@ -1110,6 +1188,26 @@ mod tests {
         let by_id = json!({"ids": [p100]});
         assert_eq!(ids(&store, std::slice::from_ref(&by_id), 100), [p100]);
         assert_eq!(count_of(&store, by_id).count, 1);
+    }
+
+    #[test]
+    fn stops_when_cancelled() {
+        let (_dir, store) = open();
+        for i in 0..1000 {
+            put(&store, &signed(1, 100 + i, 1, vec![], ""));
+        }
+        let filter = Filter::parse(&json!({"kinds": [1]}), &test_tags(), MAX_VALUES).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let filters = std::slice::from_ref(&filter);
+        let ran = run(&store, None, None, filters, 500, 500, &cancel);
+        assert!(ran.err().unwrap().is::<Cancelled>());
+        let counted = count(&store, None, filters, &cancel);
+        assert!(counted.err().unwrap().is::<Cancelled>());
+        // Stopped scanning a page in.
+        let txn = store.read().unwrap();
+        let found = run_filter(&store, &txn, &filter, 500, &cancel).unwrap();
+        assert_eq!(found.len(), CANCEL_CHECK - 1);
     }
 
     #[test]

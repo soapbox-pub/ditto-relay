@@ -844,12 +844,20 @@ mod tests {
             let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             assert!(filter.search.is_some());
             self.index.restrict(&mut filter);
-            crate::query::run(&self.store, Some(&self.index), None, &[filter], 100, 500)
-                .unwrap()
-                .events
-                .iter()
-                .map(|json| serde_json::from_str::<Event>(json).unwrap().id)
-                .collect()
+            crate::query::run(
+                &self.store,
+                Some(&self.index),
+                None,
+                &[filter],
+                100,
+                500,
+                &Default::default(),
+            )
+            .unwrap()
+            .events
+            .iter()
+            .map(|json| serde_json::from_str::<Event>(json).unwrap().id)
+            .collect()
         }
     }
 
@@ -1012,7 +1020,7 @@ mod tests {
         let count = |filter: serde_json::Value| {
             let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             f.index.restrict(&mut filter);
-            crate::query::count(&f.store, Some(&f.index), &[filter])
+            crate::query::count(&f.store, Some(&f.index), &[filter], &Default::default())
                 .unwrap()
                 .count
         };
