@@ -1313,6 +1313,39 @@ fn sweep(store: &Store) -> Result<Vec<u64>> {
     }
 }
 
+/// Store a batch of jobs in one transaction and answer each. One event's
+/// failure fails the transaction, and with it every other event in it, so
+/// a batch that fails is tried again an event at a time: only the event
+/// that can't be stored is refused.
+fn write(store: &Store, batch: Vec<WriteJob>, tell: &impl Fn(Vec<u64>, bool)) {
+    let now = crate::event::now();
+    let records = batch.iter().map(|(record, _)| record.as_slice());
+    let err = match store.write_batch(records, now) {
+        Ok(Batch { outcomes, removed }) => {
+            let stored = outcomes.iter().any(|o| matches!(o, Outcome::Stored(_)));
+            tell(removed, stored);
+            for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
+                let _ = reply.send(Ok(outcome));
+            }
+            return;
+        }
+        Err(err) => err,
+    };
+    if batch.len() == 1 {
+        tracing::error!("write failed: {err}");
+        let (_, reply) = batch.into_iter().next().expect("one job");
+        let _ = reply.send(Err(anyhow!("{err}")));
+        return;
+    }
+    tracing::warn!(
+        "a batch of {} events failed, storing them one at a time: {err}",
+        batch.len()
+    );
+    for job in batch {
+        write(store, vec![job], tell);
+    }
+}
+
 /// The most expired events removed in one write transaction.
 const MAX_SWEEP: usize = 10_000;
 
@@ -1398,22 +1431,7 @@ impl Writer {
                         }
                     }
 
-                    let records = batch.iter().map(|(record, _)| record.as_slice());
-                    match store.write_batch(records, crate::event::now()) {
-                        Ok(Batch { outcomes, removed }) => {
-                            let stored = outcomes.iter().any(|o| matches!(o, Outcome::Stored(_)));
-                            tell(removed, stored);
-                            for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
-                                let _ = reply.send(Ok(outcome));
-                            }
-                        }
-                        Err(err) => {
-                            tracing::error!("write batch failed: {err}");
-                            for (_, reply) in batch {
-                                let _ = reply.send(Err(anyhow!("{err}")));
-                            }
-                        }
-                    }
+                    write(&store, batch, &tell);
                     // A follow list in the batch may have moved trust; a
                     // turn between batches keeps it from falling behind.
                     turn(&mut trust);
@@ -1456,6 +1474,35 @@ pub mod tests {
     use crate::event::Event;
     use crate::event::tests::signed;
     use crate::record;
+
+    /// An event that can't be stored is refused alone, not with the rest
+    /// of its batch.
+    #[test]
+    fn one_failure_fails_only_its_own_event() {
+        // Room for small events, not for a big one.
+        let (_dir, store) = open_with(1 << 21, History::new(true, vec![], 20));
+        let events = [
+            signed(1, 100, 1, vec![], "small"),
+            signed(1, 100, 1, vec![], &"x".repeat(4 << 20)),
+            signed(1, 100, 1, vec![], "also small"),
+        ];
+        let (jobs, replies): (Vec<_>, Vec<_>) = events
+            .iter()
+            .map(|event| {
+                let (reply, rx) = oneshot::channel();
+                ((Arc::new(record::encode(event)), reply), rx)
+            })
+            .unzip();
+        write(&store, jobs, &|_, _| {});
+        let outcomes: Vec<_> = replies
+            .into_iter()
+            .map(|mut rx| rx.try_recv().unwrap().ok())
+            .collect();
+        assert!(matches!(outcomes[0], Some(Outcome::Stored(_))));
+        assert!(outcomes[1].is_none());
+        assert!(matches!(outcomes[2], Some(Outcome::Stored(_))));
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), 2);
+    }
 
     /// What tests index: single letters and `title`.
     pub fn test_tags() -> IndexedTags {
