@@ -27,6 +27,8 @@
 
 use std::collections::{BinaryHeap, HashSet};
 
+use secp256k1::Keypair;
+
 use crate::event::KindClass;
 use crate::filter::Filter;
 use crate::hll::{self, Registers};
@@ -63,9 +65,12 @@ pub struct Results {
 
 /// Run a REQ's filters. Each one's limit defaults to `default_limit` and is
 /// capped at `max_limit`. Search filters find nothing without `search`.
+/// With the relay's `keypair`, the [NIP-85](crate::nip85) assertions they
+/// ask it for are made and follow what's stored.
 pub fn run(
     store: &Store,
     search: Option<&SearchIndex>,
+    keypair: Option<&Keypair>,
     filters: &[Filter],
     default_limit: u64,
     max_limit: u64,
@@ -73,6 +78,9 @@ pub fn run(
     let txn = store.read()?;
     let next_seq = store.next_seq(&txn)?;
     let mut seen = HashSet::new();
+    // Asked twice, an assertion is the same event.
+    let mut asserted = HashSet::new();
+    let now = crate::event::now();
     let mut events = Vec::new();
     for filter in filters {
         let limit = filter.limit.unwrap_or(default_limit).min(max_limit) as usize;
@@ -89,9 +97,17 @@ pub fn run(
             }
             _ => run_filter(store, &txn, filter, limit)?,
         };
+        let left = limit - found.len().min(limit);
         for (seq, view) in found {
             if seen.insert(seq) {
                 events.push(view.to_json());
+            }
+        }
+        if let Some(keypair) = keypair {
+            for (id, json) in crate::nip85::run(store, &txn, keypair, filter, left, now)? {
+                if asserted.insert(id) {
+                    events.push(json);
+                }
             }
         }
     }
@@ -604,7 +620,7 @@ mod tests {
     }
 
     fn found(store: &Store, filters: &[Filter], max_limit: u64) -> Vec<String> {
-        let results = run(store, None, filters, max_limit, max_limit).unwrap();
+        let results = run(store, None, None, filters, max_limit, max_limit).unwrap();
         results
             .events
             .iter()

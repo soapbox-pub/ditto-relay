@@ -850,7 +850,7 @@ mod tests {
             let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             assert!(filter.search.is_some());
             self.index.restrict(&mut filter);
-            crate::query::run(&self.store, Some(&self.index), &[filter], 100, 500)
+            crate::query::run(&self.store, Some(&self.index), None, &[filter], 100, 500)
                 .unwrap()
                 .events
                 .iter()

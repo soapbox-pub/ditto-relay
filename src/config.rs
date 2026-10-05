@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::Context;
+use secp256k1::Keypair;
 
 use crate::event::decode_hex;
 use crate::facets;
@@ -27,6 +28,9 @@ pub struct Config {
     pub pubkey: Option<String>,
     /// How to reach the operator, for NIP-11.
     pub contact: Option<String>,
+    /// The relay's own key, which signs the NIP-85 assertions it serves.
+    /// None turns them off.
+    pub keypair: Option<Keypair>,
     pub max_message_size: usize,
     pub max_subscriptions: usize,
     pub max_filters: usize,
@@ -131,6 +135,14 @@ impl Config {
             real_ip_header: optional("RELAY_REAL_IP_HEADER"),
             pubkey,
             contact: optional("RELAY_CONTACT"),
+            keypair: match optional("RELAY_SECRET_KEY") {
+                Some(key) => Some(
+                    decode_hex(&key)
+                        .and_then(|key| Keypair::from_secret_bytes(key).ok())
+                        .context("RELAY_SECRET_KEY must be a secret key in 64 lowercase hex")?,
+                ),
+                None => None,
+            },
             max_message_size: env("RELAY_MAX_MESSAGE_SIZE", 4_000_000)?,
             max_subscriptions: env("RELAY_MAX_SUBSCRIPTIONS", 20)?,
             max_filters: env("RELAY_MAX_FILTERS", 100)?,

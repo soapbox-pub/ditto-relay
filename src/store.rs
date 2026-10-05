@@ -27,6 +27,7 @@
 //! | `ranked`        | mode ‖ kind                  | rank ‖ seq (48 bits)   |
 //! | `applied`       | pubkey                       | weight applied         |
 //! | `rank_queue`    | pubkey                       | nothing                |
+//! | `zaps`          | zapped id ([`rank::zapped`]) | count ‖ msats          |
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `history`       | address                      | stamps                 |
 //! | `expiring`      | `EXPIRING`                   | expiry stamps          |
@@ -309,6 +310,7 @@ pub struct Tables {
     pub ranked: Db,
     pub applied: Db,
     pub rank_queue: Db,
+    pub zaps: Db,
     pub replaceable: Db,
     pub history: Db,
     pub expiring: Db,
@@ -355,6 +357,7 @@ impl Store {
             ranked: env.create_db("ranked", DbFlags::DUP_FIXED)?,
             applied: env.create_db("applied", DbFlags::PLAIN)?,
             rank_queue: env.create_db("rank_queue", DbFlags::PLAIN)?,
+            zaps: env.create_db("zaps", DbFlags::PLAIN)?,
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
             history: env.create_db("history", DbFlags::DUP_FIXED)?,
             expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,

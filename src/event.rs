@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use secp256k1::XOnlyPublicKey;
 use secp256k1::schnorr::Signature;
+use secp256k1::{Keypair, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -80,6 +80,34 @@ impl Event {
         ))
         .expect("event serialization cannot fail");
         Sha256::digest(&serialized).into()
+    }
+
+    /// An event signed by `keypair`.
+    pub fn sign(
+        keypair: &Keypair,
+        created_at: u64,
+        kind: u16,
+        tags: Vec<Vec<String>>,
+        content: String,
+    ) -> Event {
+        let mut ev = Event {
+            id: String::new(),
+            pubkey: hex::encode(keypair.x_only_public_key().0.to_byte_array()),
+            created_at,
+            kind,
+            tags,
+            content,
+            sig: String::new(),
+        };
+        let id = ev.compute_id();
+        let mut aux = [0; 32];
+        let sig = match getrandom::fill(&mut aux) {
+            Ok(()) => secp256k1::schnorr::sign_with_aux_rand(&id, keypair, &aux),
+            Err(_) => keypair.sign_schnorr_no_aux_rand(&id),
+        };
+        ev.id = hex::encode(id);
+        ev.sig = hex::encode(sig.to_byte_array());
+        ev
     }
 
     /// Check the id and signature. The returned error is suitable for an `OK` message.
@@ -162,19 +190,7 @@ pub mod tests {
         content: &str,
     ) -> Event {
         let keypair = Keypair::from_secret_bytes(secret).unwrap();
-        let mut ev = Event {
-            id: String::new(),
-            pubkey: hex::encode(keypair.x_only_public_key().0.to_byte_array()),
-            created_at,
-            kind,
-            tags,
-            content: content.into(),
-            sig: String::new(),
-        };
-        let id = ev.compute_id();
-        ev.id = hex::encode(id);
-        ev.sig = hex::encode(keypair.sign_schnorr_no_aux_rand(&id).to_byte_array());
-        ev
+        Event::sign(&keypair, created_at, kind, tags, content.into())
     }
 
     /// A typical feed of `n` events from 500 people: notes, replies, and

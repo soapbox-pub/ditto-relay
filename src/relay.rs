@@ -182,6 +182,10 @@ fn nip11(config: &Config) -> Value {
     if let Some(contact) = &config.contact {
         info["contact"] = contact.as_str().into();
     }
+    // The key its NIP-85 assertions are signed with.
+    if let Some(keypair) = &config.keypair {
+        info["self"] = hex::encode(keypair.x_only_public_key().0.to_byte_array()).into();
+    }
     info
 }
 
@@ -504,6 +508,7 @@ impl Connection {
             query::run(
                 &store,
                 search.as_deref(),
+                config.keypair.as_ref(),
                 &query_filters,
                 config.default_limit,
                 config.max_limit,

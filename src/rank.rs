@@ -26,6 +26,9 @@
 //! like an event's score under an id of their own ([`recipient`]), so that
 //! profiles can be ranked by it. A zap to several splits evenly among them.
 //!
+//! Apart from all that, `zaps` tallies every zap to an event or an address
+//! at face value, whoever sent it, for [NIP-85](crate::nip85) assertions.
+//!
 //! `engagement` keeps each pair of engager and target, with [`Counts`] of
 //! how the engager's events engage the target, so the pair counts until the
 //! last of them goes. It's keyed engager first, so everything someone has
@@ -290,6 +293,64 @@ pub fn recipient(pubkey: &[u8; 32]) -> [u8; 32] {
         .into()
 }
 
+/// What's zapped to an event, or to an address, is tallied in `zaps` under.
+pub enum Zapped<'a> {
+    Event(&'a [u8; 32]),
+    Address(&'a str),
+}
+
+impl Zapped<'_> {
+    fn key(&self) -> [u8; 32] {
+        match self {
+            Zapped::Event(id) => **id,
+            Zapped::Address(address) => Sha256::new()
+                .chain_update(b"zaps of address ")
+                .chain_update(address.as_bytes())
+                .finalize()
+                .into(),
+        }
+    }
+}
+
+/// How many zaps something has had, and their msats, whoever sent them.
+pub fn zaps(store: &Store, txn: &Txn, zapped: Zapped) -> Result<(u64, u128)> {
+    zaps_under(store, txn, &zapped.key())
+}
+
+fn zaps_under(store: &Store, txn: &Txn, key: &[u8; 32]) -> Result<(u64, u128)> {
+    Ok(txn
+        .get(store.tables.zaps, key)?
+        .and_then(|v| <&[u8; 24]>::try_from(v).ok())
+        .map(|v| {
+            let count = u64::from_le_bytes(v[..8].try_into().unwrap());
+            (count, u128::from_le_bytes(v[8..].try_into().unwrap()))
+        })
+        .unwrap_or_default())
+}
+
+/// Tally, or with `add` false take back, a zap in `zaps`.
+fn tally(store: &Store, txn: &mut RwTxn, zap: &Zap, add: bool) -> Result<()> {
+    let event = zap.event.as_ref().map(Zapped::Event);
+    let address = zap.address.as_deref().map(Zapped::Address);
+    for zapped in event.into_iter().chain(address) {
+        let key = zapped.key();
+        let (count, msats) = zaps_under(store, txn, &key)?;
+        let (count, msats) = match add {
+            true => (count + 1, msats.wrapping_add(zap.msats)),
+            false => (count.saturating_sub(1), msats.wrapping_sub(zap.msats)),
+        };
+        if count == 0 {
+            txn.del(store.tables.zaps, &key, None)?;
+        } else {
+            let mut value = [0; 24];
+            value[..8].copy_from_slice(&count.to_le_bytes());
+            value[8..].copy_from_slice(&msats.to_le_bytes());
+            txn.put(store.tables.zaps, &key, &value)?;
+        }
+    }
+    Ok(())
+}
+
 /// One engager's engagement with one target, by one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Engagement {
@@ -298,10 +359,16 @@ pub struct Engagement {
     pub counts: Counts,
 }
 
-/// How an event engages with others. See the [module docs].
+#[cfg(test)]
+fn engagements(view: &EventView) -> Vec<Engagement> {
+    engagements_with(view, zap(view).as_ref())
+}
+
+/// How an event engages with others, given its [`zap`]. See the [module
+/// docs].
 ///
 /// [module docs]: self
-pub fn engagements(view: &EventView) -> Vec<Engagement> {
+fn engagements_with(view: &EventView, zap: Option<&Zap>) -> Vec<Engagement> {
     if KindClass::of(view.kind()) != KindClass::Regular {
         return Vec::new();
     }
@@ -340,7 +407,7 @@ pub fn engagements(view: &EventView) -> Vec<Engagement> {
     if let Some((id, counts)) = direct {
         out.push(engagement(author, Target::Event(*id), counts));
     }
-    if let Some(zap) = zap(view) {
+    if let Some(zap) = zap {
         let counts = |msats| Counts {
             msats,
             ..Counts::default()
@@ -381,6 +448,8 @@ struct Zap {
     sender: [u8; 32],
     msats: u128,
     event: Option<[u8; 32]>,
+    /// The address of the addressable event zapped, as its `a` tag has it.
+    address: Option<String>,
     /// Sorted.
     recipients: Vec<[u8; 32]>,
 }
@@ -409,6 +478,7 @@ fn zap(view: &EventView) -> Option<Zap> {
                 sender: decode_hex(&request.pubkey)?,
                 msats,
                 event: request.tag("e").and_then(decode_hex),
+                address: request.tag("a").map(String::from),
                 recipients: request.tag("p").and_then(decode_hex).into_iter().collect(),
             }
         }
@@ -423,6 +493,10 @@ fn zap(view: &EventView) -> Option<Zap> {
                 sender: *view.pubkey(),
                 msats: sats.parse::<u128>().ok()?.checked_mul(1000)?,
                 event: id_tag(view, "e", false).copied(),
+                address: match view.tag("a") {
+                    Some(Element::Text(address)) => Some(address.to_string()),
+                    _ => None,
+                },
                 recipients: ids(view, "p").copied().collect(),
             }
         }
@@ -832,8 +906,12 @@ pub fn index(store: &Store, txn: &mut RwTxn, seq: u64, view: &EventView) -> Resu
         }
         set_score(store, txn, id, &old, &new)?;
     }
-    for engagement in engagements(view) {
+    let zap = zap(view);
+    for engagement in engagements_with(view, zap.as_ref()) {
         engage(store, txn, &engagement, true)?;
+    }
+    if let Some(zap) = &zap {
+        tally(store, txn, zap, true)?;
     }
     if view.kind() == 0 {
         let received = recipient(author);
@@ -871,8 +949,12 @@ pub fn unindex(store: &Store, txn: &mut RwTxn, seq: u64, view: &EventView) -> Re
             set_score(store, txn, id, &old, &new)?;
         }
     }
-    for engagement in engagements(view) {
+    let zap = zap(view);
+    for engagement in engagements_with(view, zap.as_ref()) {
         engage(store, txn, &engagement, false)?;
+    }
+    if let Some(zap) = &zap {
+        tally(store, txn, zap, false)?;
     }
     if view.kind() == 0 && store.wot().is_some() {
         let score = wot::score(store, txn, author)?;
@@ -1515,7 +1597,7 @@ mod tests {
 
     fn ids(store: &Store, filter: Value) -> Vec<String> {
         let filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
-        crate::query::run(store, None, &[filter], 100, 500)
+        crate::query::run(store, None, None, &[filter], 100, 500)
             .unwrap()
             .events
             .iter()

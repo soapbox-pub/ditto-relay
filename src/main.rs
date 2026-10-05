@@ -8,6 +8,7 @@ mod hll;
 mod landing;
 mod lmdb;
 mod metrics;
+mod nip85;
 mod plugin;
 mod query;
 mod rank;
