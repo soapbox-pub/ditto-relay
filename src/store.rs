@@ -15,7 +15,7 @@
 //! | `ids`           | id prefix (8 bytes)          | seqs (u64 BE)          |
 //! | `created`       | `CREATED`                    | stamps                 |
 //! | `kinds`         | kind (u16 BE)                | stamps                 |
-//! | `authors`       | pubkey                       | stamps                 |
+//! | `authors`       | pubkey                       | stamp ‖ kind           |
 //! | `author_kinds`  | pubkey ‖ kind                | stamps                 |
 //! | `tags`          | tag key (below)              | stamps                 |
 //! | `hll`           | tag key                      | HLL registers          |
@@ -36,7 +36,9 @@
 //! `ids` is keyed by a prefix of the id, a quarter its size; the record has
 //! the whole id, so a lookup checks there, and the rare prefix shared by two
 //! ids just means reading both records. `created` files every stamp under
-//! one key, packed like the other indexes.
+//! one key, packed like the other indexes. `authors` follows each stamp with
+//! the event's kind (u16 BE), so authors with more kinds than `author_kinds`
+//! can be asked for at once are still answered from the index alone.
 //!
 //! Tag values are indexed in [`record::tag_value`] form; an *address* is
 //! pubkey ‖ kind ‖ the `d` tag in that form (always empty for replaceable
@@ -157,6 +159,9 @@ const ID_PREFIX: usize = 8;
 /// The most events committed in one write transaction.
 const MAX_WRITE_BATCH: usize = 1000;
 
+/// The length of an `authors` entry: a stamp, then the event's kind.
+pub const KINDED_LEN: usize = STAMP_LEN + 2;
+
 pub fn stamp(created_at: u32, seq: u64) -> Stamp {
     let mut out = [0; STAMP_LEN];
     out[..4].copy_from_slice(&created_at.to_be_bytes());
@@ -172,6 +177,21 @@ pub fn stamp_seq(stamp: &[u8]) -> u64 {
     let mut seq = [0; 8];
     seq[2..].copy_from_slice(&stamp[4..STAMP_LEN]);
     u64::from_be_bytes(seq)
+}
+
+/// An `authors` entry.
+pub fn kinded(stamp: &Stamp, kind: u16) -> [u8; KINDED_LEN] {
+    let mut out = [0; KINDED_LEN];
+    out[..STAMP_LEN].copy_from_slice(stamp);
+    out[STAMP_LEN..].copy_from_slice(&kind.to_be_bytes());
+    out
+}
+
+/// The kind an index entry carries, if it's an `authors` entry.
+pub fn entry_kind(entry: &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        entry.get(STAMP_LEN..KINDED_LEN)?.try_into().ok()?,
+    ))
 }
 
 /// A key of the `tags` table, for a value in [`record::tag_value`] form no
@@ -625,6 +645,7 @@ impl Store {
         let seq = self.put_record(txn, &view, record)?;
         let stamp = stamp(created_at, seq);
         txn.put_dup(t.created, CREATED, &stamp)?;
+        txn.put_dup(t.authors, view.pubkey(), &kinded(&stamp, view.kind()))?;
         for (db, key) in self.index_keys(&view) {
             txn.put_dup(db, &key, &stamp)?;
         }
@@ -935,14 +956,13 @@ impl Store {
     }
 
     /// Every (index, key) an event's stamp is filed under, besides
-    /// `created`. Each at most once, since a stamp is only stored once per
-    /// key anyway.
+    /// `created` and `authors`. Each at most once, since a stamp is only
+    /// stored once per key anyway.
     fn index_keys(&self, view: &EventView) -> Vec<(Db, Vec<u8>)> {
         let t = self.tables;
         let kind = view.kind().to_be_bytes();
         let mut keys = vec![
             (t.kinds, kind.to_vec()),
-            (t.authors, view.pubkey().to_vec()),
             (t.author_kinds, [&view.pubkey()[..], &kind].concat()),
         ];
         keys.extend(
@@ -1067,6 +1087,7 @@ impl Store {
         let t = self.tables;
         let stamp = stamp(view.created_at(), seq);
         rank::unindex(self, txn, seq, view)?;
+        txn.del(t.authors, view.pubkey(), Some(&kinded(&stamp, view.kind())))?;
         for (db, key) in self.index_keys(view) {
             txn.del(db, &key, Some(&stamp))?;
         }
@@ -1093,8 +1114,9 @@ impl Store {
     }
 }
 
-/// Call `f` with each of `key`'s stamps from `since` to `until`, oldest
-/// first, until it returns false. Reads a page of them at a time.
+/// Call `f` with each of `key`'s entries from `since` to `until`, oldest
+/// first, until it returns false. Reads a page of them at a time. An entry
+/// is a stamp, and in `authors`, a kind after it.
 pub fn each_stamp(
     txn: &Txn,
     db: Db,
@@ -1108,16 +1130,19 @@ pub fn each_stamp(
     let Some((_, first)) = cursor.get_both_range(key, &low)? else {
         return Ok(());
     };
+    // Every entry of a table is as long.
+    let len = first.len();
     let mut page = cursor.get_multiple()?;
     if page.is_empty() {
         page = first;
     }
     loop {
-        for stamp in page.as_chunks::<STAMP_LEN>().0 {
-            if *stamp > high {
+        for entry in page.chunks_exact(len) {
+            let stamp = &entry[..STAMP_LEN];
+            if stamp > &high[..] {
                 return Ok(());
             }
-            if *stamp >= low && !f(stamp) {
+            if stamp >= &low[..] && !f(entry) {
                 return Ok(());
             }
         }

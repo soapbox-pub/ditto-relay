@@ -5,7 +5,10 @@
 //! since every index key's stamps are counted by LMDB for free, the planner
 //! simply adds up the counts of each candidate's keys and takes the
 //! smallest. If that index pins down every field the filter has, its
-//! entries need no further checking.
+//! entries need no further checking. `authors` entries carry their kind,
+//! so it pins down kinds too, skipping the others' entries without loading
+//! them: that's how authors with too many kinds for `author_kinds` are
+//! answered.
 //!
 //! A scan opens a cursor per key, each starting at `until` and walking back
 //! in time, and merges them newest first until `since` or the limit.
@@ -32,13 +35,13 @@ use secp256k1::Keypair;
 use crate::event::KindClass;
 use crate::filter::Filter;
 use crate::hll::{self, Registers};
-use crate::lmdb::{Cursor, Db, Result, Txn};
+use crate::lmdb::{Cursor, Db, Entry, Result, Txn};
 use crate::metrics::METRICS;
 use crate::record::EventView;
 use crate::search::SearchIndex;
 use crate::store::{
-    CREATED, MAX_SEQ, Stamp, Store, address, each_stamp, stamp, stamp_created_at, stamp_seq,
-    tag_key, tag_key_kind,
+    CREATED, MAX_SEQ, STAMP_LEN, Stamp, Store, address, each_stamp, entry_kind, stamp,
+    stamp_created_at, stamp_seq, tag_key, tag_key_kind,
 };
 
 /// The most author × kind keys a filter may be planned over together.
@@ -155,6 +158,22 @@ struct Plan {
     exact: bool,
     /// Whether no event is filed under two of the keys.
     disjoint: bool,
+    /// The kinds wanted, checked against the kind in each entry: for
+    /// `authors` with kinds.
+    kinds: Option<Vec<u16>>,
+}
+
+impl Plan {
+    fn wants(&self, entry: &[u8]) -> bool {
+        wants(self.kinds.as_deref(), entry)
+    }
+}
+
+fn wants(kinds: Option<&[u16]>, entry: &[u8]) -> bool {
+    match (kinds, entry_kind(entry)) {
+        (Some(kinds), Some(kind)) => kinds.binary_search(&kind).is_ok(),
+        _ => true,
+    }
 }
 
 /// The address an address-shaped filter asks for every version of: one
@@ -190,6 +209,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             keys: vec![address],
             exact,
             disjoint: true,
+            kinds: None,
         });
     }
     let mut candidates = Vec::new();
@@ -212,6 +232,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             keys,
             exact: no_tags,
             disjoint: true,
+            kinds: None,
         });
     }
     if let Some(authors) = &filter.authors {
@@ -219,8 +240,9 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
         candidates.push(Plan {
             db: t.authors,
             keys,
-            exact: filter.kinds.is_none() && no_tags,
+            exact: no_tags,
             disjoint: true,
+            kinds: filter.kinds.clone(),
         });
     }
     for (name, values) in &filter.tags {
@@ -246,6 +268,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             exact,
             // One value's keys are each for another kind.
             disjoint: values.len() == 1,
+            kinds: None,
         });
     }
     // A search's extensions, those that can be looked up. Each event has
@@ -270,6 +293,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             keys,
             exact: false,
             disjoint: true,
+            kinds: None,
         });
     }
     if let Some(kinds) = &filter.kinds {
@@ -279,6 +303,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             keys,
             exact: filter.authors.is_none() && no_tags,
             disjoint: true,
+            kinds: None,
         });
     }
 
@@ -297,6 +322,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             keys: vec![CREATED.to_vec()],
             exact: filter.search.is_none(),
             disjoint: true,
+            kinds: None,
         },
         |(_, plan)| plan,
     ))
@@ -317,15 +343,21 @@ fn cost(txn: &Txn, plan: &Plan, bound: usize) -> Result<usize> {
     Ok(total)
 }
 
-/// One key's stamps, newest first.
-struct Source<'t> {
+/// One key's stamps, newest first, of the kinds wanted.
+struct Source<'t, 'p> {
     cursor: Cursor<'t>,
+    kinds: Option<&'p [u16]>,
 }
 
-impl<'t> Source<'t> {
+impl<'t, 'p> Source<'t, 'p> {
     /// Position at the newest stamp no later than `until`.
-    fn start(txn: &'t Txn, db: Db, key: &[u8], until: u32) -> Result<Option<(Stamp, Source<'t>)>> {
-        let mut cursor = txn.cursor(db)?;
+    fn start(
+        txn: &'t Txn,
+        plan: &'p Plan,
+        key: &[u8],
+        until: u32,
+    ) -> Result<Option<(Stamp, Source<'t, 'p>)>> {
+        let mut cursor = txn.cursor(plan.db)?;
         let entry = match cursor.get_both_range(key, &stamp(until, MAX_SEQ))? {
             Some(_) => cursor.prev_dup()?,
             None => match cursor.set(key)? {
@@ -333,16 +365,28 @@ impl<'t> Source<'t> {
                 None => None,
             },
         };
-        Ok(stamp_of(entry).map(|stamp| (stamp, Source { cursor })))
+        let mut source = Source {
+            cursor,
+            kinds: plan.kinds.as_deref(),
+        };
+        Ok(source.wanted(entry)?.map(|stamp| (stamp, source)))
     }
 
     fn next(&mut self) -> Result<Option<Stamp>> {
-        Ok(stamp_of(self.cursor.prev_dup()?))
+        let entry = self.cursor.prev_dup()?;
+        self.wanted(entry)
     }
-}
 
-fn stamp_of(entry: Option<(&[u8], &[u8])>) -> Option<Stamp> {
-    entry?.1.try_into().ok()
+    /// The stamp of `entry`, or the newest before it, of a kind wanted.
+    fn wanted(&mut self, mut entry: Option<Entry<'t>>) -> Result<Option<Stamp>> {
+        while let Some((_, value)) = entry {
+            if wants(self.kinds, value) {
+                return Ok(value[..STAMP_LEN].try_into().ok());
+            }
+            entry = self.cursor.prev_dup()?;
+        }
+        Ok(None)
+    }
 }
 
 fn scan<'t>(
@@ -356,7 +400,7 @@ fn scan<'t>(
     let mut sources = Vec::new();
     let mut heap = BinaryHeap::new();
     for key in &plan.keys {
-        if let Some((stamp, source)) = Source::start(txn, plan.db, key, filter.until)? {
+        if let Some((stamp, source)) = Source::start(txn, plan, key, filter.until)? {
             heap.push((stamp, sources.len()));
             sources.push(source);
         }
@@ -403,7 +447,9 @@ fn scan<'t>(
             found.push((seq, view));
         }
     }
-    METRICS.events_examined.add(examined.min(MAX_EXAMINED) as u64);
+    METRICS
+        .events_examined
+        .add(examined.min(MAX_EXAMINED) as u64);
     Ok(())
 }
 
@@ -475,7 +521,8 @@ pub fn count(
         });
     };
 
-    let unbounded = filter.since == 0 && filter.until == u32::MAX;
+    // LMDB's counts are of every kind.
+    let unbounded = filter.since == 0 && filter.until == u32::MAX && plan.kinds.is_none();
     let count = if plan.disjoint && unbounded {
         let mut cursor = txn.cursor(plan.db)?;
         let mut total = 0;
@@ -520,13 +567,16 @@ pub fn count(
 }
 
 /// Call `f` with the sequence number of each stamp of a plan's keys within
-/// the filter's time bounds, up to [`MAX_WALKED`] of them.
+/// the filter's time bounds, of the kinds it wants, walking up to
+/// [`MAX_WALKED`] of them.
 fn walk(txn: &Txn, filter: &Filter, plan: &Plan, mut f: impl FnMut(u64)) -> anyhow::Result<()> {
     let mut walked = 0;
     for key in &plan.keys {
-        each_stamp(txn, plan.db, key, filter.since, filter.until, |stamp| {
+        each_stamp(txn, plan.db, key, filter.since, filter.until, |entry| {
             walked += 1;
-            f(stamp_seq(stamp));
+            if plan.wants(entry) {
+                f(stamp_seq(entry));
+            }
             walked <= MAX_WALKED
         })?;
         if walked > MAX_WALKED {
@@ -672,6 +722,12 @@ mod tests {
         let p = plan_for(json!({"authors": [alice], "kinds": [1]}));
         assert_eq!(p.keys[0].len(), 34);
         assert!(p.exact);
+        // Past what `author_kinds` takes, authors, with the kinds checked
+        // in the index: still exact.
+        let kinds: Vec<u16> = (1..=MAX_AUTHOR_KINDS as u16 + 1).collect();
+        let p = plan_for(json!({"authors": [alice], "kinds": kinds}));
+        assert_eq!(p.db, store.tables.authors);
+        assert!(p.exact && p.kinds.is_some());
         assert_eq!(plan_for(json!({"since": 5})).keys, [CREATED]);
         // A search is checked whatever the index.
         assert!(!plan_for(json!({"kinds": [1], "search": "-x"})).exact);
@@ -785,6 +841,10 @@ mod tests {
             if rng.random_bool(0.5) {
                 let kind = [1, 4, 7, 1111][rng.random_range(0..4)];
                 filter.insert("kinds".into(), json!([kind, 9]));
+            } else if rng.random_bool(0.2) {
+                // Too many for `author_kinds`, with authors.
+                let kinds: Vec<u16> = (0..700).filter(|k| k % 7 != 0).collect();
+                filter.insert("kinds".into(), json!(kinds));
             }
             if rng.random_bool(0.5) {
                 filter.insert("#t".into(), json!(topics[..rng.random_range(1..4)]));
@@ -876,6 +936,36 @@ mod tests {
             let expected: Vec<String> = expected.iter().take(limit).map(|e| e.id.clone()).collect();
             assert_eq!(found(&store, &[parsed], 500), expected, "{filter}");
         }
+    }
+
+    #[test]
+    fn checks_kinds_in_the_authors_index() {
+        let (_dir, store) = open();
+        for i in 0..10 {
+            put(
+                &store,
+                &signed(1, 100 + i, [1, 7][i as usize % 2], vec![], ""),
+            );
+        }
+        // Others' notes make `kinds` the dearer index.
+        for i in 0..20 {
+            put(&store, &signed(2, 100 + i, 1, vec![], ""));
+        }
+        let alice = signed(1, 0, 1, vec![], "").pubkey;
+        // Every kind but 7, too many for `author_kinds`.
+        let kinds: Vec<u16> = (1..=MAX_AUTHOR_KINDS as u16 + 2)
+            .filter(|&k| k != 7)
+            .collect();
+        let filter = json!({"authors": [alice], "kinds": kinds});
+        let parsed = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
+        let p = plan(&store, &store.read().unwrap(), &parsed).unwrap();
+        assert_eq!(p.db, store.tables.authors);
+
+        assert_eq!(ids(&store, std::slice::from_ref(&filter), 100).len(), 5);
+        assert_eq!(count_of(&store, filter.clone()).count, 5);
+        let since = json!({"authors": [alice], "kinds": kinds, "since": 105});
+        assert_eq!(ids(&store, std::slice::from_ref(&since), 100).len(), 2);
+        assert_eq!(count_of(&store, since).count, 2);
     }
 
     fn count_of(store: &Store, filter: Value) -> Count {
