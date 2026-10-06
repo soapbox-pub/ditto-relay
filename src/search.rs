@@ -55,7 +55,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
 use tantivy::columnar::Column;
-use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery, TermQuery, TermSetQuery};
+use tantivy::query::{
+    BooleanQuery, ConstScoreQuery, Occur, Query, RangeQuery, TermQuery, TermSetQuery,
+};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, Schema, TextFieldIndexing, TextOptions,
 };
@@ -105,6 +107,13 @@ const MAX_UNINDEXED: u64 = 10_000;
 /// The most hits one filter may examine, to fill its limit after the
 /// fields the index doesn't hold (tags) are checked.
 const MAX_HITS: usize = 10_000;
+
+/// The share of the index a search's kinds must make up to be checked hit
+/// by hit rather than looked up. Any filter a search's terms are looked up
+/// with makes the index score every document with them all, where terms
+/// alone have the best found by skipping most; one that rules out little
+/// isn't worth that.
+const CHECKED_KINDS: f64 = 0.5;
 
 thread_local! {
     static TOKENIZER: RefCell<TextAnalyzer> = RefCell::new(analyzer());
@@ -259,7 +268,7 @@ struct Fields {
 fn schema() -> Schema {
     let mut builder = Schema::builder();
     builder.add_u64_field("seq", INDEXED | FAST);
-    builder.add_u64_field("kind", INDEXED);
+    builder.add_u64_field("kind", INDEXED | FAST);
     builder.add_bytes_field("pubkey", INDEXED);
     builder.add_u64_field("created_at", FAST);
     let indexing = TextFieldIndexing::default()
@@ -305,7 +314,7 @@ impl SearchIndex {
                 .and_then(|payload| serde_json::from_str::<Payload>(&payload).ok());
             match payload {
                 // Further along than the LMDB means it's another LMDB's.
-                Some(p) if p.next_seq <= store_next_seq => {
+                Some(p) if p.next_seq <= store_next_seq && index.schema() == schema => {
                     opened = Some((index, p.next_seq));
                 }
                 _ => {
@@ -408,7 +417,9 @@ impl SearchIndex {
         Some(doc)
     }
 
-    fn query(&self, filter: &Filter, search: &Search) -> BooleanQuery {
+    /// The query for a search filter. With `kinds` false, kinds are left
+    /// for the caller to check.
+    fn query(&self, filter: &Filter, search: &Search, kinds: bool) -> BooleanQuery {
         let f = self.fields;
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = search
             .terms
@@ -446,15 +457,15 @@ impl SearchIndex {
             clauses.push((Occur::MustNot, query));
         }
         // Only indexed kinds are in the index, so asking for all is moot.
-        if let Some(kinds) = filter.kinds.as_ref().filter(|&kinds| *kinds != self.kinds) {
+        if let Some(kinds) = filter.kinds.as_ref().filter(|&k| kinds && *k != self.kinds) {
             let terms = kinds
                 .iter()
                 .map(|&k| Term::from_field_u64(f.kind, k.into()));
-            clauses.push((Occur::Must, Box::new(TermSetQuery::new(terms))));
+            clauses.push((Occur::Must, any_of(terms.collect())));
         }
         if let Some(authors) = &filter.authors {
             let terms = authors.iter().map(|a| Term::from_field_bytes(f.pubkey, a));
-            clauses.push((Occur::Must, Box::new(TermSetQuery::new(terms))));
+            clauses.push((Occur::Must, any_of(terms.collect())));
         }
         if filter.since > 0 || filter.until < u32::MAX {
             let bound = |t: u32| Bound::Included(Term::from_field_u64(f.created_at, t.into()));
@@ -491,8 +502,10 @@ impl SearchIndex {
             authors.extend(unindexed.iter().map(|(_, view)| *view.pubkey()));
         }
 
-        let query = self.query(filter, search);
+        let checked = self.checked_kinds(&searcher, filter)?;
+        let query = self.query(filter, search, checked.is_none());
         let mut columns: HashMap<u32, Column<u64>> = HashMap::new();
+        let mut kind_columns: HashMap<u32, Column<u64>> = HashMap::new();
         let mut hits = Vec::new();
         let mut offset = 0;
         let mut page = (limit * 2).max(32);
@@ -511,6 +524,12 @@ impl SearchIndex {
             };
             let count = page_hits.len();
             for (score, address) in page_hits {
+                if let Some(kinds) = &checked
+                    && !column_value(&searcher, &mut kind_columns, "kind", address)?
+                        .is_some_and(|kind| kinds.contains(&kind))
+                {
+                    continue;
+                }
                 let Some(seq) = seq_of(&searcher, &mut columns, address)? else {
                     continue;
                 };
@@ -563,6 +582,25 @@ impl SearchIndex {
 }
 
 impl SearchIndex {
+    /// The kinds a search's hits are to be checked against one by one,
+    /// rather than looked up with its terms: those of a filter that asks
+    /// for kinds making up most of the index.
+    fn checked_kinds(
+        &self,
+        searcher: &Searcher,
+        filter: &Filter,
+    ) -> anyhow::Result<Option<HashSet<u64>>> {
+        let Some(kinds) = filter.kinds.as_ref().filter(|&k| *k != self.kinds) else {
+            return Ok(None);
+        };
+        let mut docs = 0;
+        for &kind in kinds {
+            docs += searcher.doc_freq(&Term::from_field_u64(self.fields.kind, kind.into()))?;
+        }
+        let share = docs as f64 / searcher.num_docs().max(1) as f64;
+        Ok((share >= CHECKED_KINDS).then(|| kinds.iter().map(|&k| k.into()).collect()))
+    }
+
     /// Add the sequence numbers of every event a search filter matches to
     /// `out`. Fails with [`TooExpensive`] when that's too many to check.
     pub fn collect(
@@ -580,7 +618,7 @@ impl SearchIndex {
                 .into_iter()
                 .map(|(seq, _)| seq),
         );
-        let query = self.query(filter, search);
+        let query = self.query(filter, search, true);
         if searcher.search(&query, &Count)? > MAX_EXAMINED {
             return Err(TooExpensive.into());
         }
@@ -601,6 +639,32 @@ impl SearchIndex {
         }
         Ok(())
     }
+}
+
+/// The most terms [`any_of`] matches by their postings rather than a set.
+const MAX_TERM_UNION: usize = 16;
+
+/// Documents with any of `terms`, unscored. A few are matched by their
+/// postings, which a search's own terms, much rarer, skip through; a set
+/// query instead reads every posting of every term, millions of them for a
+/// common kind, into a bitset first. Many terms are cheaper as a set.
+fn any_of(mut terms: Vec<Term>) -> Box<dyn Query> {
+    if terms.len() > MAX_TERM_UNION {
+        return Box::new(TermSetQuery::new(terms));
+    }
+    let query: Box<dyn Query> = match terms.len() {
+        1 => Box::new(TermQuery::new(terms.remove(0), IndexRecordOption::Basic)),
+        _ => Box::new(BooleanQuery::new(
+            terms
+                .into_iter()
+                .map(|term| {
+                    let query = TermQuery::new(term, IndexRecordOption::Basic);
+                    (Occur::Should, Box::new(query) as Box<dyn Query>)
+                })
+                .collect(),
+        )),
+    };
+    Box::new(ConstScoreQuery::new(query, 0.0))
 }
 
 /// The current, unexpired events stored since the index was last committed
@@ -636,13 +700,24 @@ fn seq_of(
     columns: &mut HashMap<u32, Column<u64>>,
     address: DocAddress,
 ) -> anyhow::Result<Option<u64>> {
+    column_value(searcher, columns, "seq", address)
+}
+
+/// A hit's value of the fast field `field`, reading each segment's column
+/// once.
+fn column_value(
+    searcher: &Searcher,
+    columns: &mut HashMap<u32, Column<u64>>,
+    field: &str,
+    address: DocAddress,
+) -> anyhow::Result<Option<u64>> {
     let column = match columns.entry(address.segment_ord) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => e.insert(
             searcher
                 .segment_reader(address.segment_ord)
                 .fast_fields()
-                .u64("seq")?,
+                .u64(field)?,
         ),
     };
     Ok(column.first(address.doc_id))
@@ -1368,8 +1443,14 @@ mod tests {
             if rng.random_bool(0.3) {
                 filter.insert("authors".into(), json!(pubkeys[..rng.random_range(1..3)]));
             }
-            if rng.random_bool(0.3) {
-                filter.insert("kinds".into(), json!([KINDS[rng.random_range(0..3)]]));
+            if rng.random_bool(0.4) {
+                // Most of the index, checked hit by hit, or a little,
+                // looked up.
+                let kinds = match rng.random_range(0..4) {
+                    3 => vec![1, 30023],
+                    n => vec![KINDS[n]],
+                };
+                filter.insert("kinds".into(), json!(kinds));
             }
             if rng.random_bool(0.3) {
                 filter.insert("#t".into(), json!(["x"]));
