@@ -301,6 +301,19 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
         "Work waiting in the background: authors to push trust from, engagers to rescore what they engaged with, and events to make searchable.",
         &backlog,
     );
+    let (keys, ready) = store.deletion_filter();
+    out.one(
+        "deletion_filter_keys",
+        "gauge",
+        "Keys added to the filter that spares deletion checks from LMDB. Past about 200 million, it spares fewer.",
+        keys as f64,
+    );
+    out.one(
+        "deletion_filter_ready",
+        "gauge",
+        "Whether the deletion filter has caught up since startup; until then every deletion check searches LMDB.",
+        f64::from(u8::from(ready)),
+    );
     out.one(
         "lmdb_used_bytes",
         "gauge",

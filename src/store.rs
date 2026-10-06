@@ -91,7 +91,7 @@
 //! events arrive; smaller ones are sketched when asked. Sketches can't
 //! forget, so one counts authors whose events have since gone too.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -101,6 +101,7 @@ use anyhow::{Context, anyhow, bail};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+use crate::deletions;
 use crate::event::KindClass;
 use crate::event::decode_hex;
 use crate::facets;
@@ -154,6 +155,16 @@ const PRUNE_CHUNK: usize = 1000;
 
 /// The one key of the `expiring` table.
 const EXPIRING: &[u8] = &[0];
+
+/// The deletion filter's size: 256 MiB, enough for some 200 million keys
+/// before it rules out much less than 99% of the rest.
+const DELETION_FILTER_BITS: u64 = 1 << 31;
+
+/// The deletion filter's file, in the database's directory.
+const DELETION_FILTER_FILE: &str = "deletions.bloom";
+
+/// How often the writer saves the deletion filter.
+const DELETION_FILTER_SAVE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// How often the writer sweeps away expired events.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
@@ -348,6 +359,12 @@ pub struct Store {
     history: History,
     wot: Option<Wot>,
     rank: Rank,
+    /// What [`is_deleted`](Self::is_deleted) can skip looking up.
+    deletions: deletions::Filter,
+    deletions_path: PathBuf,
+    /// The sequence number from which deletions are missing from the
+    /// filter, until it's [caught up](Self::catch_up_deletions).
+    deletions_from: u64,
 }
 
 impl Store {
@@ -389,6 +406,14 @@ impl Store {
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         };
 
+        let deletions = deletions::Filter::new(DELETION_FILTER_BITS);
+        let deletions_path = dir.join(DELETION_FILTER_FILE);
+        let covered = deletions.load(&deletions_path).with_context(|| {
+            format!(
+                "Could not read the deletion filter {}",
+                deletions_path.display()
+            )
+        })?;
         let store = Store {
             env,
             tables,
@@ -396,7 +421,18 @@ impl Store {
             history,
             wot,
             rank,
+            deletions,
+            deletions_path,
+            deletions_from: covered.unwrap_or(1),
         };
+        // Saved since the last event was stored, or a new database.
+        let next = {
+            let txn = store.read()?;
+            store.next_seq(&txn)?
+        };
+        if store.deletions_from >= next {
+            store.deletions.set_ready();
+        }
         store.prune_all()?;
         wot::open(&store, store.wot.as_ref())?;
         rank::open(&store)?;
@@ -747,6 +783,9 @@ impl Store {
         if keeps && let Some(address) = &address {
             self.prune(txn, address, removed)?;
         }
+        for key in self.deletion_keys(&view) {
+            self.deletions.add(&key);
+        }
         match view.kind() {
             DELETION => self.delete(txn, &view, now, removed)?,
             VANISH => self.vanish(txn, &view, seq, removed)?,
@@ -757,7 +796,10 @@ impl Store {
 
     /// The `created_at` of the newest NIP-62 request to vanish by `pubkey`.
     fn vanished_at(&self, txn: &Txn, pubkey: &[u8; 32]) -> Result<Option<u32>> {
-        let key = [&pubkey[..], &VANISH.to_be_bytes()].concat();
+        let key = vanish_key(pubkey);
+        if self.deletions.rules_out(&key) {
+            return Ok(None);
+        }
         let mut cursor = txn.cursor(self.tables.author_kinds)?;
         if cursor.set(&key)?.is_none() {
             return Ok(None);
@@ -838,19 +880,102 @@ impl Store {
         let mut id = Vec::with_capacity(33);
         Element::Hex(view.id()).encode(&mut id);
         let key = tag_key("e", &id, Some(DELETION));
-        if self.any_deletion(txn, &key, 0, |deletion| may_delete(deletion.pubkey(), view))? {
+        if !self.deletions.rules_out(&key)
+            && self.any_deletion(txn, &key, 0, |deletion| may_delete(deletion.pubkey(), view))?
+        {
             return Ok(true);
         }
         if let Some(text) = address_text(view) {
             let value = tag_value(&text);
             if value.len() <= MAX_INDEXED_TAG {
                 let key = tag_key("a", &value, Some(DELETION));
+                if self.deletions.rules_out(&key) {
+                    return Ok(false);
+                }
                 return self.any_deletion(txn, &key, view.created_at(), |deletion| {
                     deletion.pubkey() == view.pubkey()
                 });
             }
         }
         Ok(false)
+    }
+
+    /// The keys [`is_deleted`](Self::is_deleted) looks a deletion or a
+    /// request to vanish up by, which the deletion filter is told of.
+    fn deletion_keys(&self, view: &EventView) -> Vec<Vec<u8>> {
+        match view.kind() {
+            DELETION => self
+                .tag_keys(view)
+                .into_iter()
+                .filter(|key| key.starts_with(&[1, b'e']) || key.starts_with(&[1, b'a']))
+                .collect(),
+            VANISH => vec![vanish_key(view.pubkey())],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Add to the deletion filter the deletions and requests to vanish it
+    /// lacks, those stored since it was last saved, and let it rule keys
+    /// out. Until then, every deletion check searches LMDB. Deletions the
+    /// writer stores meanwhile it adds itself.
+    pub fn catch_up_deletions(&self) -> Result<u64> {
+        let mut added = 0;
+        if self.deletions.is_ready() {
+            return Ok(added);
+        }
+        let txn = self.read()?;
+        for kind in [DELETION, VANISH] {
+            let mut failed = None;
+            each_stamp(
+                &txn,
+                self.tables.kinds,
+                &kind.to_be_bytes(),
+                0,
+                u32::MAX,
+                |stamp| {
+                    let seq = stamp_seq(stamp);
+                    if seq < self.deletions_from {
+                        return true;
+                    }
+                    match txn.get(self.tables.events, &seq.to_ne_bytes()) {
+                        Ok(record) => {
+                            if let Some(view) = record.and_then(EventView::new) {
+                                for key in self.deletion_keys(&view) {
+                                    self.deletions.add(&key);
+                                }
+                                added += 1;
+                            }
+                            true
+                        }
+                        Err(err) => {
+                            failed = Some(err);
+                            false
+                        }
+                    }
+                },
+            )?;
+            if let Some(err) = failed {
+                return Err(err);
+            }
+        }
+        self.deletions.set_ready();
+        Ok(added)
+    }
+
+    /// Save the deletion filter as complete below `covered`, if it's caught
+    /// up. Call it with the next sequence number as the writer last
+    /// committed it, so every deletion below has been added.
+    pub fn save_deletions(&self, covered: u64) -> std::io::Result<()> {
+        if !self.deletions.is_ready() {
+            return Ok(());
+        }
+        self.deletions.save(&self.deletions_path, covered)
+    }
+
+    /// How many keys the deletion filter has had added, and whether it's
+    /// caught up.
+    pub fn deletion_filter(&self) -> (u64, bool) {
+        (self.deletions.keys(), self.deletions.is_ready())
     }
 
     /// Whether any deletion filed under a `tags` key, from `since` on,
@@ -1213,6 +1338,11 @@ pub fn each_stamp(
     }
 }
 
+/// The `author_kinds` key of an author's requests to vanish.
+fn vanish_key(pubkey: &[u8; 32]) -> Vec<u8> {
+    [&pubkey[..], &VANISH.to_be_bytes()].concat()
+}
+
 /// The address a replaceable or addressable event is kept under.
 fn address_of(view: &EventView) -> Option<Vec<u8>> {
     let kind = view.kind();
@@ -1343,6 +1473,21 @@ fn write(store: &Store, batch: Vec<WriteJob>, tell: &impl Fn(Written)) {
     }
 }
 
+/// The sequence number the next event will be stored under, as last
+/// committed.
+fn committed(store: &Store) -> Result<u64> {
+    let txn = store.read()?;
+    store.next_seq(&txn)
+}
+
+fn save_deletions(store: &Store, covered: u64) {
+    let start = Instant::now();
+    match store.save_deletions(covered) {
+        Ok(()) => tracing::debug!("saved the deletion filter in {:.1?}", start.elapsed()),
+        Err(err) => tracing::error!("saving the deletion filter failed: {err}"),
+    }
+}
+
 /// The most expired events removed in one write transaction.
 const MAX_SWEEP: usize = 10_000;
 
@@ -1389,11 +1534,33 @@ impl Writer {
             }
         };
 
+        if !store.deletion_filter().1 {
+            let store = store.clone();
+            std::thread::Builder::new()
+                .name("deletion-filter".into())
+                .spawn(move || {
+                    let start = Instant::now();
+                    tracing::info!("catching the deletion filter up");
+                    match store.catch_up_deletions() {
+                        Ok(n) => tracing::info!(
+                            "caught the deletion filter up with {n} deletions in {:.1?}",
+                            start.elapsed()
+                        ),
+                        Err(err) => {
+                            tracing::error!("catching the deletion filter up failed: {err}")
+                        }
+                    }
+                })
+                .expect("failed to spawn the deletion filter thread");
+        }
+
         let prefetching = store.clone();
         let thread = std::thread::Builder::new()
             .name("lmdb-writer".into())
             .spawn(move || {
                 let mut next_sweep = Instant::now();
+                let mut next_save = Instant::now() + DELETION_FILTER_SAVE_INTERVAL;
+                let mut saving: Option<JoinHandle<()>> = None;
                 // Whether the web of trust may have pushing to do.
                 let mut trust = true;
                 let turn = |trust: &mut bool| {
@@ -1411,6 +1578,22 @@ impl Writer {
                         // Expired follow lists move trust.
                         trust = true;
                         next_sweep = Instant::now() + SWEEP_INTERVAL;
+                    }
+                    if Instant::now() >= next_save
+                        && saving.as_ref().is_none_or(|saving| saving.is_finished())
+                    {
+                        // Taken here, between commits, so every deletion
+                        // below it has been added.
+                        match committed(&store) {
+                            Ok(covered) => {
+                                let store = store.clone();
+                                saving = Some(std::thread::spawn(move || {
+                                    save_deletions(&store, covered)
+                                }));
+                            }
+                            Err(err) => tracing::error!("reading the next seq failed: {err}"),
+                        }
+                        next_save = Instant::now() + DELETION_FILTER_SAVE_INTERVAL;
                     }
                     let wait = match trust {
                         true => Duration::ZERO,
@@ -1453,6 +1636,13 @@ impl Writer {
                     // A follow list in the batch may have moved trust; a
                     // turn between batches keeps it from falling behind.
                     turn(&mut trust);
+                }
+                if let Some(saving) = saving {
+                    let _ = saving.join();
+                }
+                match committed(&store) {
+                    Ok(covered) => save_deletions(&store, covered),
+                    Err(err) => tracing::error!("reading the next seq failed: {err}"),
                 }
             })
             .expect("failed to spawn writer thread");
@@ -2137,6 +2327,62 @@ pub mod tests {
         // A deletion can't bring it all back.
         put(&store, &signed(1, 300, 5, vec![vec!["e", &request.id]], ""));
         assert!(has(&store, &request));
+    }
+
+    /// Deletions stored since the filter was last saved are still found
+    /// after a restart, in LMDB until the filter has caught up with them.
+    #[test]
+    fn catches_the_deletion_filter_up() {
+        let (dir, store) = open();
+        let reopen = || {
+            let history = History::new(true, vec![], 20);
+            Store::open(
+                dir.path(),
+                1 << 26,
+                true,
+                test_tags(),
+                history,
+                None,
+                Rank::default(),
+            )
+            .unwrap()
+        };
+        let note = signed(1, 100, 1, vec![], "note");
+        let profile = signed(1, 100, 0, vec![], "profile");
+        let bobs = signed(2, 100, 1, vec![], "bob's");
+        let address = format!("0:{}:", profile.pubkey);
+        put(&store, &signed(1, 200, 5, vec![vec!["e", &note.id]], ""));
+        store.save_deletions(committed(&store).unwrap()).unwrap();
+        put(&store, &signed(1, 200, 5, vec![vec!["a", &address]], ""));
+        put(
+            &store,
+            &signed(2, 200, 62, vec![vec!["relay", "ALL_RELAYS"]], ""),
+        );
+        drop(store);
+
+        let refused = |store: &Store| {
+            for event in [&note, &profile, &bobs] {
+                assert_eq!(put(store, event), Outcome::Deleted);
+            }
+        };
+        let store = reopen();
+        assert_eq!(store.deletion_filter(), (1, false));
+        refused(&store);
+        // Only what was stored since it was saved.
+        assert_eq!(store.catch_up_deletions().unwrap(), 2);
+        assert_eq!(store.deletion_filter(), (3, true));
+        refused(&store);
+        assert!(matches!(
+            put(&store, &signed(3, 100, 1, vec![], "fine")),
+            Outcome::Stored(_)
+        ));
+
+        // Saved up to date, it's ready at once.
+        store.save_deletions(committed(&store).unwrap()).unwrap();
+        drop(store);
+        let store = reopen();
+        assert_eq!(store.deletion_filter(), (3, true));
+        refused(&store);
     }
 
     /// How big the database is, compacted, against the events' JSON. Slow,

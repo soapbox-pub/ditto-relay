@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod auth;
 pub mod config;
+pub mod deletions;
 pub mod event;
 pub mod facets;
 pub mod filter;
