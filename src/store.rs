@@ -161,8 +161,11 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 /// The bytes of an id the `ids` table is keyed by.
 const ID_PREFIX: usize = 8;
 
-/// The most events committed in one write transaction.
-const MAX_WRITE_BATCH: usize = 1000;
+/// The most events committed in one write transaction. A batch is only what
+/// is already queued, so a big one doesn't keep events waiting that small
+/// ones wouldn't, and a page many of its events touch is copied once rather
+/// than once a commit.
+const MAX_WRITE_BATCH: usize = 10_000;
 
 /// The length of an `authors` entry: a stamp, then the event's kind.
 pub const KINDED_LEN: usize = STAMP_LEN + 2;
