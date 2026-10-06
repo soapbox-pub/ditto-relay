@@ -226,11 +226,7 @@ pub fn tag_key_kind(key: &[u8]) -> u16 {
 fn tag_key_value(key: &[u8]) -> String {
     let name_len = usize::from(key[0]);
     let value = &key[name_len + 2..key.len() - 2];
-    match value.split_first() {
-        Some((1, bytes)) => hex::encode(bytes),
-        Some((_, text)) => String::from_utf8_lossy(text).into_owned(),
-        None => String::new(),
-    }
+    record::tag_value_element(value).map_or_else(String::new, |value| value.to_text().into_owned())
 }
 
 /// Which tags are indexed, and so can be filtered by: every single letter,
@@ -649,11 +645,9 @@ impl Store {
         seek(t.authors, view.pubkey(), &kinded(&at, view.kind()))?;
         for (db, key) in self.index_keys(&view) {
             seek(db, &key, &at)?;
-        }
-        for (key, _) in self.tag_keys(&view) {
             // A key about to reach the threshold has its events read to
             // sketch them: read them too.
-            if txn.get(t.hll, &key)?.is_none() {
+            if db == t.tags && txn.get(t.hll, &key)?.is_none() {
                 let mut cursor = txn.cursor(t.tags)?;
                 if cursor.set(&key)?.is_some()
                     && cursor.count()? + HLL_PREFETCH_MARGIN >= HLL_THRESHOLD
@@ -718,9 +712,9 @@ impl Store {
         txn.put_dup(t.authors, view.pubkey(), &kinded(&stamp, view.kind()))?;
         for (db, key) in self.index_keys(&view) {
             txn.put_dup(db, &key, &stamp)?;
-        }
-        for (key, value) in self.tag_keys(&view) {
-            self.sketch(txn, &key, &value, view.pubkey())?;
+            if db == t.tags {
+                self.sketch(txn, &key, view.pubkey())?;
+            }
         }
         rank::index(self, txn, seq, &view)?;
         if let Some(address) = &address {
@@ -1035,11 +1029,7 @@ impl Store {
             (t.kinds, kind.to_vec()),
             (t.author_kinds, [&view.pubkey()[..], &kind].concat()),
         ];
-        keys.extend(
-            self.tag_keys(view)
-                .into_iter()
-                .map(|(key, _)| (t.tags, key)),
-        );
+        keys.extend(self.tag_keys(view).into_iter().map(|key| (t.tags, key)));
         keys.extend(
             facets::keys(view, &self.indexed_tags)
                 .into_iter()
@@ -1048,8 +1038,8 @@ impl Store {
         keys
     }
 
-    /// The `tags` keys an event is filed under, each with its value as text.
-    fn tag_keys(&self, view: &EventView) -> Vec<(Vec<u8>, String)> {
+    /// The `tags` keys an event is filed under.
+    fn tag_keys(&self, view: &EventView) -> Vec<Vec<u8>> {
         let mut keys = Vec::new();
         for (name, value) in view.tag_values() {
             if !self.indexed_tags.contains(name) || value.encoded_len() > MAX_INDEXED_TAG {
@@ -1057,10 +1047,7 @@ impl Store {
             }
             let mut encoded = Vec::with_capacity(value.encoded_len());
             value.encode(&mut encoded);
-            keys.push((
-                tag_key(name, &encoded, Some(view.kind())),
-                value.to_text().into_owned(),
-            ));
+            keys.push(tag_key(name, &encoded, Some(view.kind())));
         }
         keys.sort_unstable();
         keys.dedup();
@@ -1069,12 +1056,13 @@ impl Store {
 
     /// Count an author into a tag key's HyperLogLog, starting it if the key
     /// has grown big enough.
-    fn sketch(&self, txn: &mut RwTxn, key: &[u8], value: &str, pubkey: &[u8; 32]) -> Result<()> {
+    fn sketch(&self, txn: &mut RwTxn, key: &[u8], pubkey: &[u8; 32]) -> Result<()> {
         let t = self.tables;
         let registers = match txn.get(t.hll, key)? {
             Some(stored) => {
                 let mut registers: Registers = stored.try_into().unwrap_or([0; hll::REGISTERS]);
-                if !hll::add(&mut registers, hll::offset(value), pubkey) {
+                let offset = hll::offset(&tag_key_value(key));
+                if !hll::add(&mut registers, offset, pubkey) {
                     return Ok(());
                 }
                 registers
@@ -1164,10 +1152,8 @@ impl Store {
         txn.del(t.authors, view.pubkey(), Some(&kinded(&stamp, view.kind())))?;
         for (db, key) in self.index_keys(view) {
             txn.del(db, &key, Some(&stamp))?;
-        }
-        // A sketch outlives its events, but not its key.
-        for (key, _) in self.tag_keys(view) {
-            if txn.cursor(t.tags)?.set(&key)?.is_none() {
+            // A sketch outlives its events, but not its key.
+            if db == t.tags && txn.cursor(t.tags)?.set(&key)?.is_none() {
                 txn.del(t.hll, &key, None)?;
             }
         }
@@ -1712,17 +1698,22 @@ pub mod tests {
 
     #[test]
     fn sketches_big_tag_keys() {
+        sketches_big_tag_key("e", &"ef".repeat(32));
+        // Packed in the key, and read back from it, as `kind:pubkey:d`.
+        sketches_big_tag_key("a", &format!("30023:{}:post", "ef".repeat(32)));
+    }
+
+    fn sketches_big_tag_key(name: &str, target: &str) {
         let (_dir, store) = open();
-        let target = "ef".repeat(32);
         let reactions: Vec<Event> = (0..HLL_THRESHOLD as u32 + 5)
             .map(|n| {
                 let mut secret = [1; 32];
                 secret[28..].copy_from_slice(&n.to_be_bytes());
-                let tags = vec![vec!["e".to_string(), target.clone()]];
+                let tags = vec![vec![name.to_string(), target.to_string()]];
                 crate::event::tests::sign(secret, 100, 7, tags, "+")
             })
             .collect();
-        let key = tag_key("e", &crate::record::tag_value(&target), Some(7));
+        let key = tag_key(name, &crate::record::tag_value(target), Some(7));
         let stored = |store: &Store| {
             store
                 .read()
@@ -1739,9 +1730,16 @@ pub mod tests {
             put(&store, event);
             assert_eq!(stored(&store), i + 1 >= HLL_THRESHOLD, "{i}");
         }
-        // Kept up as events arrive: the same as sketching them all now.
+        // Kept up as events arrive: the same as sketching them all now, at
+        // the offset NIP-45 derives from the value.
+        let mut expected = [0; hll::REGISTERS];
+        for event in &reactions {
+            let pubkey = crate::event::decode_hex(&event.pubkey).unwrap();
+            hll::add(&mut expected, hll::offset(target), &pubkey);
+        }
         let txn = store.read().unwrap();
         let kept = store.key_sketch(&txn, &key).unwrap();
+        assert_eq!(kept, expected);
         assert_eq!(kept, store.sketch_from_events(&txn, &key).unwrap());
         let estimate = hll::estimate(&kept);
         assert!((800.0..1250.0).contains(&estimate), "{estimate}");
