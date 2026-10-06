@@ -575,6 +575,13 @@ impl Store {
         self.env.copy_compact(self.bodies, bodies)
     }
 
+    /// Have the kernel start reading the `len` bytes of records from where
+    /// `record` is, for reading records on in order of their sequence
+    /// numbers, which is mostly the order they're in on disk.
+    pub fn will_need_records(&self, record: &[u8], len: usize) {
+        self.env.will_need(self.bodies, record, len);
+    }
+
     /// The main environment's usage, and `bodies`'.
     pub fn usage(&self) -> Result<(Usage, Usage)> {
         Ok((self.env.usage(0)?, self.env.usage(self.bodies)?))

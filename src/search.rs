@@ -98,8 +98,19 @@ const MAX_PREFIX: usize = 20;
 /// The indexer's memory, split between its threads.
 const WRITER_MEMORY: usize = 64 << 20;
 
-/// The most events indexed per LMDB read transaction and commit.
-const CATCH_UP_CHUNK: usize = 50_000;
+/// The most sequence numbers indexed per commit.
+const CATCH_UP_CHUNK: usize = 400_000;
+
+/// How many threads catching up reads records with.
+const CATCH_UP_THREADS: u64 = 8;
+
+/// The fewest sequence numbers to catch up with that are split between
+/// threads.
+const CATCH_UP_SPLIT: u64 = if cfg!(test) { 4 } else { 10_000 };
+
+/// How far ahead of the record it's on catching up reads records, and how
+/// far it goes before reading ahead again.
+const READ_AHEAD: usize = 64 << 20;
 
 /// The most sequence numbers past the last commit a search checks by hand.
 const MAX_UNINDEXED: u64 = 10_000;
@@ -667,6 +678,42 @@ fn any_of(mut terms: Vec<Term>) -> Box<dyn Query> {
     Box::new(ConstScoreQuery::new(query, 0.0))
 }
 
+/// Add to the index every searchable event stored under a sequence number
+/// from `start` up to `stop`.
+fn index_range(
+    store: &Store,
+    writer: &IndexWriter,
+    search: &SearchIndex,
+    start: u64,
+    stop: u64,
+) -> anyhow::Result<()> {
+    let txn = store.read()?;
+    let mut cursor = txn.cursor(store.tables.events)?;
+    let mut entry = cursor.set_range(&start.to_ne_bytes())?;
+    // Where in memory records were last read ahead from.
+    let mut read_ahead = 0usize;
+    while let Some((key, record)) = entry {
+        let seq = u64::from_ne_bytes(key.try_into()?);
+        if seq >= stop {
+            break;
+        }
+        let at = record.as_ptr() as usize;
+        if at.abs_diff(read_ahead) > READ_AHEAD / 2 {
+            store.will_need_records(record, READ_AHEAD);
+            read_ahead = at;
+        }
+        // Old versions, kept as history, aren't searchable.
+        if let Some(view) = EventView::new(record)
+            && store.is_current(&txn, seq, &view)?
+            && let Some(doc) = search.document(seq, &view)
+        {
+            writer.add_document(doc)?;
+        }
+        entry = cursor.next()?;
+    }
+    Ok(())
+}
+
 /// The current, unexpired events stored since the index was last committed
 /// that a filter matches, checked by hand. Only the newest [`MAX_UNINDEXED`].
 fn unindexed<'t>(
@@ -750,37 +797,40 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    /// Index what's been stored since last time, up to `max` events.
-    /// Returns whether there's more.
+    /// Index what's been stored since last time, up to `max` sequence
+    /// numbers' worth. Returns whether there's more.
+    ///
+    /// Many are read [`CATCH_UP_THREADS`] at a time, each a share of them:
+    /// records are mostly out of memory when rebuilding, and one thread
+    /// waits on the disk for each page in turn.
     pub fn catch_up(&mut self, store: &Store, max: usize) -> anyhow::Result<bool> {
-        let txn = store.read()?;
-        let end = store.next_seq(&txn)?;
-        let mut cursor = txn.cursor(store.tables.events)?;
-        let mut entry = cursor.set_range(&self.next_seq.to_ne_bytes())?;
-        let mut count = 0;
-        while let Some((key, record)) = entry {
-            let seq = u64::from_ne_bytes(key.try_into()?);
-            if count == max {
-                self.next_seq = seq;
-                return Ok(true);
-            }
-            // Old versions, kept as history, aren't searchable.
-            if let Some(view) = EventView::new(record)
-                && store.is_current(&txn, seq, &view)?
-                && let Some(doc) = self.search.document(seq, &view)
-            {
-                self.writer.add_document(doc)?;
-            }
-            count += 1;
-            entry = cursor.next()?;
-        }
-        self.dirty |= end != self.next_seq;
-        self.next_seq = end;
-        Ok(false)
+        let end = store.next_seq(&*store.read()?)?;
+        let from = self.next_seq;
+        let to = end.min(from.saturating_add(max as u64));
+        let threads = match to - from >= CATCH_UP_SPLIT {
+            true => CATCH_UP_THREADS,
+            false => 1,
+        };
+        let share = (to - from).div_ceil(threads);
+        let (writer, search) = (&self.writer, &*self.search);
+        std::thread::scope(|scope| {
+            let shares: Vec<_> = (0..threads)
+                .map(|n| from + n * share)
+                .take_while(|&start| start < to)
+                .map(|start| {
+                    let stop = (start + share).min(to);
+                    scope.spawn(move || index_range(store, writer, search, start, stop))
+                })
+                .collect();
+            shares
+                .into_iter()
+                .try_for_each(|share| share.join().expect("an indexing thread panicked"))
+        })?;
+        self.dirty |= to != from;
+        self.next_seq = to;
+        Ok(to < end)
     }
 
-    /// Drop removed events from the index. Any not yet indexed are no
-    /// longer stored, so won't be.
     pub fn remove(&mut self, seqs: &[u64]) {
         for &seq in seqs {
             self.writer

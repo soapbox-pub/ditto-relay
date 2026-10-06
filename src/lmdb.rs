@@ -269,6 +269,39 @@ impl Env {
         })
     }
 
+    /// Have the kernel start reading the `len` bytes of environment
+    /// `env`'s file from where `at`, read from its map, is, so that reading
+    /// on from there in order doesn't wait on the disk a page at a time:
+    /// environments are opened without the kernel's readahead, which
+    /// random lookups have no use for. Only a hint, so failing is no error.
+    pub fn will_need(&self, env: usize, at: &[u8], len: usize) {
+        let ptr = self.ptrs[env];
+        // SAFETY: plain data, filled in by LMDB from an open env.
+        let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
+        let mut fd = -1;
+        if check(unsafe { ffi::mdb_env_info(ptr, &mut info) }).is_err()
+            || check(unsafe { ffi::mdb_env_get_fd(ptr, &mut fd) }).is_err()
+        {
+            return;
+        }
+        let Some(offset) = (at.as_ptr() as usize).checked_sub(info.me_mapaddr as usize) else {
+            return;
+        };
+        if offset >= info.me_mapsize {
+            return;
+        }
+        // SAFETY: advice on a file LMDB holds open; nothing is read or
+        // written through any pointer.
+        unsafe {
+            libc::posix_fadvise(
+                fd,
+                offset as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_WILLNEED,
+            );
+        }
+    }
+
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         Ok(RoTxn(self.begin(ffi::MDB_RDONLY)?))
     }
