@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::serve::ListenerExt;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -61,6 +62,14 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&config.bind).await?;
     tracing::info!("listening on ws://{}", listener.local_addr()?);
+    // A REQ's events and its EOSE go out as they're ready: Nagle's
+    // algorithm would hold the last back until the client acknowledged
+    // the rest, which with delayed ACKs is some 40 ms.
+    let listener = listener.tap_io(|tcp| {
+        if let Err(err) = tcp.set_nodelay(true) {
+            tracing::debug!("couldn't set TCP_NODELAY: {err}");
+        }
+    });
 
     let metrics = match &config.metrics_bind {
         Some(bind) => {
