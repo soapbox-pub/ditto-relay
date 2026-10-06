@@ -678,7 +678,7 @@ fn ranked_key(mode: u8, kind: u16) -> [u8; 3] {
 }
 
 /// A `ranked` value: rank, then the sequence number in 48 bits.
-fn ranked_value(rank: u64, seq: u64) -> [u8; 14] {
+fn ranked_value(rank: u64, seq: u64) -> RankedValue {
     let mut out = [0; 14];
     out[..8].copy_from_slice(&rank.to_be_bytes());
     out[8..].copy_from_slice(&seq.to_be_bytes()[2..]);
@@ -1333,21 +1333,18 @@ pub fn run<'t>(
 ) -> anyhow::Result<Vec<(u64, EventView<'t>)>> {
     let search = filter.search.as_ref().expect("a ranked search");
     let mode = mode(store, filter, search.sort);
-    // The filter as a plain one, newest first.
-    let mut plain = filter.clone();
-    plain.search = match search.has_text() || !search.conditions.is_empty() {
-        true => Some(crate::filter::Search {
-            sort: Sort::New,
-            distinct_author: false,
-            ..search.clone()
-        }),
-        false => None,
-    };
+    let plain = newest_of(filter, false);
+    let fill = newest_of(filter, search.distinct_author);
     let narrow = filter.ids.is_some() || filter.authors.is_some() || !filter.tags.is_empty();
     let mut found = if narrow {
-        let mut found = crate::query::run_filter(store, txn, &plain, MAX_EXAMINED, cancel)?;
-        sort(store, txn, filter, search.sort, &mut found)?;
-        found
+        match walk_narrow(store, txn, filter, &fill, limit, cancel)? {
+            Some(found) => found,
+            None => {
+                let mut found = crate::query::run_filter(store, txn, &plain, MAX_EXAMINED, cancel)?;
+                sort(store, txn, filter, search.sort, &mut found)?;
+                found
+            }
+        }
     } else {
         let mut found = match by_author(filter, mode) {
             true => {
@@ -1358,7 +1355,7 @@ pub fn run<'t>(
         };
         if found.len() < limit {
             let seen: HashSet<u64> = found.iter().map(|(seq, _)| *seq).collect();
-            let newest = crate::query::run_filter(store, txn, &plain, limit + seen.len(), cancel)?;
+            let newest = crate::query::run_filter(store, txn, &fill, limit + seen.len(), cancel)?;
             found.extend(newest.into_iter().filter(|(seq, _)| !seen.contains(seq)));
         }
         found
@@ -1369,6 +1366,23 @@ pub fn run<'t>(
     }
     found.truncate(limit);
     Ok(found)
+}
+
+/// A ranked filter as a plain one, newest first, for its unranked matches;
+/// with `distinct`, only each author's newest, so that those found already
+/// ranked can't crowd out the others.
+pub fn newest_of(filter: &Filter, distinct: bool) -> Filter {
+    let search = filter.search.as_ref().expect("a ranked search");
+    let mut plain = filter.clone();
+    plain.search = match search.has_text() || !search.conditions.is_empty() || distinct {
+        true => Some(crate::filter::Search {
+            sort: Sort::New,
+            distinct_author: distinct,
+            ..search.clone()
+        }),
+        false => None,
+    };
+    plain
 }
 
 /// The authors of the best events of any kind in a mode, the best first.
@@ -1414,17 +1428,325 @@ fn best<'t>(
     limit: usize,
     distinct: bool,
 ) -> Result<Vec<(u64, EventView<'t>)>> {
-    match mode {
-        RISING => walk_rising(store, txn, filter, limit, distinct, crate::event::now()),
-        _ => walk(store, txn, filter, mode, limit, distinct),
+    let walk = RankedWalk {
+        limit,
+        distinct,
+        among: None,
+        budget: MAX_EXAMINED,
+        max_steps: usize::MAX,
+        text_checked: false,
+    };
+    let (found, cut_short) = best_within(store, txn, filter, mode, &walk)?;
+    if cut_short {
+        METRICS.filters_cut_short.inc();
+    }
+    Ok(found)
+}
+
+/// How far to walk `ranked`.
+struct RankedWalk<'a> {
+    limit: usize,
+    /// Only each author's best.
+    distinct: bool,
+    /// Only these sequence numbers, sorted, which are passed over without
+    /// reading their records.
+    among: Option<&'a [u64]>,
+    /// The most records to read.
+    budget: usize,
+    /// The most entries to walk, read or not.
+    max_steps: usize,
+    /// Whether every candidate has the search's text already, so only the
+    /// filter's other fields need checking.
+    text_checked: bool,
+}
+
+impl RankedWalk<'_> {
+    fn matches(&self, filter: &Filter, view: &EventView) -> bool {
+        match self.text_checked {
+            true => filter.matches_fields(view),
+            false => filter.matches(view),
+        }
     }
 }
 
-/// A mode's `ranked` entries of the kinds a filter wants, from the top.
+/// [`best`], as far as a walk goes, and whether it stopped at its budget
+/// short of the limit.
+fn best_within<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    filter: &Filter,
+    mode: u8,
+    walk: &RankedWalk,
+) -> Result<(Vec<(u64, EventView<'t>)>, bool)> {
+    match mode {
+        RISING => walk_rising(store, txn, filter, walk, crate::event::now()),
+        _ => walk_ranked(store, txn, filter, mode, walk),
+    }
+}
+
+/// The most candidates gathered for a walk of `ranked`.
+pub const MAX_CANDIDATES: usize = 2_000_000;
+
+/// How many `ranked` entries passing one over costs as much as reading a
+/// record does, about, given most records aren't in memory.
+const STEPS_PER_READ: usize = if cfg!(test) { usize::MAX } else { 200 };
+
+/// The best of a narrow filter's matches, without reading every one: see
+/// [`best_among`]. With too many candidates to gather, every record is
+/// walked past instead, up to a budget. None when that wouldn't be
+/// quicker than ranking them all.
+fn walk_narrow<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    filter: &Filter,
+    fill: &Filter,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<Vec<(u64, EventView<'t>)>>> {
+    if filter.ids.is_some() {
+        return Ok(None);
+    }
+    match crate::query::candidates(store, txn, filter, MAX_CANDIDATES)? {
+        Some(candidates) => {
+            let direct = candidates.len().min(MAX_EXAMINED);
+            best_among(
+                store,
+                txn,
+                filter,
+                &candidates,
+                false,
+                direct,
+                fill,
+                MAX_EXAMINED,
+                limit,
+                cancel,
+            )
+        }
+        None => walk_matching(store, txn, filter, limit, WALK_BUDGET, cancel),
+    }
+}
+
+/// The best a ranked filter matches among `candidates`, sorted, a superset of its
+/// matches (with `text_checked`, all with its search's text), by walking
+/// `ranked` from the top past those that aren't candidates, without
+/// reading their records, then the newest unranked
+/// matching `fill`, if that's found within `fill_budget` records. None if
+/// the walk would take longer than reading `direct` records, as ranking
+/// them all would, or does.
+///
+/// A walk is about `limit` times as long as the events of the filter's
+/// kinds are to the candidates, if they're as often ranked as the rest.
+#[allow(clippy::too_many_arguments)]
+pub fn best_among<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    filter: &Filter,
+    candidates: &[u64],
+    text_checked: bool,
+    direct: usize,
+    fill: &Filter,
+    fill_budget: usize,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<Vec<(u64, EventView<'t>)>>> {
+    let search = filter.search.as_ref().expect("a ranked search");
+    let mode = mode(store, filter, search.sort);
+    if by_author(filter, mode) || candidates.is_empty() {
+        return Ok(None);
+    }
+    let events = events_of_kinds(store, txn, filter)?;
+    let steps = (limit.saturating_mul(events) / candidates.len()).saturating_add(1);
+    let max_steps = match cfg!(test) {
+        true => usize::MAX,
+        false => steps.saturating_mul(8).saturating_add(10_000),
+    };
+    if steps > direct.saturating_mul(STEPS_PER_READ) {
+        return Ok(None);
+    }
+    let walk = RankedWalk {
+        limit,
+        distinct: search.distinct_author,
+        among: Some(candidates),
+        budget: MAX_EXAMINED,
+        max_steps,
+        text_checked,
+    };
+    let (mut found, cut_short) = best_within(store, txn, filter, mode, &walk)?;
+    tracing::debug!(
+        "ranked walk: {} candidates of {events} events, about {steps} steps; found {}{}",
+        candidates.len(),
+        found.len(),
+        if cut_short { ", cut short" } else { "" },
+    );
+    if found.len() < limit {
+        if cut_short {
+            return Ok(None);
+        }
+        // Every ranked match is found: the rest are unranked.
+        let seen: HashSet<u64> = found.iter().map(|(seq, _)| *seq).collect();
+        let more = limit + seen.len();
+        let Some(newest) = crate::query::newest(store, txn, fill, more, fill_budget, cancel)?
+        else {
+            return Ok(None);
+        };
+        found.extend(newest.into_iter().filter(|(seq, _)| !seen.contains(seq)));
+    }
+    if search.distinct_author {
+        let mut authors = HashSet::new();
+        found.retain(|(_, view)| authors.insert(*view.pubkey()));
+    }
+    found.truncate(limit);
+    Ok(Some(found))
+}
+
+/// How many events there are of the kinds a filter wants.
+fn events_of_kinds(store: &Store, txn: &Txn, filter: &Filter) -> Result<usize> {
+    let t = store.tables;
+    let Some(kinds) = &filter.kinds else {
+        return txn.len(t.created);
+    };
+    let mut cursor = txn.cursor(t.kinds)?;
+    let mut events = 0;
+    for kind in kinds {
+        if cursor.set(&kind.to_be_bytes())?.is_some() {
+            events += cursor.count()?;
+        }
+    }
+    Ok(events)
+}
+
+/// The most records [`walk_matching`] reads.
+pub const WALK_BUDGET: usize = 2000;
+
+/// The best a ranked filter matches, by walking `ranked` from the top and
+/// reading every record, checking it, search text and all, up to `budget`
+/// of them; then the newest unranked, as many as are short. For a filter
+/// most events match, as a search for a common word, that's far quicker
+/// than ranking them all. None if the budget runs out first.
+pub fn walk_matching<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    filter: &Filter,
+    limit: usize,
+    budget: usize,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<Vec<(u64, EventView<'t>)>>> {
+    let search = filter.search.as_ref().expect("a ranked search");
+    let mode = mode(store, filter, search.sort);
+    if by_author(filter, mode) {
+        return Ok(None);
+    }
+    let walk = RankedWalk {
+        limit,
+        distinct: search.distinct_author,
+        among: None,
+        budget,
+        max_steps: usize::MAX,
+        text_checked: false,
+    };
+    let (mut found, cut_short) = best_within(store, txn, filter, mode, &walk)?;
+    if found.len() < limit {
+        if cut_short {
+            return Ok(None);
+        }
+        // Every ranked match is found: the rest are unranked.
+        let plain = newest_of(filter, search.distinct_author);
+        let seen: HashSet<u64> = found.iter().map(|(seq, _)| *seq).collect();
+        let more = limit + seen.len();
+        let Some(newest) = crate::query::newest(store, txn, &plain, more, budget, cancel)? else {
+            return Ok(None);
+        };
+        found.extend(newest.into_iter().filter(|(seq, _)| !seen.contains(seq)));
+    }
+    if search.distinct_author {
+        let mut authors = HashSet::new();
+        found.retain(|(_, view)| authors.insert(*view.pubkey()));
+    }
+    found.truncate(limit);
+    Ok(Some(found))
+}
+
+/// A mode's `ranked` entries of the kinds a filter wants, from the top,
+/// read a page of a kind's at a time.
 struct Ranked<'t> {
-    cursors: Vec<Cursor<'t>>,
-    /// Each cursor's entry, by which is next.
-    heap: BinaryHeap<(Vec<u8>, usize)>,
+    kinds: Vec<RankedKind<'t>>,
+    /// Each kind's next entry, by which is next.
+    heap: BinaryHeap<(RankedValue, usize)>,
+}
+
+type RankedValue = [u8; RANKED_VALUE];
+
+const RANKED_VALUE: usize = 14;
+
+/// One kind's entries, from its cursor's page, the last first.
+struct RankedKind<'t> {
+    cursor: Cursor<'t>,
+    /// The key's last value, when it isn't the last of `page`, to come
+    /// first.
+    last: Option<RankedValue>,
+    page: &'t [u8],
+    /// How many of the page's entries are left.
+    left: usize,
+    /// Whether there are no pages before `page`.
+    first: bool,
+}
+
+impl<'t> RankedKind<'t> {
+    /// Positioned on a key's last value, or None with none.
+    fn new(mut cursor: Cursor<'t>, key: &[u8]) -> Result<Option<RankedKind<'t>>> {
+        if cursor.set(key)?.is_none() {
+            return Ok(None);
+        }
+        let Some((_, last)) = cursor.last_dup()? else {
+            return Ok(None);
+        };
+        let last: RankedValue = last.try_into().expect("a ranked value");
+        // A page isn't returned from the last value, which leaves the
+        // cursor at the end, so from the one before: the last's page, or
+        // with it alone there, the page before.
+        if cursor.prev_dup()?.is_none() {
+            return Ok(Some(RankedKind {
+                cursor,
+                last: Some(last),
+                page: &[],
+                left: 0,
+                first: true,
+            }));
+        }
+        let page = cursor.get_multiple()?;
+        let alone = !page.ends_with(&last);
+        Ok(Some(RankedKind {
+            cursor,
+            last: alone.then_some(last),
+            page,
+            left: page.len() / RANKED_VALUE,
+            first: false,
+        }))
+    }
+
+    fn next(&mut self) -> Result<Option<RankedValue>> {
+        if let Some(last) = self.last.take() {
+            return Ok(Some(last));
+        }
+        if self.left == 0 {
+            if self.first {
+                return Ok(None);
+            }
+            match self.cursor.prev_multiple()? {
+                Some(page) if !page.is_empty() => {
+                    self.page = page;
+                    self.left = page.len() / RANKED_VALUE;
+                }
+                _ => {
+                    self.first = true;
+                    return Ok(None);
+                }
+            }
+        }
+        self.left -= 1;
+        let at = self.left * RANKED_VALUE;
+        Ok(self.page[at..at + RANKED_VALUE].try_into().ok())
+    }
 }
 
 impl<'t> Ranked<'t> {
@@ -1445,18 +1767,21 @@ impl<'t> Ranked<'t> {
                 kinds
             }
         };
-        let mut cursors = Vec::new();
+        let mut sources = Vec::new();
         let mut heap = BinaryHeap::new();
         for kind in kinds.into_iter().filter(|&kind| filter.wants_kind(kind)) {
-            let mut cursor = txn.cursor(t.ranked)?;
-            if cursor.set(&ranked_key(mode, kind))?.is_some()
-                && let Some((_, value)) = cursor.last_dup()?
+            let cursor = txn.cursor(t.ranked)?;
+            if let Some(mut source) = RankedKind::new(cursor, &ranked_key(mode, kind))?
+                && let Some(value) = source.next()?
             {
-                heap.push((value.to_vec(), cursors.len()));
-                cursors.push(cursor);
+                heap.push((value, sources.len()));
+                sources.push(source);
             }
         }
-        Ok(Ranked { cursors, heap })
+        Ok(Ranked {
+            kinds: sources,
+            heap,
+        })
     }
 
     /// The next entry's rank and sequence number.
@@ -1464,42 +1789,52 @@ impl<'t> Ranked<'t> {
         let Some((value, i)) = self.heap.pop() else {
             return Ok(None);
         };
-        if let Some((_, next)) = self.cursors[i].prev_dup()? {
-            self.heap.push((next.to_vec(), i));
+        if let Some(next) = self.kinds[i].next()? {
+            self.heap.push((next, i));
         }
         Ok(Some((ranked_rank(&value), ranked_seq(&value))))
     }
 }
 
-/// The best ranked events a filter matches, from `ranked`.
-fn walk<'t>(
+/// The best ranked events a filter matches, from `ranked`, and whether the
+/// walk stopped at its budget.
+fn walk_ranked<'t>(
     store: &Store,
     txn: &'t Txn,
     filter: &Filter,
     mode: u8,
-    limit: usize,
-    distinct: bool,
-) -> Result<Vec<(u64, EventView<'t>)>> {
+    walk: &RankedWalk,
+) -> Result<(Vec<(u64, EventView<'t>)>, bool)> {
     let mut ranked = Ranked::new(store, txn, filter, mode)?;
     let mut authors = HashSet::new();
     let mut found = Vec::new();
-    let mut examined = 0;
-    while found.len() < limit
+    let (mut examined, mut steps) = (0, 0);
+    while found.len() < walk.limit
         && let Some((_, seq)) = ranked.next()?
     {
+        steps += 1;
+        if steps > walk.max_steps {
+            return Ok((found, true));
+        }
+        if walk
+            .among
+            .is_some_and(|among| among.binary_search(&seq).is_err())
+        {
+            continue;
+        }
         examined += 1;
-        if examined > MAX_EXAMINED {
-            METRICS.filters_cut_short.inc();
-            break;
+        if examined > walk.budget {
+            return Ok((found, true));
         }
         if let Some(view) = store.load(txn, seq)?
-            && filter.matches(&view)
-            && (!distinct || authors.insert(*view.pubkey()))
+            && walk.matches(filter, &view)
+            && (!walk.distinct || authors.insert(*view.pubkey()))
         {
             found.push((seq, view));
         }
     }
-    Ok(found)
+    tracing::debug!("walked {steps} ranked entries, reading {examined}");
+    Ok((found, false))
 }
 
 /// The fastest rising events a filter matches at `now`, walking `sort:hot`
@@ -1513,10 +1848,10 @@ fn walk_rising<'t>(
     store: &Store,
     txn: &'t Txn,
     filter: &Filter,
-    limit: usize,
-    distinct: bool,
+    walk: &RankedWalk,
     now: u32,
-) -> Result<Vec<(u64, EventView<'t>)>> {
+) -> Result<(Vec<(u64, EventView<'t>)>, bool)> {
+    let (limit, distinct) = (walk.limit, walk.distinct);
     let half_life = f64::from(store.rank().half_life);
     let factor = |age: u32| f64::from(age) / half_life - f64::from(age).log2();
     // Less `x`, the log2 of the fastest an event at `x` can rise, in
@@ -1527,17 +1862,32 @@ fn walk_rising<'t>(
     let mut found: Vec<(f64, u64, EventView<'t>)> = Vec::new();
     // The log2 of the `limit`th fastest found, as of the last look.
     let mut threshold = f64::NEG_INFINITY;
-    let mut examined = 0usize;
+    let (mut examined, mut steps) = (0usize, 0usize);
+    let mut cut_short = false;
     while let Some((rank, seq)) = ranked.next()? {
-        examined += 1;
-        if examined > MAX_EXAMINED {
-            METRICS.filters_cut_short.inc();
-            break;
-        }
         if unordered(rank) + slack < threshold {
             break;
         }
-        let Some(view) = store.load(txn, seq)?.filter(|view| filter.matches(view)) else {
+        steps += 1;
+        if steps > walk.max_steps {
+            cut_short = true;
+            break;
+        }
+        if walk
+            .among
+            .is_some_and(|among| among.binary_search(&seq).is_err())
+        {
+            continue;
+        }
+        examined += 1;
+        if examined > walk.budget {
+            cut_short = true;
+            break;
+        }
+        let Some(view) = store
+            .load(txn, seq)?
+            .filter(|view| walk.matches(filter, view))
+        else {
             continue;
         };
         let Some(rise) = score_of(store, txn, view.id())?
@@ -1555,12 +1905,14 @@ fn walk_rising<'t>(
             .then_with(|| crate::search::newest_first(a, b))
     });
     let mut authors = HashSet::new();
-    Ok(found
+    let found: Vec<_> = found
         .into_iter()
         .filter(|(_, _, view)| !distinct || authors.insert(*view.pubkey()))
         .take(limit)
         .map(|(_, seq, view)| (seq, view))
-        .collect())
+        .collect();
+    let cut_short = cut_short && found.len() < limit;
+    Ok((found, cut_short))
 }
 
 /// How fast the `n`th fastest rises, with `distinct` counting only each
@@ -2384,6 +2736,185 @@ mod tests {
 
     /// Random posts and reactions, ranked by how fast they're rising, the
     /// walk stopping where it may, checked against ranking them all.
+    /// Walking `ranked` for a narrow filter's candidates, or reading every
+    /// record for a search's text, finds what ranking every match does:
+    /// the ranked best first, ties the latest stored first, then the
+    /// unranked newest first.
+    #[test]
+    fn walks_as_ranking_everything_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), None, Rank::new(DAY, 0.05, 100));
+        let mut rng = StdRng::seed_from_u64(7);
+        let words = ["apple", "banana", "cherry"];
+        let mut posts = Vec::new();
+        for i in 0..120u32 {
+            let tag = ["x", "y", "z"][rng.random_range(0..3)];
+            let kind = if rng.random_bool(0.8) { 1 } else { 30023 };
+            let d = i.to_string();
+            let mut tags = vec![vec!["t", tag]];
+            if kind == 30023 {
+                tags.push(vec!["d", d.as_str()]);
+            }
+            let text = words[rng.random_range(0..3)];
+            let post = event(rng.random_range(1..7), 10 * DAY + i * 600, kind, tags, text);
+            put(&store, &post);
+            posts.push(post);
+        }
+        for n in 0..300u32 {
+            let to = &posts[rng.random_range(0..posts.len())];
+            let who = 10 + rng.random_range(0..30);
+            let engagement = match rng.random_range(0..4) {
+                0 => event(who, 1 + n, 1, vec![vec!["e", &to.id, "", "root"]], "re"),
+                1 => event(who, 1 + n, 7, vec![vec!["e", &to.id]], "-"),
+                _ => react(who, to, "+"),
+            };
+            put(&store, &engagement);
+        }
+        settle(&store);
+
+        let txn = store.read().unwrap();
+        let now = crate::event::now();
+        for _ in 0..300 {
+            let mut filter = serde_json::Map::new();
+            let sort = ["top", "hot", "controversial", "zaps"][rng.random_range(0..4)];
+            let text = rng.random_bool(0.5);
+            let mut search = format!("sort:{sort}");
+            if rng.random_bool(0.2) {
+                search.push_str(" distinct:author");
+            }
+            if text {
+                search = format!("{} {search}", words[rng.random_range(0..3)]);
+            }
+            filter.insert("search".into(), json!(search));
+            if !text || rng.random_bool(0.5) {
+                let tag = ["x", "y", "z"][rng.random_range(0..3)];
+                filter.insert("#t".into(), json!([tag]));
+            }
+            if rng.random_bool(0.3) {
+                filter.insert(
+                    "authors".into(),
+                    json!([hex::encode(pubkey(rng.random_range(1..7)))]),
+                );
+            }
+            if rng.random_bool(0.4) {
+                let kind = [1, 30023][rng.random_range(0..2)];
+                filter.insert("kinds".into(), json!([kind]));
+            }
+            if rng.random_bool(0.3) {
+                filter.insert(
+                    "since".into(),
+                    json!(10 * DAY + rng.random_range(0..120) * 600),
+                );
+            }
+            let limit = rng.random_range(1..60);
+            filter.insert("limit".into(), json!(limit));
+            let raw = Value::Object(filter);
+            let filter = Filter::parse(&raw, &test_tags(), MAX_VALUES).unwrap();
+            let mode = mode(&store, &filter, filter.search.as_ref().unwrap().sort);
+
+            let mut ranked = Vec::new();
+            let mut unranked = Vec::new();
+            for (key, record) in table(&store, store.tables.events) {
+                let seq = u64::from_ne_bytes(key.try_into().unwrap());
+                let view = EventView::new(&record).unwrap();
+                if !store.is_current(&txn, seq, &view).unwrap() || !filter.matches(&view) {
+                    continue;
+                }
+                let id = hex::encode(view.id());
+                match rank_of(&store, &txn, mode, &view, now).unwrap() {
+                    0 => unranked.push((view.created_at(), id)),
+                    rank => ranked.push((rank, seq, view.pubkey().to_owned(), id)),
+                }
+            }
+            ranked.sort_by_key(|r| std::cmp::Reverse((r.0, r.1)));
+            unranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let authors_of: HashMap<String, [u8; 32]> = posts
+                .iter()
+                .map(|p| {
+                    (
+                        p.id.clone(),
+                        hex::decode(&p.pubkey).unwrap().try_into().unwrap(),
+                    )
+                })
+                .collect();
+            let mut want: Vec<String> = ranked.into_iter().map(|r| r.3).collect();
+            want.extend(unranked.into_iter().map(|u| u.1));
+            if filter.search.as_ref().unwrap().distinct_author {
+                let mut seen = HashSet::new();
+                want.retain(|id| seen.insert(authors_of[id]));
+            }
+            want.truncate(limit);
+
+            let got: Vec<String> = match text {
+                false => ids(&store, raw.clone()),
+                true => {
+                    match walk_matching(&store, &txn, &filter, limit, 1000, &Default::default())
+                        .unwrap()
+                    {
+                        Some(found) => found.iter().map(|(_, v)| hex::encode(v.id())).collect(),
+                        None => continue,
+                    }
+                }
+            };
+            assert_eq!(got, want, "{raw}");
+        }
+    }
+
+    /// Walking `ranked` a page at a time, across pages and with one value
+    /// alone on the last, comes to every entry, best first.
+    #[test]
+    fn walks_every_page_of_ranked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), None, Rank::new(DAY, 0.05, 100));
+        let mut rng = StdRng::seed_from_u64(3);
+        let sizes = [1, 2, 290, 291, 292, 293, 580, 581, 582, 583, 1000, 3001];
+        let mut want = Vec::new();
+        let mut txn = store.write().unwrap();
+        for (kind, &n) in (1u16..).zip(&sizes) {
+            for _ in 0..n {
+                let (rank, seq) = (
+                    rng.random_range(1..1u64 << 40),
+                    rng.random_range(1..1u64 << 40),
+                );
+                txn.put_dup(
+                    store.tables.ranked,
+                    &ranked_key(TOP, kind),
+                    &ranked_value(rank, seq),
+                )
+                .unwrap();
+                want.push((rank, seq));
+            }
+        }
+        txn.commit().unwrap();
+        want.sort_unstable_by(|a, b| b.cmp(a));
+        want.dedup();
+
+        let txn = store.read().unwrap();
+        let filter = Filter::default();
+        let mut ranked = Ranked::new(&store, &txn, &filter, TOP).unwrap();
+        let mut got = Vec::new();
+        while let Some(entry) = ranked.next().unwrap() {
+            got.push(entry);
+        }
+        assert_eq!(got, want);
+        // One kind at a time, too.
+        for (kind, &n) in (1u16..).zip(&sizes) {
+            let filter = Filter {
+                kinds: Some(vec![kind]),
+                ..Filter::default()
+            };
+            let mut ranked = Ranked::new(&store, &txn, &filter, TOP).unwrap();
+            let mut count = 0;
+            let mut previous = (u64::MAX, u64::MAX);
+            while let Some(entry) = ranked.next().unwrap() {
+                assert!(entry < previous, "{kind}");
+                previous = entry;
+                count += 1;
+            }
+            assert_eq!(count, n, "{kind}");
+        }
+    }
+
     #[test]
     fn rises_as_brute_force_does() {
         const NOW: u32 = 100 * DAY;
@@ -2423,7 +2954,15 @@ mod tests {
                 let mut authors = HashSet::new();
                 want.retain(|(_, post)| !distinct || authors.insert(post.pubkey.clone()));
                 for limit in [1, 3, 10, 40] {
-                    let got = walk_rising(&store, &txn, &filter, limit, distinct, NOW).unwrap();
+                    let walk = RankedWalk {
+                        limit,
+                        distinct,
+                        among: None,
+                        budget: MAX_EXAMINED,
+                        max_steps: usize::MAX,
+                        text_checked: false,
+                    };
+                    let (got, _) = walk_rising(&store, &txn, &filter, &walk, NOW).unwrap();
                     let got: Vec<String> = got.iter().map(|(_, v)| hex::encode(v.id())).collect();
                     let want: Vec<String> =
                         want.iter().take(limit).map(|(_, e)| e.id.clone()).collect();

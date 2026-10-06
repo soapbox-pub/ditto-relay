@@ -45,16 +45,17 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tantivy::collector::{Count, DocSetCollector, TopDocs};
+use tantivy::collector::{Collector, Count, DocSetCollector, SegmentCollector, TopDocs};
 use tantivy::columnar::Column;
+use tantivy::index::SegmentId;
 use tantivy::query::{
     BooleanQuery, ConstScoreQuery, Occur, Query, RangeQuery, TermQuery, TermSetQuery,
 };
@@ -66,13 +67,15 @@ use tantivy::tokenizer::{
     TextAnalyzer, Token,
 };
 use tantivy::{
-    DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Searcher, TantivyDocument,
-    Term,
+    DocAddress, DocId, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Score, Searcher,
+    SegmentOrdinal, SegmentReader, TantivyDocument, Term,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::filter::{Filter, Search, Sort};
 use crate::lmdb::Txn;
 use crate::query::{MAX_EXAMINED, TooExpensive};
+use crate::rank::WALK_BUDGET;
 use crate::record::{Content, Element, EventView};
 use crate::store::Store;
 
@@ -118,6 +121,13 @@ const MAX_UNINDEXED: u64 = 10_000;
 /// The most hits one filter may examine, to fill its limit after the
 /// fields the index doesn't hold (tags) are checked.
 const MAX_HITS: usize = 10_000;
+
+/// How many of a term's hits the index orders or gathers in the time it
+/// takes to read and check an event, about.
+const HITS_PER_READ: u64 = 500;
+
+/// How many threads one search's segments are searched with.
+const SEARCH_THREADS: usize = 8;
 
 /// The share of the index a search's kinds must make up to be checked hit
 /// by hit rather than looked up. Any filter a search's terms are looked up
@@ -189,11 +199,39 @@ pub fn matches(terms: &[String], excluded: &[Vec<String>], view: &EventView) -> 
     if terms.is_empty() && excluded.is_empty() {
         return true;
     }
-    let have: HashSet<String> = tokens(&text(view)).into_iter().collect();
-    terms.iter().all(|term| have.contains(term))
-        && !excluded
+    let text = text(view);
+    // Which of the terms, and of each excluded group's, the text has.
+    let mut have = vec![false; terms.len()];
+    let mut have_excluded: Vec<Vec<bool>> = excluded
+        .iter()
+        .map(|group| vec![false; group.len()])
+        .collect();
+    let mut wanting = terms.len();
+    TOKENIZER.with_borrow_mut(|analyzer| {
+        let mut stream = analyzer.token_stream(&text);
+        while stream.advance() {
+            let token = stream.token().text.as_str();
+            for (term, have) in terms.iter().zip(&mut have) {
+                if !*have && term == token {
+                    *have = true;
+                    wanting -= 1;
+                }
+            }
+            for (group, have) in excluded.iter().zip(&mut have_excluded) {
+                for (term, have) in group.iter().zip(have) {
+                    *have |= term == token;
+                }
+            }
+            // Only the rest of the text could bring in an excluded word.
+            if wanting == 0 && excluded.is_empty() {
+                break;
+            }
+        }
+    });
+    wanting == 0
+        && !have_excluded
             .iter()
-            .any(|group| group.iter().all(|term| have.contains(term)))
+            .any(|group| group.iter().all(|&have| have))
 }
 
 /// What autocomplete matches: a profile's names and any event's title.
@@ -300,6 +338,9 @@ pub struct SearchIndex {
     /// Every event stored below this sequence number is visible to the
     /// reader (or no longer stored).
     indexed: AtomicU64,
+    /// The fast field columns opened, by segment and field, which opening
+    /// for every search would cost a good part of it.
+    columns: Mutex<HashMap<(SegmentId, &'static str), Column<u64>>>,
 }
 
 impl SearchIndex {
@@ -335,7 +376,7 @@ impl SearchIndex {
                 }
             }
         }
-        let (index, next_seq) = match opened {
+        let (mut index, next_seq) = match opened {
             Some(opened) => opened,
             None => {
                 std::fs::create_dir_all(dir).with_context(|| {
@@ -345,6 +386,7 @@ impl SearchIndex {
             }
         };
         index.tokenizers().register(ANALYZER, analyzer());
+        index.set_multithread_executor(SEARCH_THREADS)?;
 
         let field = |name| schema.get_field(name).expect("a field of the schema");
         let fields = Fields {
@@ -364,6 +406,7 @@ impl SearchIndex {
             fields,
             kinds,
             indexed: AtomicU64::new(next_seq),
+            columns: Mutex::default(),
         });
         let indexer = Indexer {
             writer: index.writer(WRITER_MEMORY)?,
@@ -430,7 +473,7 @@ impl SearchIndex {
 
     /// The query for a search filter. With `kinds` false, kinds are left
     /// for the caller to check.
-    fn query(&self, filter: &Filter, search: &Search, kinds: bool) -> BooleanQuery {
+    fn query(&self, filter: &Filter, search: &Search, kinds: bool) -> Box<dyn Query> {
         let f = self.fields;
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = search
             .terms
@@ -485,7 +528,13 @@ impl SearchIndex {
                 Box::new(RangeQuery::new(bound(filter.since), bound(filter.until))),
             ));
         }
-        BooleanQuery::new(clauses)
+        // A term alone has the best found by skipping blocks of its postings
+        // that can't score among them, which a boolean query of one term
+        // doesn't do.
+        if let [(Occur::Must, _)] = clauses.as_slice() {
+            return clauses.pop().expect("a clause").1;
+        }
+        Box::new(BooleanQuery::new(clauses))
     }
 
     /// Run a search filter: the best matches by relevance, or with
@@ -502,6 +551,9 @@ impl SearchIndex {
         // In this order, so the searcher has everything below `indexed`.
         let indexed = self.indexed.load(Ordering::Acquire);
         let searcher = self.reader.searcher();
+        if let Some(found) = self.walk_common(store, txn, &searcher, filter, search, limit)? {
+            return Ok(found);
+        }
         let mut unindexed = unindexed(store, txn, indexed, filter)?;
         // The searcher may have some of those too.
         let mut seen: HashSet<u64> = unindexed.iter().map(|(seq, _)| *seq).collect();
@@ -517,9 +569,47 @@ impl SearchIndex {
         let query = self.query(filter, search, checked.is_none());
         let mut columns: HashMap<u32, Column<u64>> = HashMap::new();
         let mut kind_columns: HashMap<u32, Column<u64>> = HashMap::new();
+        if search.sort.is_ranked() {
+            let count = searcher.search(&query, &Count)?;
+            if count <= crate::rank::MAX_CANDIDATES {
+                let kinds = checked
+                    .as_ref()
+                    .map(|kinds| kinds.iter().copied().collect());
+                let collector = Seqs { index: self, kinds };
+                let mut candidates = searcher.search(&query, &collector)?;
+                candidates.extend(seen.iter().copied());
+                candidates.sort_unstable();
+                candidates.dedup();
+                // As many as ranking the newest matches reads.
+                let direct = candidates.len().min(MAX_HITS);
+                let fill = crate::rank::newest_of(filter, search.distinct_author);
+                let cancel = CancellationToken::new();
+                let best = crate::rank::best_among(
+                    store,
+                    txn,
+                    filter,
+                    &candidates,
+                    // Autocomplete prefixes past MAX_PREFIX aren't indexed.
+                    !search.autocomplete,
+                    direct,
+                    &fill,
+                    WALK_BUDGET,
+                    limit,
+                    &cancel,
+                )?;
+                if let Some(found) = best {
+                    return Ok(found);
+                }
+            }
+        }
         let mut hits = Vec::new();
         let mut offset = 0;
-        let mut page = (limit * 2).max(32);
+        // Ranked searches take every match, up to MAX_HITS, so at once:
+        // each page orders every match again.
+        let mut page = match search.sort.is_ranked() {
+            true => MAX_HITS,
+            false => (limit * 2).max(32),
+        };
         loop {
             let top = TopDocs::with_limit(page).and_offset(offset);
             // Ranked searches rank every match, so take them newest first.
@@ -536,12 +626,12 @@ impl SearchIndex {
             let count = page_hits.len();
             for (score, address) in page_hits {
                 if let Some(kinds) = &checked
-                    && !column_value(&searcher, &mut kind_columns, "kind", address)?
+                    && !column_value(self, &searcher, &mut kind_columns, "kind", address)?
                         .is_some_and(|kind| kinds.contains(&kind))
                 {
                     continue;
                 }
-                let Some(seq) = seq_of(&searcher, &mut columns, address)? else {
+                let Some(seq) = seq_of(self, &searcher, &mut columns, address)? else {
                     continue;
                 };
                 if !seen.insert(seq) {
@@ -593,6 +683,77 @@ impl SearchIndex {
 }
 
 impl SearchIndex {
+    /// A segment's fast field column, opened once.
+    fn column(&self, segment: &SegmentReader, field: &'static str) -> tantivy::Result<Column<u64>> {
+        let key = (segment.segment_id(), field);
+        if let Some(column) = self
+            .columns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(column.clone());
+        }
+        let column = segment.fast_fields().u64(field)?;
+        let mut columns = self.columns.lock().unwrap_or_else(|e| e.into_inner());
+        columns.insert(key, column.clone());
+        Ok(column)
+    }
+
+    /// Close the columns of segments merged away.
+    fn forget_merged(&self) {
+        let searcher = self.reader.searcher();
+        let live: HashSet<SegmentId> = searcher
+            .segment_readers()
+            .iter()
+            .map(SegmentReader::segment_id)
+            .collect();
+        let mut columns = self.columns.lock().unwrap_or_else(|e| e.into_inner());
+        columns.retain(|(segment, _), _| live.contains(segment));
+    }
+
+    /// A `sort:new` or ranked search for words common enough that reading
+    /// events newest or best first from the LMDB, checking their text, finds
+    /// its matches sooner than looking them up, which orders every match
+    /// by time first. None if they aren't, or that doesn't find them within
+    /// [`WALK_BUDGET`] events.
+    fn walk_common<'t>(
+        &self,
+        store: &Store,
+        txn: &'t Txn,
+        searcher: &Searcher,
+        filter: &Filter,
+        search: &Search,
+        limit: usize,
+    ) -> anyhow::Result<Option<Vec<(u64, EventView<'t>)>>> {
+        if search.sort == Sort::Relevance {
+            return Ok(None);
+        }
+        let field = match search.autocomplete {
+            true => self.fields.names,
+            false => self.fields.text,
+        };
+        let mut rarest = u64::MAX;
+        for term in &search.terms {
+            let term = match search.autocomplete {
+                true => prefix(term),
+                false => term,
+            };
+            rarest = rarest.min(searcher.doc_freq(&Term::from_field_text(field, term))?);
+        }
+        // About how many events are read to find enough, at best, against
+        // what the index would read of every match.
+        let reads = (limit as u64).saturating_mul(searcher.num_docs() / rarest.max(1));
+        if reads > WALK_BUDGET as u64 || reads.saturating_mul(HITS_PER_READ) > rarest {
+            return Ok(None);
+        }
+        let cancel = CancellationToken::new();
+        Ok(match search.sort.is_ranked() {
+            true => crate::rank::walk_matching(store, txn, filter, limit, WALK_BUDGET, &cancel)?,
+            false => crate::query::newest(store, txn, filter, limit, WALK_BUDGET, &cancel)?,
+        })
+    }
+
     /// The kinds a search's hits are to be checked against one by one,
     /// rather than looked up with its terms: those of a filter that asks
     /// for kinds making up most of the index.
@@ -635,7 +796,7 @@ impl SearchIndex {
         }
         let mut columns = HashMap::new();
         for address in searcher.search(&query, &DocSetCollector)? {
-            let Some(seq) = seq_of(&searcher, &mut columns, address)? else {
+            let Some(seq) = seq_of(self, &searcher, &mut columns, address)? else {
                 continue;
             };
             if out.contains(&seq) {
@@ -649,6 +810,82 @@ impl SearchIndex {
             }
         }
         Ok(())
+    }
+}
+
+/// Collects the sequence numbers of every hit, reading their columns a block
+/// of hits at a time; with `kinds`, only of hits of those kinds.
+struct Seqs<'a> {
+    index: &'a SearchIndex,
+    kinds: Option<Arc<[u64]>>,
+}
+
+struct SegmentSeqs {
+    seq: Column<u64>,
+    kind: Option<(Column<u64>, Arc<[u64]>)>,
+    seqs: Vec<Option<u64>>,
+    kinds: Vec<Option<u64>>,
+    found: Vec<u64>,
+}
+
+impl Collector for Seqs<'_> {
+    type Fruit = Vec<u64>;
+    type Child = SegmentSeqs;
+
+    fn for_segment(
+        &self,
+        _: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<SegmentSeqs> {
+        let kind = match &self.kinds {
+            Some(kinds) => Some((self.index.column(segment, "kind")?, kinds.clone())),
+            None => None,
+        };
+        Ok(SegmentSeqs {
+            seq: self.index.column(segment, "seq")?,
+            kind,
+            seqs: Vec::new(),
+            kinds: Vec::new(),
+            found: Vec::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(&self, fruits: Vec<Vec<u64>>) -> tantivy::Result<Vec<u64>> {
+        Ok(fruits.concat())
+    }
+}
+
+impl SegmentCollector for SegmentSeqs {
+    type Fruit = Vec<u64>;
+
+    fn collect(&mut self, doc: DocId, _: Score) {
+        self.collect_block(&[doc]);
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.seqs.resize(docs.len(), None);
+        self.seq.first_vals(docs, &mut self.seqs);
+        if let Some((column, wanted)) = &self.kind {
+            self.kinds.resize(docs.len(), None);
+            column.first_vals(docs, &mut self.kinds);
+            for (seq, kind) in self.seqs.iter().zip(&self.kinds) {
+                if let (Some(seq), Some(kind)) = (seq, kind)
+                    && wanted.contains(kind)
+                {
+                    self.found.push(*seq);
+                }
+            }
+        } else {
+            self.found.extend(self.seqs.iter().flatten());
+        }
+    }
+
+    fn harvest(self) -> Vec<u64> {
+        self.found
     }
 }
 
@@ -741,31 +978,30 @@ fn unindexed<'t>(
     Ok(found)
 }
 
-/// The sequence number of a hit, reading each segment's column once.
+/// The sequence number of a hit, looking each segment's column up once.
 fn seq_of(
+    index: &SearchIndex,
     searcher: &Searcher,
     columns: &mut HashMap<u32, Column<u64>>,
     address: DocAddress,
 ) -> anyhow::Result<Option<u64>> {
-    column_value(searcher, columns, "seq", address)
+    column_value(index, searcher, columns, "seq", address)
 }
 
-/// A hit's value of the fast field `field`, reading each segment's column
-/// once.
+/// A hit's value of the fast field `field`, looking each segment's column
+/// up once.
 fn column_value(
+    index: &SearchIndex,
     searcher: &Searcher,
     columns: &mut HashMap<u32, Column<u64>>,
-    field: &str,
+    field: &'static str,
     address: DocAddress,
 ) -> anyhow::Result<Option<u64>> {
     let column = match columns.entry(address.segment_ord) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-        std::collections::hash_map::Entry::Vacant(e) => e.insert(
-            searcher
-                .segment_reader(address.segment_ord)
-                .fast_fields()
-                .u64(field)?,
-        ),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(index.column(searcher.segment_reader(address.segment_ord), field)?)
+        }
     };
     Ok(column.first(address.doc_id))
 }
@@ -851,6 +1087,7 @@ impl Indexer {
         commit.set_payload(&serde_json::to_string(&payload)?);
         commit.commit()?;
         self.search.reader.reload()?;
+        self.search.forget_merged();
         self.search.indexed.store(self.next_seq, Ordering::Release);
         self.dirty = false;
         Ok(())
@@ -1469,9 +1706,11 @@ mod tests {
                     terms.push(format!("-{}", words[rng.random_range(0..words.len())]));
                 }
             }
+            // Nothing's engaged with, so ranked is newest first too.
+            let sort = ["sort:new", "sort:hot", "sort:top"][rng.random_range(0..3)];
             let mut extensions = match autocomplete {
-                true => "sort:new autocomplete:true".to_string(),
-                false => "sort:new".to_string(),
+                true => format!("{sort} autocomplete:true"),
+                false => sort.to_string(),
             };
             if rng.random_bool(0.3) {
                 let conditions = [

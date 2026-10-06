@@ -555,6 +555,13 @@ impl<'t> Cursor<'t> {
         Ok(self.op(None, None, ffi::MDB_NEXT_MULTIPLE)?.map(|(_, v)| v))
     }
 
+    /// The page of the current key's values before the one
+    /// [`get_multiple`](Self::get_multiple) or this last returned, as
+    /// that returns them.
+    pub fn prev_multiple(&mut self) -> Result<Option<&'t [u8]>> {
+        Ok(self.op(None, None, ffi::MDB_PREV_MULTIPLE)?.map(|(_, v)| v))
+    }
+
     /// How many values the current key has.
     pub fn count(&mut self) -> Result<usize> {
         let mut count = 0;

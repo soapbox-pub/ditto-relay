@@ -171,17 +171,85 @@ pub fn run_filter<'t>(
         }
     } else {
         let plan = plan(store, txn, filter)?;
-        scan(store, txn, filter, &plan, limit, cancel, &mut found)?;
+        if scan(
+            store,
+            txn,
+            filter,
+            &plan,
+            limit,
+            MAX_EXAMINED,
+            cancel,
+            &mut found,
+        )? {
+            METRICS.filters_cut_short.inc();
+        }
     }
+    Ok(newest_first(found, limit))
+}
 
-    // Newest first; on a tie, the lowest id first (NIP-01).
+/// A filter's newest matches, as [`run_filter`] finds them, if it finds
+/// them all by examining at most `budget` records. A search's text is
+/// checked event by event, which for a common term is quicker than
+/// looking it up, and finds what isn't searchable yet too.
+pub fn newest<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    filter: &Filter,
+    limit: usize,
+    budget: usize,
+    cancel: &CancellationToken,
+) -> Result<Option<Vec<(u64, EventView<'t>)>>> {
+    if filter.ids.is_some() {
+        return run_filter(store, txn, filter, limit, cancel).map(Some);
+    }
+    let plan = plan(store, txn, filter)?;
+    let mut found = Vec::new();
+    if scan(store, txn, filter, &plan, limit, budget, cancel, &mut found)? {
+        return Ok(None);
+    }
+    Ok(Some(newest_first(found, limit)))
+}
+
+/// Newest first; on a tie, the lowest id first (NIP-01). Up to `limit`.
+fn newest_first(mut found: Vec<(u64, EventView<'_>)>, limit: usize) -> Vec<(u64, EventView<'_>)> {
     found.sort_unstable_by(|(_, a), (_, b)| {
         b.created_at()
             .cmp(&a.created_at())
             .then_with(|| a.id().cmp(b.id()))
     });
     found.truncate(limit);
-    Ok(found)
+    found
+}
+
+/// The sequence numbers of every event the index entries a filter would be
+/// answered from point to, within its time bounds, without reading any
+/// records: a superset of its matches, sorted. None if there are more than
+/// `max`, or it names ids.
+pub fn candidates(
+    store: &Store,
+    txn: &Txn,
+    filter: &Filter,
+    max: usize,
+) -> Result<Option<Vec<u64>>> {
+    if filter.ids.is_some() {
+        return Ok(None);
+    }
+    let plan = plan(store, txn, filter)?;
+    if cost(txn, &plan, max + 1)? > max {
+        return Ok(None);
+    }
+    let mut seqs = Vec::new();
+    for key in &plan.keys {
+        each_stamp(txn, plan.db, key, filter.since, filter.until, |entry| {
+            if plan.wants(entry) {
+                seqs.push(stamp_seq(entry));
+            }
+            true
+        })?;
+    }
+    seqs.sort_unstable();
+    seqs.dedup();
+    Ok(Some(seqs))
 }
 
 #[derive(Debug)]
@@ -424,15 +492,19 @@ impl<'t, 'p> Source<'t, 'p> {
     }
 }
 
+/// Find a plan's newest matches, examining at most `max_examined` records.
+/// Returns whether it stopped for that, short of the limit.
+#[allow(clippy::too_many_arguments)]
 fn scan<'t>(
     store: &Store,
     txn: &'t Txn,
     filter: &Filter,
     plan: &Plan,
     limit: usize,
+    max_examined: usize,
     cancel: &CancellationToken,
     found: &mut Vec<(u64, EventView<'t>)>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut sources = Vec::new();
     let mut heap = BinaryHeap::new();
     for key in &plan.keys {
@@ -446,6 +518,7 @@ fn scan<'t>(
     let mut authors = HashSet::new();
     let mut last = None;
     let mut examined = 0;
+    let mut cut_short = false;
     while let Some((stamp, i)) = heap.pop() {
         if let Some(next) = sources[i].next()? {
             heap.push((next, i));
@@ -470,8 +543,8 @@ fn scan<'t>(
             break;
         }
         examined += 1;
-        if examined > MAX_EXAMINED {
-            METRICS.filters_cut_short.inc();
+        if examined > max_examined {
+            cut_short = true;
             break;
         }
         if examined % CANCEL_CHECK == 0 && cancel.is_cancelled() {
@@ -488,8 +561,8 @@ fn scan<'t>(
     }
     METRICS
         .events_examined
-        .add(examined.min(MAX_EXAMINED) as u64);
-    Ok(())
+        .add(examined.min(max_examined) as u64);
+    Ok(cut_short)
 }
 
 /// What a NIP-45 count found.
