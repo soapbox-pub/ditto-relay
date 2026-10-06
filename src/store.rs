@@ -163,6 +163,9 @@ const DELETION_FILTER_BITS: u64 = 1 << 31;
 /// The deletion filter's file, in the database's directory.
 const DELETION_FILTER_FILE: &str = "deletions.bloom";
 
+/// How many deletions the filter is caught up with per read transaction.
+const CATCH_UP_CHUNK: usize = if cfg!(test) { 2 } else { 10_000 };
+
 /// How often the writer saves the deletion filter.
 const DELETION_FILTER_SAVE_INTERVAL: Duration = Duration::from_secs(600);
 
@@ -923,39 +926,52 @@ impl Store {
         if self.deletions.is_ready() {
             return Ok(added);
         }
-        let txn = self.read()?;
         for kind in [DELETION, VANISH] {
-            let mut failed = None;
-            each_stamp(
-                &txn,
-                self.tables.kinds,
-                &kind.to_be_bytes(),
-                0,
-                u32::MAX,
-                |stamp| {
-                    let seq = stamp_seq(stamp);
-                    if seq < self.deletions_from {
-                        return true;
-                    }
-                    match txn.get(self.tables.events, &seq.to_ne_bytes()) {
-                        Ok(record) => {
-                            if let Some(view) = record.and_then(EventView::new) {
-                                for key in self.deletion_keys(&view) {
-                                    self.deletions.add(&key);
+            // A read transaction at a time keeps what's freed meanwhile
+            // from being reused, so the map grows, and the pages are
+            // reused later, once they've left memory: a chunk at a time.
+            let mut after: Option<Stamp> = None;
+            loop {
+                let txn = self.read()?;
+                let (mut last, mut steps, mut failed) = (None, 0, None);
+                let since = after.map_or(0, |after| stamp_created_at(&after));
+                each_stamp(
+                    &txn,
+                    self.tables.kinds,
+                    &kind.to_be_bytes(),
+                    since,
+                    u32::MAX,
+                    |entry| {
+                        let stamp: Stamp = entry[..STAMP_LEN].try_into().expect("a stamp");
+                        if after.is_some_and(|after| stamp <= after) {
+                            return true;
+                        }
+                        last = Some(stamp);
+                        steps += 1;
+                        let seq = stamp_seq(&stamp);
+                        if seq >= self.deletions_from {
+                            match txn.get(self.tables.events, &seq.to_ne_bytes()) {
+                                Ok(record) => {
+                                    if let Some(view) = record.and_then(EventView::new) {
+                                        for key in self.deletion_keys(&view) {
+                                            self.deletions.add(&key);
+                                        }
+                                        added += 1;
+                                    }
                                 }
-                                added += 1;
+                                Err(err) => failed = Some(err),
                             }
-                            true
                         }
-                        Err(err) => {
-                            failed = Some(err);
-                            false
-                        }
-                    }
-                },
-            )?;
-            if let Some(err) = failed {
-                return Err(err);
+                        failed.is_none() && steps < CATCH_UP_CHUNK
+                    },
+                )?;
+                if let Some(err) = failed {
+                    return Err(err);
+                }
+                match last {
+                    Some(last) => after = Some(last),
+                    None => break,
+                }
             }
         }
         self.deletions.set_ready();
@@ -2358,10 +2374,17 @@ pub mod tests {
             &store,
             &signed(2, 200, 62, vec![vec!["relay", "ALL_RELAYS"]], ""),
         );
+        // More than a chunk of them at one time.
+        let others: Vec<Event> = (0..3)
+            .map(|n| signed(3, 100, 1, vec![], &n.to_string()))
+            .collect();
+        for other in &others {
+            put(&store, &signed(3, 200, 5, vec![vec!["e", &other.id]], ""));
+        }
         drop(store);
 
         let refused = |store: &Store| {
-            for event in [&note, &profile, &bobs] {
+            for event in [&note, &profile, &bobs].into_iter().chain(&others) {
                 assert_eq!(put(store, event), Outcome::Deleted);
             }
         };
@@ -2369,8 +2392,8 @@ pub mod tests {
         assert_eq!(store.deletion_filter(), (1, false));
         refused(&store);
         // Only what was stored since it was saved.
-        assert_eq!(store.catch_up_deletions().unwrap(), 2);
-        assert_eq!(store.deletion_filter(), (3, true));
+        assert_eq!(store.catch_up_deletions().unwrap(), 5);
+        assert_eq!(store.deletion_filter(), (6, true));
         refused(&store);
         assert!(matches!(
             put(&store, &signed(3, 100, 1, vec![], "fine")),
@@ -2381,7 +2404,7 @@ pub mod tests {
         store.save_deletions(committed(&store).unwrap()).unwrap();
         drop(store);
         let store = reopen();
-        assert_eq!(store.deletion_filter(), (3, true));
+        assert_eq!(store.deletion_filter(), (6, true));
         refused(&store);
     }
 
