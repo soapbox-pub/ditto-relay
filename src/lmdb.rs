@@ -6,6 +6,15 @@
 //! whose key is stored once and whose entries are packed fixed-size values,
 //! which is several times smaller than one key per entry.
 //!
+//! An [`Env`] may be several LMDB environments, each its own file, whose
+//! tables are used as one: a transaction spans them all, and each [`Db`]
+//! knows which it's in. Read transactions begin in the order the
+//! environments were opened, and write transactions commit in the reverse,
+//! so a reader sees everything the first environment's tables point to in
+//! the others, as long as writers put it there in the same transaction. A
+//! crash between the commits can leave the later environments with writes
+//! the first never committed: callers must cope with those.
+//!
 //! All the `unsafe` in the crate lives here.
 
 use std::ffi::{CStr, CString};
@@ -116,9 +125,15 @@ impl DbFlags {
     }
 }
 
-/// A table within an [`Env`].
+/// A table within one of an [`Env`]'s environments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Db(ffi::MDB_dbi);
+pub struct Db {
+    dbi: ffi::MDB_dbi,
+    env: usize,
+}
+
+/// The most environments an [`Env`] holds.
+const MAX_ENVS: usize = 2;
 
 /// See [`Env::usage`].
 pub struct Usage {
@@ -127,7 +142,7 @@ pub struct Usage {
 }
 
 pub struct Env {
-    ptr: *mut ffi::MDB_env,
+    ptrs: Vec<*mut ffi::MDB_env>,
 }
 
 // SAFETY: an MDB_env is safe to share between threads; transactions opened
@@ -146,61 +161,108 @@ impl Env {
         max_dbs: u32,
         max_readers: u32,
     ) -> Result<Env> {
+        let mut env = Env { ptrs: Vec::new() };
+        // Writing each dirty page with its own pwrite, as LMDB otherwise
+        // does, is most of what a commit costs, and on ZFS most of what
+        // the writer does. Writing into the map instead, the kernel
+        // flushes a page rewritten by many commits once.
+        let flags = match sync {
+            true => 0,
+            false => ffi::MDB_WRITEMAP | ffi::MDB_MAPASYNC,
+        };
+        env.add(path, map_size, flags, max_dbs, max_readers)?;
+        Ok(env)
+    }
+
+    /// Open (creating if need be) another environment, in the directory
+    /// `path`, whose tables share this one's transactions, returning which
+    /// it is for [`create_db_in`](Self::create_db_in). It's for tables
+    /// written in order, mostly appended to: the pages a commit writes are
+    /// together, so they're written with a single call, not one each, and
+    /// never read first, as writing into the map would. Without `sync`,
+    /// commits aren't flushed to disk before they return.
+    pub fn attach(
+        &mut self,
+        path: &Path,
+        map_size: usize,
+        sync: bool,
+        max_dbs: u32,
+        max_readers: u32,
+    ) -> Result<usize> {
+        assert!(self.ptrs.len() < MAX_ENVS, "too many environments");
+        let flags = match sync {
+            true => 0,
+            false => ffi::MDB_NOSYNC,
+        };
+        self.add(path, map_size, flags, max_dbs, max_readers)?;
+        Ok(self.ptrs.len() - 1)
+    }
+
+    fn add(
+        &mut self,
+        path: &Path,
+        map_size: usize,
+        flags: u32,
+        max_dbs: u32,
+        max_readers: u32,
+    ) -> Result<()> {
         let path =
             CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
         let mut ptr = ptr::null_mut();
-        // SAFETY: plain FFI calls in the documented order; the env is closed if any fails.
+        // SAFETY: plain FFI calls in the documented order; the env is closed
+        // by Drop if any fails, once it's in `ptrs`.
         unsafe {
             check(ffi::mdb_env_create(&mut ptr))?;
-            let env = Env { ptr };
+            self.ptrs.push(ptr);
             check(ffi::mdb_env_set_mapsize(ptr, map_size))?;
             check(ffi::mdb_env_set_maxdbs(ptr, max_dbs))?;
             check(ffi::mdb_env_set_maxreaders(ptr, max_readers))?;
             // NOTLS: read transactions belong to no thread, so they can run on
             // any blocking-pool thread. NORDAHEAD: lookups are random, so
             // read-ahead mostly wastes page cache once the map outgrows RAM.
-            let mut flags = ffi::MDB_NOTLS | ffi::MDB_NORDAHEAD;
-            if !sync {
-                // Writing each dirty page with its own pwrite, as LMDB
-                // otherwise does, is most of what a commit costs, and on
-                // ZFS most of what the writer does. Writing into the map
-                // instead, the kernel flushes a page rewritten by many
-                // commits once.
-                flags |= ffi::MDB_WRITEMAP | ffi::MDB_MAPASYNC;
-            }
-            check(ffi::mdb_env_open(ptr, path.as_ptr(), flags, 0o600))?;
-            Ok(env)
+            let flags = flags | ffi::MDB_NOTLS | ffi::MDB_NORDAHEAD;
+            check(ffi::mdb_env_open(ptr, path.as_ptr(), flags, 0o600))
         }
     }
 
     /// Open a table, creating it if need be. Call these at startup, before
     /// any other transaction: LMDB forbids opening tables concurrently.
     pub fn create_db(&self, name: &str, flags: DbFlags) -> Result<Db> {
+        self.create_db_in(0, name, flags)
+    }
+
+    /// Open a table in the environment `env`, as [`create_db`](Self::create_db).
+    pub fn create_db_in(&self, env: usize, name: &str, flags: DbFlags) -> Result<Db> {
         let name = CString::new(name).map_err(|_| Error(libc::EINVAL))?;
         let txn = self.write_txn()?;
         let mut dbi = 0;
         // SAFETY: a live write transaction and a NUL-terminated name.
-        check(unsafe { ffi::mdb_dbi_open(txn.0.ptr, name.as_ptr(), flags.bits(), &mut dbi) })?;
+        check(unsafe {
+            ffi::mdb_dbi_open(txn.0.ptrs[env], name.as_ptr(), flags.bits(), &mut dbi)
+        })?;
         txn.commit()?;
-        Ok(Db(dbi))
+        Ok(Db { dbi, env })
     }
 
-    /// Write a compacted copy of the environment into the directory `path`.
+    /// Write a compacted copy of the environment `env` into the directory
+    /// `path`.
     #[cfg(test)]
-    pub fn copy_compact(&self, path: &Path) -> Result<()> {
+    pub fn copy_compact(&self, env: usize, path: &Path) -> Result<()> {
         let path =
             CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
         // SAFETY: the env is open and the path NUL-terminated.
-        check(unsafe { ffi::mdb_env_copy2(self.ptr, path.as_ptr(), ffi::MDB_CP_COMPACT) })
+        check(unsafe { ffi::mdb_env_copy2(self.ptrs[env], path.as_ptr(), ffi::MDB_CP_COMPACT) })
     }
 
-    /// How big the map is, and how much of it is used, in bytes.
-    pub fn usage(&self) -> Result<Usage> {
+    /// How big the environment `env`'s map is, and how much of it is used,
+    /// in bytes.
+    pub fn usage(&self, env: usize) -> Result<Usage> {
+        let ptr = self.ptrs[env];
         // SAFETY: plain data, filled in by LMDB from an open env.
         let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
         let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
-        check(unsafe { ffi::mdb_env_info(self.ptr, &mut info) })?;
-        check(unsafe { ffi::mdb_env_stat(self.ptr, &mut stat) })?;
+        check(unsafe { ffi::mdb_env_info(ptr, &mut info) })?;
+        check(unsafe { ffi::mdb_env_stat(ptr, &mut stat) })?;
         Ok(Usage {
             map: info.me_mapsize as u64,
             used: (info.me_last_pgno as u64 + 1) * u64::from(stat.ms_psize),
@@ -215,21 +277,27 @@ impl Env {
         Ok(RwTxn(self.begin(0)?))
     }
 
+    /// A transaction in each environment, in the order they were opened.
     fn begin(&self, flags: u32) -> Result<Txn<'_>> {
-        let mut ptr = ptr::null_mut();
-        // SAFETY: the env is open; the transaction is freed by Txn's drop or commit.
-        check(unsafe { ffi::mdb_txn_begin(self.ptr, ptr::null_mut(), flags, &mut ptr) })?;
-        Ok(Txn {
-            ptr,
+        let mut txn = Txn {
+            ptrs: [ptr::null_mut(); MAX_ENVS],
             _env: PhantomData,
-        })
+        };
+        for (env, slot) in self.ptrs.iter().zip(&mut txn.ptrs) {
+            // SAFETY: the env is open; the transaction is freed by Txn's
+            // drop or commit, those already begun too if this fails.
+            check(unsafe { ffi::mdb_txn_begin(*env, ptr::null_mut(), flags, slot) })?;
+        }
+        Ok(txn)
     }
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
-        // SAFETY: every transaction borrows the env, so none outlives it.
-        unsafe { ffi::mdb_env_close(self.ptr) }
+        for &ptr in &self.ptrs {
+            // SAFETY: every transaction borrows the env, so none outlives it.
+            unsafe { ffi::mdb_env_close(ptr) }
+        }
     }
 }
 
@@ -237,16 +305,22 @@ impl Drop for Env {
 /// borrow the transaction, so a write (which takes `&mut`) can't leave one
 /// dangling.
 pub struct Txn<'env> {
-    ptr: *mut ffi::MDB_txn,
+    /// One per environment, null past the last.
+    ptrs: [*mut ffi::MDB_txn; MAX_ENVS],
     _env: PhantomData<&'env Env>,
 }
 
 impl Txn<'_> {
+    /// The transaction in `db`'s environment.
+    fn of(&self, db: Db) -> *mut ffi::MDB_txn {
+        self.ptrs[db.env]
+    }
+
     pub fn get(&self, db: Db, key: &[u8]) -> Result<Option<&[u8]>> {
         let (mut k, mut v) = (val(key), empty());
         // SAFETY: a live transaction; the value is valid while `self` is borrowed.
         Ok(
-            found(unsafe { ffi::mdb_get(self.ptr, db.0, &mut k, &mut v) })?
+            found(unsafe { ffi::mdb_get(self.of(db), db.dbi, &mut k, &mut v) })?
                 .map(|()| unsafe { bytes(&v) }),
         )
     }
@@ -254,7 +328,7 @@ impl Txn<'_> {
     pub fn cursor(&self, db: Db) -> Result<Cursor<'_>> {
         let mut ptr = ptr::null_mut();
         // SAFETY: a live transaction; the cursor is closed on drop, before the txn ends.
-        check(unsafe { ffi::mdb_cursor_open(self.ptr, db.0, &mut ptr) })?;
+        check(unsafe { ffi::mdb_cursor_open(self.of(db), db.dbi, &mut ptr) })?;
         Ok(Cursor {
             ptr,
             _txn: PhantomData,
@@ -265,16 +339,18 @@ impl Txn<'_> {
     pub fn len(&self, db: Db) -> Result<usize> {
         // SAFETY: MDB_stat is plain data, filled in by LMDB.
         let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
-        check(unsafe { ffi::mdb_stat(self.ptr, db.0, &mut stat) })?;
+        check(unsafe { ffi::mdb_stat(self.of(db), db.dbi, &mut stat) })?;
         Ok(stat.ms_entries)
     }
 }
 
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // SAFETY: not yet committed or aborted.
-            unsafe { ffi::mdb_txn_abort(self.ptr) }
+        for &ptr in &self.ptrs {
+            if !ptr.is_null() {
+                // SAFETY: not yet committed or aborted.
+                unsafe { ffi::mdb_txn_abort(ptr) }
+            }
         }
     }
 }
@@ -311,10 +387,17 @@ impl RwTxn<'_> {
         self.put_flags(db, key, value, ffi::MDB_NODUPDATA)
     }
 
+    /// Store `value` under `key`, which must sort after every key in the
+    /// table. LMDB then fills pages rather than splitting them in half.
+    /// Returns `false`, writing nothing, if it doesn't.
+    pub fn append(&mut self, db: Db, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.put_flags(db, key, value, ffi::MDB_APPEND)
+    }
+
     fn put_flags(&mut self, db: Db, key: &[u8], value: &[u8], flags: u32) -> Result<bool> {
         let (mut k, mut v) = (val(key), val(value));
         // SAFETY: a live write transaction, and `&mut self` keeps no reads alive.
-        match unsafe { ffi::mdb_put(self.0.ptr, db.0, &mut k, &mut v, flags) } {
+        match unsafe { ffi::mdb_put(self.0.of(db), db.dbi, &mut k, &mut v, flags) } {
             ffi::MDB_KEYEXIST => Ok(false),
             code => check(code).map(|()| true),
         }
@@ -327,21 +410,29 @@ impl RwTxn<'_> {
         let mut v = value.map(val);
         let v_ptr = v.as_mut().map_or(ptr::null_mut(), |v| v as *mut _);
         // SAFETY: a live write transaction; a null data pointer means "every value".
-        Ok(found(unsafe { ffi::mdb_del(self.0.ptr, db.0, &mut k, v_ptr) })?.is_some())
+        Ok(found(unsafe { ffi::mdb_del(self.0.of(db), db.dbi, &mut k, v_ptr) })?.is_some())
     }
 
     /// Remove every entry of a table, keeping the table.
     pub fn clear(&mut self, db: Db) -> Result<()> {
         // SAFETY: a live write transaction; 0 empties the table without
         // closing its handle.
-        check(unsafe { ffi::mdb_drop(self.0.ptr, db.0, 0) })
+        check(unsafe { ffi::mdb_drop(self.0.of(db), db.dbi, 0) })
     }
 
+    /// Commit, the last environment opened first. If one fails, those not
+    /// yet committed are aborted.
     pub fn commit(mut self) -> Result<()> {
-        let ptr = std::mem::replace(&mut self.0.ptr, ptr::null_mut());
-        // SAFETY: commit frees the transaction whatever it returns, so it's
-        // nulled first to keep Drop from aborting it again.
-        check(unsafe { ffi::mdb_txn_commit(ptr) })
+        for slot in self.0.ptrs.iter_mut().rev() {
+            if slot.is_null() {
+                continue;
+            }
+            let ptr = std::mem::replace(slot, ptr::null_mut());
+            // SAFETY: commit frees the transaction whatever it returns, so
+            // it's nulled first to keep Drop from aborting it again.
+            check(unsafe { ffi::mdb_txn_commit(ptr) })?;
+        }
+        Ok(())
     }
 }
 
@@ -475,6 +566,51 @@ mod tests {
         assert_eq!(
             env.read_txn().unwrap().get(db, b"a").unwrap(),
             Some(&b"2"[..])
+        );
+    }
+
+    /// A transaction spans every environment: committed together, and
+    /// dropped together.
+    #[test]
+    fn spans_environments() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let mut env = Env::open(dir.path(), 1 << 24, false, 4, 16).unwrap();
+        assert_eq!(env.attach(&other, 1 << 24, false, 4, 16).unwrap(), 1);
+        let main = env.create_db("main", DbFlags::PLAIN).unwrap();
+        let appended = env
+            .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
+            .unwrap();
+
+        let mut txn = env.write_txn().unwrap();
+        txn.put(main, b"a", b"1").unwrap();
+        assert!(txn.append(appended, &1u64.to_ne_bytes(), b"one").unwrap());
+        assert!(txn.append(appended, &2u64.to_ne_bytes(), b"two").unwrap());
+        // Only past the last key.
+        assert!(!txn.append(appended, &1u64.to_ne_bytes(), b"uno").unwrap());
+        drop(txn);
+        let txn = env.read_txn().unwrap();
+        assert_eq!(txn.len(main).unwrap() + txn.len(appended).unwrap(), 0);
+        drop(txn);
+
+        let mut txn = env.write_txn().unwrap();
+        txn.put(main, b"a", b"1").unwrap();
+        txn.append(appended, &1u64.to_ne_bytes(), b"one").unwrap();
+        txn.commit().unwrap();
+        drop(env);
+
+        let mut env = Env::open(dir.path(), 1 << 24, true, 4, 16).unwrap();
+        env.attach(&other, 1 << 24, true, 4, 16).unwrap();
+        let main = env.create_db("main", DbFlags::PLAIN).unwrap();
+        let appended = env
+            .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
+            .unwrap();
+        let txn = env.read_txn().unwrap();
+        assert_eq!(txn.get(main, b"a").unwrap(), Some(&b"1"[..]));
+        assert_eq!(
+            txn.get(appended, &1u64.to_ne_bytes()).unwrap(),
+            Some(&b"one"[..])
         );
     }
 

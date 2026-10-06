@@ -314,17 +314,24 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
         "Whether the deletion filter has caught up since startup; until then every deletion check searches LMDB.",
         f64::from(u8::from(ready)),
     );
-    out.one(
+    let (main, bodies) = usage;
+    out.metric(
         "lmdb_used_bytes",
         "gauge",
-        "How much of the LMDB map is used. Writes fail once it's full.",
-        usage.used as f64,
+        "How much of each LMDB environment's map is used: the indexes', and the event records'. Writes fail once one is full.",
+        &[
+            (r#"env="main""#, main.used as f64),
+            (r#"env="bodies""#, bodies.used as f64),
+        ],
     );
-    out.one(
+    out.metric(
         "lmdb_map_bytes",
         "gauge",
-        "How big the LMDB map is (RELAY_MAP_SIZE).",
-        usage.map as f64,
+        "How big each LMDB environment's map is (RELAY_MAP_SIZE).",
+        &[
+            (r#"env="main""#, main.map as f64),
+            (r#"env="bodies""#, bodies.map as f64),
+        ],
     );
     Ok(out.0)
 }
@@ -389,8 +396,17 @@ mod tests {
         assert_eq!(sample(&text, "ditto_relay_stored_events"), 2.0);
         assert_eq!(sample(&text, r#"ditto_relay_backlog{work="wot"}"#), 0.0);
         assert!(!text.contains(r#"work="search""#));
-        let used = sample(&text, "ditto_relay_lmdb_used_bytes");
-        assert!(0.0 < used && used <= sample(&text, "ditto_relay_lmdb_map_bytes"));
+        for env in ["main", "bodies"] {
+            let used = sample(
+                &text,
+                &format!(r#"ditto_relay_lmdb_used_bytes{{env="{env}"}}"#),
+            );
+            let map = sample(
+                &text,
+                &format!(r#"ditto_relay_lmdb_map_bytes{{env="{env}"}}"#),
+            );
+            assert!(0.0 < used && used <= map, "{env}");
+        }
         // Every sample is introduced by its HELP and TYPE.
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let name = line.split(['{', ' ']).next().unwrap();

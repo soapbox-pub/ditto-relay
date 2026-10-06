@@ -12,7 +12,7 @@
 //! | table           | key                          | value                  |
 //! |-----------------|------------------------------|------------------------|
 //! | `events`        | seq (native u64)             | record                 |
-//! | `ids`           | id prefix (8 bytes)          | seqs (u64 BE)          |
+//! | `ids`           | id                           | seq (u64 BE)           |
 //! | `created`       | `CREATED`                    | stamps                 |
 //! | `kinds`         | kind (u16 BE)                | stamps                 |
 //! | `authors`       | pubkey                       | stamp ‖ kind           |
@@ -33,9 +33,17 @@
 //! | `expiring`      | `EXPIRING`                   | expiry stamps          |
 //! | `meta`          | name                         | value                  |
 //!
-//! `ids` is keyed by a prefix of the id, a quarter its size; the record has
-//! the whole id, so a lookup checks there, and the rare prefix shared by two
-//! ids just means reading both records. `created` files every stamp under
+//! `events` is in an environment of its own, `bodies/` inside the database's
+//! directory, and every other table in the main one. Records are most of
+//! the data, written once, and read only to be sent or checked, so apart,
+//! the indexes the writer works on all the time stay small enough to stay
+//! in memory, and records are appended a commit at a time, in one write.
+//! See [`crate::lmdb`] for how the two are kept consistent; [`Store::open`]
+//! drops records a crash left behind, under sequence numbers never
+//! committed, and a record removed meanwhile is read as gone.
+//!
+//! `ids` is keyed by the whole id, so that whether an event is here doesn't
+//! need its record read. `created` files every stamp under
 //! one key, packed like the other indexes. `authors` follows each stamp with
 //! the event's kind (u16 BE), so authors with more kinds than `author_kinds`
 //! can be asked for at once are still answered from the index alone.
@@ -160,6 +168,9 @@ const EXPIRING: &[u8] = &[0];
 /// before it rules out much less than 99% of the rest.
 const DELETION_FILTER_BITS: u64 = 1 << 31;
 
+/// The directory, in the database's, of the environment records are kept in.
+const BODIES_DIR: &str = "bodies";
+
 /// The deletion filter's file, in the database's directory.
 const DELETION_FILTER_FILE: &str = "deletions.bloom";
 
@@ -171,9 +182,6 @@ const DELETION_FILTER_SAVE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// How often the writer sweeps away expired events.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
-
-/// The bytes of an id the `ids` table is keyed by.
-const ID_PREFIX: usize = 8;
 
 /// The most events committed in one write transaction. A batch is only what
 /// is already queued, so a big one doesn't keep events waiting that small
@@ -362,6 +370,8 @@ pub struct Store {
     history: History,
     wot: Option<Wot>,
     rank: Rank,
+    /// Which of `env`'s environments `events` is in.
+    bodies: usize,
     /// What [`is_deleted`](Self::is_deleted) can skip looking up.
     deletions: deletions::Filter,
     deletions_path: PathBuf,
@@ -383,11 +393,21 @@ impl Store {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("Could not create the database directory {}", dir.display())
         })?;
-        let env = Env::open(dir, map_size, sync, 32, 1024)
+        let mut env = Env::open(dir, map_size, sync, 32, 1024)
             .with_context(|| format!("Could not open the database at {}", dir.display()))?;
+        let bodies = dir.join(BODIES_DIR);
+        std::fs::create_dir_all(&bodies).with_context(|| {
+            format!(
+                "Could not create the database directory {}",
+                bodies.display()
+            )
+        })?;
+        let bodies = env
+            .attach(&bodies, map_size, sync, 1, 1024)
+            .with_context(|| format!("Could not open the database at {}", bodies.display()))?;
         let tables = Tables {
-            events: env.create_db("events", DbFlags::INTEGER_KEY)?,
-            ids: env.create_db("ids", DbFlags::DUP_FIXED)?,
+            events: env.create_db_in(bodies, "events", DbFlags::INTEGER_KEY)?,
+            ids: env.create_db("ids", DbFlags::PLAIN)?,
             created: env.create_db("created", DbFlags::DUP_FIXED)?,
             kinds: env.create_db("kinds", DbFlags::DUP_FIXED)?,
             authors: env.create_db("authors", DbFlags::DUP_FIXED)?,
@@ -419,6 +439,7 @@ impl Store {
         })?;
         let store = Store {
             env,
+            bodies,
             tables,
             indexed_tags,
             history,
@@ -428,11 +449,8 @@ impl Store {
             deletions_path,
             deletions_from: covered.unwrap_or(1),
         };
+        let next = store.drop_uncommitted()?;
         // Saved since the last event was stored, or a new database.
-        let next = {
-            let txn = store.read()?;
-            store.next_seq(&txn)?
-        };
         if store.deletions_from >= next {
             store.deletions.set_ready();
         }
@@ -440,6 +458,30 @@ impl Store {
         wot::open(&store, store.wot.as_ref())?;
         rank::open(&store)?;
         Ok(store)
+    }
+
+    /// Remove the records a crash left in `bodies` under sequence numbers
+    /// the main environment never committed, so they're appended to again.
+    /// Returns the next sequence number.
+    fn drop_uncommitted(&self) -> Result<u64> {
+        let mut txn = self.write()?;
+        let next = self.next_seq(&txn)?;
+        let mut orphans = Vec::new();
+        let mut cursor = txn.cursor(self.tables.events)?;
+        let mut entry = cursor.set_range(&next.to_ne_bytes())?;
+        while let Some((key, _)) = entry {
+            orphans.push(key.to_vec());
+            entry = cursor.next()?;
+        }
+        drop(cursor);
+        if !orphans.is_empty() {
+            tracing::warn!("dropping {} records never committed", orphans.len());
+            for key in &orphans {
+                txn.del(self.tables.events, key, None)?;
+            }
+            txn.commit()?;
+        }
+        Ok(next)
     }
 
     /// If the history cap is lower than when the store was last opened (or
@@ -525,13 +567,17 @@ impl Store {
         Ok(cursor.count()? >= self.history.max_versions && created_at < oldest)
     }
 
+    /// Compacted copies of the main environment and `bodies`, into the
+    /// directories `main` and `bodies`.
     #[cfg(test)]
-    pub fn copy_compact(&self, path: &Path) -> Result<()> {
-        self.env.copy_compact(path)
+    pub fn copy_compact(&self, main: &Path, bodies: &Path) -> Result<()> {
+        self.env.copy_compact(0, main)?;
+        self.env.copy_compact(self.bodies, bodies)
     }
 
-    pub fn usage(&self) -> Result<Usage> {
-        self.env.usage()
+    /// The main environment's usage, and `bodies`'.
+    pub fn usage(&self) -> Result<(Usage, Usage)> {
+        Ok((self.env.usage(0)?, self.env.usage(self.bodies)?))
     }
 
     pub fn read(&self) -> Result<RoTxn<'_>> {
@@ -591,21 +637,16 @@ impl Store {
             .map_or(1, |v| u64::from_be_bytes(v.try_into().unwrap_or_default())))
     }
 
+    /// Whether an event is stored, expired or not.
     pub fn contains(&self, txn: &Txn, id: &[u8; 32]) -> Result<bool> {
         Ok(self.seq_of(txn, id)?.is_some())
     }
 
+    /// The sequence number an event is stored under, expired or not.
     pub fn seq_of(&self, txn: &Txn, id: &[u8; 32]) -> Result<Option<u64>> {
-        let mut cursor = txn.cursor(self.tables.ids)?;
-        let mut entry = cursor.set(&id[..ID_PREFIX])?;
-        while let Some((_, value)) = entry {
-            let seq = u64::from_be_bytes(value.try_into().unwrap_or_default());
-            if self.load(txn, seq)?.is_some_and(|view| view.id() == id) {
-                return Ok(Some(seq));
-            }
-            entry = cursor.next_dup()?;
-        }
-        Ok(None)
+        Ok(txn
+            .get(self.tables.ids, id)?
+            .map(|value| u64::from_be_bytes(value.try_into().unwrap_or_default())))
     }
 
     /// A stored event's signature.
@@ -1122,8 +1163,11 @@ impl Store {
         let t = self.tables;
         let seq = self.next_seq(txn)?;
         assert!(seq <= MAX_SEQ, "the relay has run out of sequence numbers");
-        txn.put(t.events, &seq.to_ne_bytes(), record)?;
-        txn.put_dup(t.ids, &view.id()[..ID_PREFIX], &seq.to_be_bytes())?;
+        // Sequence numbers only grow, so a record always goes at the end.
+        if !txn.append(t.events, &seq.to_ne_bytes(), record)? {
+            txn.put(t.events, &seq.to_ne_bytes(), record)?;
+        }
+        txn.put(t.ids, view.id(), &seq.to_be_bytes())?;
         if let Some(expiration) = view.expiration() {
             txn.put_dup(t.expiring, EXPIRING, &stamp(expiration, seq))?;
         }
@@ -1264,7 +1308,7 @@ impl Store {
         if let Some(expiration) = view.expiration() {
             txn.del(t.expiring, EXPIRING, Some(&stamp(expiration, seq)))?;
         }
-        txn.del(t.ids, &view.id()[..ID_PREFIX], Some(&seq.to_be_bytes()))?;
+        txn.del(t.ids, view.id(), None)?;
         txn.del(t.events, &seq.to_ne_bytes(), None)?;
         Ok(true)
     }
@@ -1784,10 +1828,12 @@ pub mod tests {
             .outcomes[0]
     }
 
+    /// Whether an event is stored, and not expired.
     fn has(store: &Store, event: &Event) -> bool {
         let txn = store.read().unwrap();
         let id: [u8; 32] = hex::decode(&event.id).unwrap().try_into().unwrap();
-        store.contains(&txn, &id).unwrap()
+        let seq = store.seq_of(&txn, &id).unwrap();
+        seq.is_some_and(|seq| store.load(&txn, seq).unwrap().is_some())
     }
 
     /// Every index entry of every table, to check removals leave nothing.
@@ -2408,6 +2454,46 @@ pub mod tests {
         refused(&store);
     }
 
+    /// A crash after `bodies` committed but before the main environment
+    /// did leaves records under sequence numbers never used, which are
+    /// dropped when it's next opened, and the numbers used again.
+    #[test]
+    fn drops_records_never_committed() {
+        let (dir, store) = open();
+        let note = signed(1, 100, 1, vec![], "note");
+        assert_eq!(put(&store, &note), Outcome::Stored(1));
+        // What a crash between the commits leaves.
+        let orphan = record::encode(&signed(2, 100, 1, vec![], "orphan"));
+        let mut txn = store.write().unwrap();
+        for seq in [2u64, 3] {
+            txn.put(store.tables.events, &seq.to_ne_bytes(), &orphan)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        drop(store);
+
+        let history = History::new(true, vec![], 20);
+        let store = Store::open(
+            dir.path(),
+            1 << 26,
+            true,
+            test_tags(),
+            history,
+            None,
+            Rank::default(),
+        )
+        .unwrap();
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), 1);
+        let next = signed(3, 100, 1, vec![], "next");
+        assert_eq!(put(&store, &next), Outcome::Stored(2));
+        assert!(has(&store, &note) && has(&store, &next));
+        let txn = store.read().unwrap();
+        assert_eq!(
+            store.load(&txn, 2).unwrap().unwrap().content().to_text(),
+            "next"
+        );
+    }
+
     /// How big the database is, compacted, against the events' JSON. Slow,
     /// so run by hand: `cargo test --release disk_usage -- --ignored --nocapture`.
     #[test]
@@ -2425,11 +2511,19 @@ pub mod tests {
                 .write_batch(records.iter().map(Vec::as_slice), 0)
                 .unwrap();
         }
-        let compact = tempfile::tempdir().unwrap();
-        store.copy_compact(compact.path()).unwrap();
-        let disk = std::fs::metadata(compact.path().join("data.mdb"))
-            .unwrap()
-            .len() as usize;
+        let (main, bodies) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        store.copy_compact(main.path(), bodies.path()).unwrap();
+        let size = |dir: &tempfile::TempDir| {
+            std::fs::metadata(dir.path().join("data.mdb"))
+                .unwrap()
+                .len() as usize
+        };
+        let disk = size(&main) + size(&bodies);
+        println!(
+            "{} bytes of indexes, {} of records",
+            size(&main),
+            size(&bodies)
+        );
         let count = events.len();
         println!(
             "{count} events: {json} bytes of JSON, {disk} bytes on disk ({:.2}x), {} per event",
