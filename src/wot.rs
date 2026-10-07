@@ -139,6 +139,11 @@ impl Wot {
         (i128::from(score) * i128::from(self.damping) / i128::from(MILLION - self.damping)) as i64
     }
 
+    /// The least weight counted.
+    pub fn min_weight(&self) -> f64 {
+        self.min_weight
+    }
+
     /// An author's weight.
     pub fn weight(&self, store: &Store, txn: &Txn, pubkey: &[u8; 32]) -> Result<f32> {
         if self.seeds.binary_search(pubkey).is_ok() {

@@ -119,6 +119,7 @@ pub fn run(
         if filter.never || limit == 0 {
             continue;
         }
+        let filter = &*crate::rank::windowed(store, filter);
         let found = match (&filter.search, &filter.ids) {
             (Some(query), None) if !query.terms.is_empty() => match search {
                 Some(search) => search.run(store, &txn, filter, query, limit)?,

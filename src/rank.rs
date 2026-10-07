@@ -77,6 +77,7 @@
 //! only events with a rank in its mode, however few: those without have
 //! nothing to be ordered by.
 
+use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
@@ -113,6 +114,10 @@ const WALK: &[u8] = b"rank_walk";
 
 /// The most entries rebuilt per write transaction.
 const REBUILD_CHUNK: usize = 10_000;
+
+/// `sort:hot` finds only events this new, in seconds, but for profiles,
+/// which go by their authors' trust.
+const HOT_WINDOW: u32 = 7 * 86_400;
 
 /// `sort:rising` ranks only events this new, in seconds,
 const RISING_WINDOW: u32 = 7 * 86_400;
@@ -738,6 +743,15 @@ fn weight(store: &Store, txn: &Txn, engager: &[u8; 32]) -> Result<i64> {
     }
 }
 
+/// The least score anything engaged with has: one engager's, at the least
+/// weight counted.
+fn least_score(store: &Store) -> i64 {
+    match store.wot() {
+        Some(wot) => ((wot.min_weight() * FULL as f64).floor() as i64).max(1),
+        None => FULL,
+    }
+}
+
 /// The weight applied to an engager, walk aside.
 fn stored_applied(store: &Store, txn: &Txn, engager: &[u8; 32]) -> Result<i64> {
     if store.wot().is_none() {
@@ -1340,6 +1354,24 @@ pub fn sort<'t>(
     Ok(())
 }
 
+/// A filter as a ranked sort has it run: for `sort:hot`, with `since` no
+/// earlier than [`HOT_WINDOW`] ago, so that an old event, however much it's
+/// been engaged with, isn't hot.
+pub fn windowed<'f>(store: &Store, filter: &'f Filter) -> Cow<'f, Filter> {
+    let hot = filter
+        .search
+        .as_ref()
+        .is_some_and(|search| mode(store, filter, search.sort) == HOT);
+    let since = crate::event::now().saturating_sub(HOT_WINDOW);
+    match hot && filter.since < since {
+        true => Cow::Owned(Filter {
+            since,
+            ..filter.clone()
+        }),
+        false => Cow::Borrowed(filter),
+    }
+}
+
 /// Run a ranked filter whose search has no text to look up. One naming
 /// ids, authors, or tags has its matches ranked; any other walks `ranked`
 /// from the top.
@@ -1350,6 +1382,7 @@ pub fn run<'t>(
     limit: usize,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Vec<(u64, EventView<'t>)>> {
+    let filter = &*windowed(store, filter);
     let search = filter.search.as_ref().expect("a ranked search");
     let mode = mode(store, filter, search.sort);
     let narrow = filter.ids.is_some() || filter.authors.is_some() || !filter.tags.is_empty();
@@ -1866,9 +1899,17 @@ fn walk_ranked<'t>(
     let mut authors = HashSet::new();
     let mut found = Vec::new();
     let (mut examined, mut steps) = (0, 0);
+    // Below the least score's hot rank at `since`, every event is older.
+    let floor = match mode {
+        HOT => hot(least_score(store), filter.since, store.rank().half_life),
+        _ => 0,
+    };
     while found.len() < walk.limit
-        && let Some((_, seq)) = ranked.next()?
+        && let Some((rank, seq)) = ranked.next()?
     {
+        if rank < floor {
+            break;
+        }
         steps += 1;
         if steps > walk.max_steps {
             return Ok((found, true));
@@ -2405,11 +2446,13 @@ mod tests {
     fn ranks_top_and_hot() {
         let dir = tempfile::tempdir().unwrap();
         let store = open(dir.path(), None, Rank::new(DAY, 0.05, 100));
-        // Old and much engaged with, newer and less, and newest and none.
-        let old = event(1, 10 * DAY, 1, vec![], "old");
-        let mid = event(2, 11 * DAY, 1, vec![], "mid");
-        let new = event(3, 13 * DAY + DAY / 2, 1, vec![], "new");
-        let quiet = event(1, 14 * DAY, 1, vec![], "quiet");
+        // Old and much engaged with, newer and less, and newest and none,
+        // the last now.
+        let base = crate::event::now() - 14 * DAY;
+        let old = event(1, base + 10 * DAY, 1, vec![], "old");
+        let mid = event(2, base + 11 * DAY, 1, vec![], "mid");
+        let new = event(3, base + 13 * DAY + DAY / 2, 1, vec![], "new");
+        let quiet = event(1, base + 14 * DAY, 1, vec![], "quiet");
         for e in [&old, &mid, &new, &quiet] {
             put(&store, e);
         }
@@ -2454,6 +2497,20 @@ mod tests {
         let deletion = event(13, 3, 5, vec![vec!["e", &reaction.id]], "");
         put(&store, &deletion);
         assert_eq!(score(&store, &old), 7000);
+
+        // Older than a week isn't hot, however much engaged with, but is
+        // still top.
+        let ancient = event(4, base + 6 * DAY, 1, vec![], "ancient");
+        put(&store, &ancient);
+        for n in 20..60 {
+            put(&store, &react(n, &ancient, "+"));
+        }
+        let top = ids(&store, json!({"search": "sort:top", "kinds": [1]}));
+        assert_eq!(top, of(&[&ancient, &old, &mid, &new]));
+        let hot = ids(&store, json!({"search": "sort:hot", "kinds": [1]}));
+        assert_eq!(hot, of(&[&new, &old, &mid]));
+        let by = json!({"search": "sort:hot", "authors": [hex::encode(pubkey(4))]});
+        assert!(ids(&store, by).is_empty());
     }
 
     #[test]
@@ -2779,11 +2836,11 @@ mod tests {
                 put(&store, &react(100 + m, e, "+"));
             }
         }
-        // Too old to rise, so not found.
+        // Too old to rise or be hot, so not found.
         let rising = json!({"search": "sort:rising", "kinds": [1]});
         assert_eq!(ids(&store, rising), of(&[&new, &mid]));
         let hot = json!({"search": "sort:hot", "kinds": [1]});
-        assert_eq!(ids(&store, hot), of(&[&mid, &new, &old]));
+        assert_eq!(ids(&store, hot), of(&[&mid, &new]));
     }
 
     /// Random posts and reactions, ranked by how fast they're rising, the
@@ -2798,6 +2855,8 @@ mod tests {
         let store = open(dir.path(), None, Rank::new(DAY, 0.05, 100));
         let mut rng = StdRng::seed_from_u64(7);
         let words = ["apple", "banana", "cherry"];
+        // Over nine days ago to five, hot only for the last two.
+        let base = crate::event::now() - 9 * DAY;
         let mut posts = Vec::new();
         for i in 0..120u32 {
             let tag = ["x", "y", "z"][rng.random_range(0..3)];
@@ -2808,7 +2867,7 @@ mod tests {
                 tags.push(vec!["d", d.as_str()]);
             }
             let text = words[rng.random_range(0..3)];
-            let post = event(rng.random_range(1..7), 10 * DAY + i * 600, kind, tags, text);
+            let post = event(rng.random_range(1..7), base + i * 2880, kind, tags, text);
             put(&store, &post);
             posts.push(post);
         }
@@ -2855,13 +2914,14 @@ mod tests {
             if rng.random_bool(0.3) {
                 filter.insert(
                     "since".into(),
-                    json!(10 * DAY + rng.random_range(0..120) * 600),
+                    json!(base + rng.random_range(0..120) * 2880),
                 );
             }
             let limit = rng.random_range(1..60);
             filter.insert("limit".into(), json!(limit));
             let raw = Value::Object(filter);
             let filter = Filter::parse(&raw, &test_tags(), MAX_VALUES).unwrap();
+            let filter = windowed(&store, &filter).into_owned();
             let mode = mode(&store, &filter, filter.search.as_ref().unwrap().sort);
 
             let mut ranked = Vec::new();
