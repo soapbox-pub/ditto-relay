@@ -1389,7 +1389,7 @@ pub fn run<'t>(
     let mut found = if narrow {
         let found = match walk_narrow(store, txn, filter, limit)? {
             Some(found) => Some(found),
-            None => rank_candidates(store, txn, filter, search.sort, limit)?,
+            None => rank_candidates(store, txn, filter, limit)?,
         };
         match found {
             Some(found) => found,
@@ -1424,22 +1424,36 @@ const RANK_CHUNK: usize = if cfg!(test) { 4 } else { 64 };
 const RANK_THREADS: usize = 8;
 
 /// The best of a narrow filter's matches, ranking every candidate the
-/// indexes give for it from its record's header, and reading whole only
-/// the best, as many as it takes to find `limit` that match. Ranking them
-/// read whole costs as much as reading them, which for posts of a thousand
-/// hashtags out of memory is a read from disk for every few kilobytes of
-/// tags. None if there are more than [`MAX_EXAMINED`] candidates.
+/// indexes give for it: see [`rank_among`]. None if there are more than
+/// [`MAX_EXAMINED`] candidates.
 fn rank_candidates<'t>(
     store: &Store,
     txn: &'t Txn,
     filter: &Filter,
-    sort: Sort,
     limit: usize,
 ) -> Result<Option<Vec<(u64, EventView<'t>)>>> {
-    let Some(candidates) = crate::query::candidates(store, txn, filter, MAX_EXAMINED)? else {
-        return Ok(None);
-    };
-    let mode = mode(store, filter, sort);
+    match crate::query::candidates(store, txn, filter, MAX_EXAMINED)? {
+        Some(candidates) => rank_among(store, txn, filter, &candidates, false, limit).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The best a ranked filter matches among `candidates`, a superset of its
+/// matches (with `text_checked`, all with its search's text), ranking every
+/// one from its record's header, and reading whole only the best, as many
+/// as it takes to find `limit` that match. Ranking them read whole costs as
+/// much as reading them, which for posts of a thousand hashtags out of
+/// memory is a read from disk for every few kilobytes of tags.
+pub fn rank_among<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    filter: &Filter,
+    candidates: &[u64],
+    text_checked: bool,
+    limit: usize,
+) -> Result<Vec<(u64, EventView<'t>)>> {
+    let search = filter.search.as_ref().expect("a ranked search");
+    let mode = mode(store, filter, search.sort);
     let now = crate::event::now();
     let authors: Option<HashMap<[u8; 32], u64>> = match by_author(filter, mode) {
         true => {
@@ -1490,7 +1504,7 @@ fn rank_candidates<'t>(
     })?;
     // Best first, ties the latest stored first, as walking `ranked` finds them.
     ranked.sort_unstable_by(|a, b| b.cmp(a));
-    let distinct = filter.search.as_ref().is_some_and(|s| s.distinct_author);
+    let distinct = search.distinct_author;
     let mut seen = HashSet::new();
     let mut found = Vec::new();
     for (_, seq) in ranked {
@@ -1500,7 +1514,11 @@ fn rank_candidates<'t>(
         let Some(view) = store.load(txn, seq)? else {
             continue;
         };
-        if !filter.matches(&view) || !store.is_current(txn, seq, &view)? {
+        let matches = match text_checked {
+            true => filter.matches_fields(&view),
+            false => filter.matches(&view),
+        };
+        if !matches || !store.is_current(txn, seq, &view)? {
             continue;
         }
         if distinct && !seen.insert(*view.pubkey()) {
@@ -1508,7 +1526,7 @@ fn rank_candidates<'t>(
         }
         found.push((seq, view));
     }
-    Ok(Some(found))
+    Ok(found)
 }
 
 /// A ranked filter as a plain one, for all its matches, to be ranked.
@@ -2957,8 +2975,7 @@ mod tests {
             // Ranked from their headers, as when walking would take too long.
             let narrow = filter.authors.is_some() || !filter.tags.is_empty();
             if !text && narrow {
-                let sort = filter.search.as_ref().unwrap().sort;
-                let found = rank_candidates(&store, &txn, &filter, sort, limit).unwrap();
+                let found = rank_candidates(&store, &txn, &filter, limit).unwrap();
                 let found: Vec<String> = found
                     .unwrap()
                     .iter()

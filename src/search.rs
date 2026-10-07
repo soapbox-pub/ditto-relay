@@ -634,6 +634,20 @@ impl SearchIndex {
                 if let Some(found) = best {
                     return Ok(found);
                 }
+                // Too few among the events the walk would pass: rank them
+                // all, from their headers.
+                if candidates.len() <= MAX_EXAMINED {
+                    let text_checked = !search.autocomplete;
+                    let found = crate::rank::rank_among(
+                        store,
+                        txn,
+                        filter,
+                        &candidates,
+                        text_checked,
+                        limit,
+                    )?;
+                    return Ok(found);
+                }
             }
         }
         let mut hits = Vec::new();
@@ -1534,6 +1548,32 @@ mod tests {
         assert_eq!(
             f.search(json!({"search": "cat sort:controversial"})),
             ids(&[&two])
+        );
+    }
+
+    /// Profiles ranked by their authors' events are found among those
+    /// the search matches, ranked one by one.
+    #[test]
+    fn ranks_matching_profiles_by_their_authors() {
+        let mut f = fixture();
+        let alice = signed(1, 100, 0, vec![], r#"{"name":"alice"}"#);
+        let alicia = signed(2, 100, 0, vec![], r#"{"name":"alicia"}"#);
+        let bob = signed(3, 100, 0, vec![], r#"{"name":"bob"}"#);
+        let note = signed(2, 100, 1, vec![], "argue with me");
+        let reply = signed(5, 200, 1, vec![vec!["e", &note.id, "", "root"]], "no");
+        let react = signed(6, 200, 7, vec![vec!["e", &note.id]], "+");
+        let bobs = signed(3, 100, 1, vec![], "me too");
+        let bob_reply = signed(5, 200, 1, vec![vec!["e", &bobs.id, "", "root"]], "no");
+        let bob_react = signed(6, 200, 7, vec![vec!["e", &bobs.id]], "+");
+        for event in [
+            &alice, &alicia, &bob, &note, &reply, &react, &bobs, &bob_reply, &bob_react,
+        ] {
+            put(&f.store, event);
+        }
+        f.index_all();
+        assert_eq!(
+            f.search(json!({"kinds": [0], "search": "ali sort:controversial"})),
+            std::slice::from_ref(&alicia.id)
         );
     }
 
