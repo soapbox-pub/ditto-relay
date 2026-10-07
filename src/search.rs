@@ -634,6 +634,14 @@ impl SearchIndex {
                 searcher.search(&query, &collector)?
             };
             let count = page_hits.len();
+            // Out of memory, each is a read from disk: have them all read at
+            // once before taking them in order. Not only as many as the
+            // limit, since hits are passed over: of other kinds, replaced.
+            let mut seqs = Vec::with_capacity(count);
+            for &(_, address) in &page_hits {
+                seqs.extend(seq_of(self, &searcher, &mut columns, address)?);
+            }
+            store.read_ahead(&seqs);
             for (score, address) in page_hits {
                 if let Some(kinds) = &checked
                     && !column_value(self, &searcher, &mut kind_columns, "kind", address)?

@@ -152,6 +152,15 @@ const DELETION: u16 = 5;
 /// NIP-62 requests to vanish.
 const VANISH: u16 = 62;
 
+/// Records [`Store::read_ahead`] reads on each thread, at least.
+const PREFETCH_CHUNK: usize = if cfg!(test) { 2 } else { 32 };
+
+/// The most threads [`Store::read_ahead`] reads on.
+const PREFETCH_THREADS: usize = 8;
+
+/// LMDB's page size, as far as reading a record's every page goes.
+const PAGE: usize = 4096;
+
 /// NIP-59 gift wraps.
 const GIFT_WRAP: u16 = 1059;
 
@@ -671,6 +680,34 @@ impl Store {
             .get(self.tables.events, &seq.to_ne_bytes())?
             .and_then(EventView::new)
             .filter(|view| !view.is_expired(now)))
+    }
+
+    /// Read the records of `seqs` on several threads at once, each in a
+    /// transaction of its own, so that reading them after, one at a time,
+    /// doesn't wait on the disk for each in turn. Only a hint: those that
+    /// can't be read, or aren't worth threads, are left for then.
+    pub fn read_ahead(&self, seqs: &[u64]) {
+        let threads = (seqs.len() / PREFETCH_CHUNK).min(PREFETCH_THREADS);
+        if threads < 2 {
+            return;
+        }
+        let txns: Vec<_> = (0..threads).map_while(|_| self.read().ok()).collect();
+        let Some(chunk) = seqs.len().checked_div(txns.len()) else {
+            return;
+        };
+        std::thread::scope(|scope| {
+            for (txn, seqs) in txns.into_iter().zip(seqs.chunks(chunk + 1)) {
+                scope.spawn(move || {
+                    for &seq in seqs {
+                        if let Ok(Some(record)) = txn.get(self.tables.events, &seq.to_ne_bytes()) {
+                            // A byte of every page it's on.
+                            let bytes = record.iter().step_by(PAGE).fold(0, |a, &b| a ^ b);
+                            std::hint::black_box(bytes);
+                        }
+                    }
+                });
+            }
+        });
     }
 
     /// A stored, unexpired event's [`Header`], read without its tags or
