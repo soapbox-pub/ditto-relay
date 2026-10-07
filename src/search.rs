@@ -596,8 +596,6 @@ impl SearchIndex {
                 candidates.dedup();
                 // As many as ranking the newest matches reads.
                 let direct = candidates.len().min(MAX_HITS);
-                let fill = crate::rank::newest_of(filter, search.distinct_author);
-                let cancel = CancellationToken::new();
                 let best = crate::rank::best_among(
                     store,
                     txn,
@@ -606,10 +604,7 @@ impl SearchIndex {
                     // Autocomplete prefixes past MAX_PREFIX aren't indexed.
                     !search.autocomplete,
                     direct,
-                    &fill,
-                    WALK_BUDGET,
                     limit,
-                    &cancel,
                 )?;
                 if let Some(found) = best {
                     return Ok(found);
@@ -764,7 +759,7 @@ impl SearchIndex {
         }
         let cancel = CancellationToken::new();
         Ok(match search.sort.is_ranked() {
-            true => crate::rank::walk_matching(store, txn, filter, limit, WALK_BUDGET, &cancel)?,
+            true => crate::rank::walk_matching(store, txn, filter, limit, WALK_BUDGET)?,
             false => crate::query::newest(store, txn, filter, limit, WALK_BUDGET, &cancel)?,
         })
     }
@@ -1485,21 +1480,22 @@ mod tests {
         }
         let ids =
             |events: &[&Event]| -> Vec<String> { events.iter().map(|e| e.id.clone()).collect() };
+        // Not two, which no one's engaged with.
         assert_eq!(
             f.search(json!({"search": "cat sort:top"})),
-            ids(&[&four, &one, &three, &two])
+            ids(&[&four, &one, &three])
         );
         assert_eq!(
             f.search(json!({"search": "cat sort:top distinct:author", "limit": 2})),
             ids(&[&four, &one])
         );
-        // Only the argued over are controversial; the rest, newest first.
+        // Only the argued over are controversial.
         let reply = signed(7, 600, 1, vec![vec!["e", &two.id, "", "root"]], "no");
         put(&f.store, &reply);
         put(&f.store, &react(8, &two));
         assert_eq!(
             f.search(json!({"search": "cat sort:controversial"})),
-            ids(&[&two, &three, &one, &four])
+            ids(&[&two])
         );
     }
 
@@ -1937,6 +1933,10 @@ mod tests {
             if parsed.search.as_ref().unwrap().distinct_author {
                 let mut authors = HashSet::new();
                 expected.retain(|e| authors.insert(e.pubkey.clone()));
+            }
+            // No one engages here, so nothing's ranked.
+            if parsed.search.as_ref().unwrap().sort.is_ranked() {
+                expected.clear();
             }
             let expected: Vec<&str> = expected.iter().take(limit).map(|e| e.id.as_str()).collect();
             assert_eq!(f.search(filter.clone()), expected, "{filter}");
