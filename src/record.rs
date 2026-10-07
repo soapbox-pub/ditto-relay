@@ -427,10 +427,22 @@ impl<'a> EventView<'a> {
 }
 
 fn push_hex_str(out: &mut String, bytes: &[u8]) {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    // Each byte's two digits.
+    const PAIRS: [[u8; 2]; 256] = {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut pairs = [[0; 2]; 256];
+        let mut byte = 0;
+        while byte < 256 {
+            pairs[byte] = [DIGITS[byte >> 4], DIGITS[byte & 0xf]];
+            byte += 1;
+        }
+        pairs
+    };
+    // SAFETY: only ASCII digits are appended, so it stays UTF-8.
+    let out = unsafe { out.as_mut_vec() };
+    out.reserve(bytes.len() * 2);
     for &byte in bytes {
-        out.push(DIGITS[usize::from(byte >> 4)] as char);
-        out.push(DIGITS[usize::from(byte & 0xf)] as char);
+        out.extend_from_slice(&PAIRS[usize::from(byte)]);
     }
 }
 
