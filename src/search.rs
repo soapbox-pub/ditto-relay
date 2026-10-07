@@ -43,7 +43,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::ops::Bound;
+use std::ops::{Bound, RangeInclusive};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -57,7 +57,7 @@ use tantivy::collector::{Collector, Count, DocSetCollector, SegmentCollector, To
 use tantivy::columnar::Column;
 use tantivy::index::SegmentId;
 use tantivy::query::{
-    BooleanQuery, ConstScoreQuery, Occur, Query, RangeQuery, TermQuery, TermSetQuery,
+    BooleanQuery, ConstScoreQuery, Occur, Query, RangeQuery, TermQuery, TermSetQuery, Weight,
 };
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, Schema, TextFieldIndexing, TextOptions,
@@ -472,8 +472,14 @@ impl SearchIndex {
     }
 
     /// The query for a search filter. With `kinds` false, kinds are left
-    /// for the caller to check.
-    fn query(&self, filter: &Filter, search: &Search, kinds: bool) -> Box<dyn Query> {
+    /// for the caller to check. With it, the times to collect its hits
+    /// [`Within`], if those are left for the collector to check.
+    fn query(
+        &self,
+        filter: &Filter,
+        search: &Search,
+        kinds: bool,
+    ) -> (Box<dyn Query>, Option<RangeInclusive<u64>>) {
         let f = self.fields;
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = search
             .terms
@@ -521,20 +527,28 @@ impl SearchIndex {
             let terms = authors.iter().map(|a| Term::from_field_bytes(f.pubkey, a));
             clauses.push((Occur::Must, any_of(terms.collect())));
         }
+        // A range query reads the created_at column through to find what's
+        // in range, every block of it, however few hits the rest of the
+        // query has: those are better checked one by one as they're
+        // collected. Without anything else to find hits by, it's that.
+        let mut within = None;
         if filter.since > 0 || filter.until < u32::MAX {
-            let bound = |t: u32| Bound::Included(Term::from_field_u64(f.created_at, t.into()));
-            clauses.push((
-                Occur::Must,
-                Box::new(RangeQuery::new(bound(filter.since), bound(filter.until))),
-            ));
+            let range = u64::from(filter.since)..=u64::from(filter.until);
+            if clauses.iter().any(|(occur, _)| *occur == Occur::Must) {
+                within = Some(range);
+            } else {
+                let bound = |t: u64| Bound::Included(Term::from_field_u64(f.created_at, t));
+                let query = RangeQuery::new(bound(*range.start()), bound(*range.end()));
+                clauses.push((Occur::Must, Box::new(query)));
+            }
         }
         // A term alone has the best found by skipping blocks of its postings
         // that can't score among them, which a boolean query of one term
         // doesn't do.
         if let [(Occur::Must, _)] = clauses.as_slice() {
-            return clauses.pop().expect("a clause").1;
+            return (clauses.pop().expect("a clause").1, within);
         }
-        Box::new(BooleanQuery::new(clauses))
+        (Box::new(BooleanQuery::new(clauses)), within)
     }
 
     /// Run a search filter: the best matches by relevance, or with
@@ -566,16 +580,16 @@ impl SearchIndex {
         }
 
         let checked = self.checked_kinds(&searcher, filter)?;
-        let query = self.query(filter, search, checked.is_none());
+        let (query, times) = self.query(filter, search, checked.is_none());
         let mut columns: HashMap<u32, Column<u64>> = HashMap::new();
         let mut kind_columns: HashMap<u32, Column<u64>> = HashMap::new();
         if search.sort.is_ranked() {
-            let count = searcher.search(&query, &Count)?;
+            let count = searcher.search(&query, &Within::new(self, &times, Count))?;
             if count <= crate::rank::MAX_CANDIDATES {
                 let kinds = checked
                     .as_ref()
                     .map(|kinds| kinds.iter().copied().collect());
-                let collector = Seqs { index: self, kinds };
+                let collector = Within::new(self, &times, Seqs { index: self, kinds });
                 let mut candidates = searcher.search(&query, &collector)?;
                 candidates.extend(seen.iter().copied());
                 candidates.sort_unstable();
@@ -615,13 +629,14 @@ impl SearchIndex {
             // Ranked searches rank every match, so take them newest first.
             let page_hits: Vec<(f32, DocAddress)> = if search.sort != Sort::Relevance {
                 let collector = top.order_by_fast_field::<u64>("created_at", Order::Desc);
-                let found = searcher.search(&query, &collector)?;
+                let found = searcher.search(&query, &Within::new(self, &times, collector))?;
                 found
                     .into_iter()
                     .map(|(_, address)| (0.0, address))
                     .collect()
             } else {
-                searcher.search(&query, &top.order_by_score())?
+                let collector = Within::new(self, &times, top.order_by_score());
+                searcher.search(&query, &collector)?
             };
             let count = page_hits.len();
             for (score, address) in page_hits {
@@ -790,12 +805,13 @@ impl SearchIndex {
                 .into_iter()
                 .map(|(seq, _)| seq),
         );
-        let query = self.query(filter, search, true);
-        if searcher.search(&query, &Count)? > MAX_EXAMINED {
+        let (query, times) = self.query(filter, search, true);
+        if searcher.search(&query, &Within::new(self, &times, Count))? > MAX_EXAMINED {
             return Err(TooExpensive.into());
         }
         let mut columns = HashMap::new();
-        for address in searcher.search(&query, &DocSetCollector)? {
+        let collector = Within::new(self, &times, DocSetCollector);
+        for address in searcher.search(&query, &collector)? {
             let Some(seq) = seq_of(self, &searcher, &mut columns, address)? else {
                 continue;
             };
@@ -810,6 +826,125 @@ impl SearchIndex {
             }
         }
         Ok(())
+    }
+}
+
+/// Collects with another collector only the hits created within a range of
+/// times, if any, which its query leaves out; any other way, it's the other.
+struct Within<'a, C> {
+    index: &'a SearchIndex,
+    range: &'a Option<RangeInclusive<u64>>,
+    inner: C,
+}
+
+impl<'a, C> Within<'a, C> {
+    fn new(index: &'a SearchIndex, range: &'a Option<RangeInclusive<u64>>, inner: C) -> Self {
+        Within {
+            index,
+            range,
+            inner,
+        }
+    }
+}
+
+struct SegmentWithin<S> {
+    created_at: Option<(Column<u64>, RangeInclusive<u64>)>,
+    inner: S,
+    times: Vec<Option<u64>>,
+    within: Vec<DocId>,
+}
+
+impl<C: Collector> Collector for Within<'_, C> {
+    type Fruit = C::Fruit;
+    type Child = SegmentWithin<C::Child>;
+
+    fn for_segment(
+        &self,
+        ord: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        let created_at = match self.range {
+            Some(range) => Some((self.index.column(segment, "created_at")?, range.clone())),
+            None => None,
+        };
+        Ok(SegmentWithin {
+            created_at,
+            inner: self.inner.for_segment(ord, segment)?,
+            times: Vec::new(),
+            within: Vec::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        self.inner.requires_scoring()
+    }
+
+    fn merge_fruits(
+        &self,
+        fruits: Vec<<C::Child as SegmentCollector>::Fruit>,
+    ) -> tantivy::Result<C::Fruit> {
+        self.inner.merge_fruits(fruits)
+    }
+
+    // Unchecked, the other collector may collect its own way, as the best
+    // by score do, skipping blocks of postings that can't score among them.
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        ord: u32,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<<C::Child as SegmentCollector>::Fruit> {
+        if self.range.is_none() {
+            return self.inner.collect_segment(weight, ord, segment);
+        }
+        let mut collector = self.for_segment(ord, segment)?;
+        let alive = segment.alive_bitset();
+        let alive = |doc| alive.is_none_or(|alive| alive.is_alive(doc));
+        if self.requires_scoring() {
+            weight.for_each(segment, &mut |doc, score| {
+                if alive(doc) {
+                    collector.collect(doc, score);
+                }
+            })?;
+        } else {
+            let mut docs = Vec::new();
+            weight.for_each_no_score(segment, &mut |block| {
+                docs.clear();
+                docs.extend(block.iter().copied().filter(|&doc| alive(doc)));
+                collector.collect_block(&docs);
+            })?;
+        }
+        Ok(collector.harvest())
+    }
+}
+
+impl<S: SegmentCollector> SegmentCollector for SegmentWithin<S> {
+    type Fruit = S::Fruit;
+
+    fn collect(&mut self, doc: DocId, score: Score) {
+        match &self.created_at {
+            Some((column, range)) if !column.first(doc).is_some_and(|t| range.contains(&t)) => {}
+            _ => self.inner.collect(doc, score),
+        }
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        let Some((column, range)) = &self.created_at else {
+            return self.inner.collect_block(docs);
+        };
+        self.times.resize(docs.len(), None);
+        column.first_vals(docs, &mut self.times);
+        self.within.clear();
+        for (&doc, time) in docs.iter().zip(&self.times) {
+            if time.is_some_and(|t| range.contains(&t)) {
+                self.within.push(doc);
+            }
+        }
+        self.inner.collect_block(&self.within);
+    }
+
+    fn harvest(self) -> S::Fruit {
+        self.inner.harvest()
     }
 }
 
@@ -1395,6 +1530,38 @@ mod tests {
     }
 
     #[test]
+    fn collects_hits_within_times() {
+        let mut f = fixture();
+        for (seed, at) in [(1, 100), (2, 200), (3, 300), (4, 400)] {
+            put(&f.store, &signed(seed, at, 1, vec![], "hello world"));
+        }
+        f.index_all();
+        let searcher = f.index.reader.searcher();
+        let hits = |filter: serde_json::Value| {
+            let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
+            f.index.restrict(&mut filter);
+            let search = filter.search.clone().unwrap();
+            let (query, times) = f.index.query(&filter, &search, true);
+            let count = Within::new(&f.index, &times, Count);
+            let top = Within::new(&f.index, &times, TopDocs::with_limit(10).order_by_score());
+            let top = searcher.search(&query, &top).unwrap().len();
+            (
+                times.is_some(),
+                searcher.search(&query, &count).unwrap(),
+                top,
+            )
+        };
+        // With a term, the times are checked as hits are collected.
+        assert_eq!(hits(json!({"search": "hello"})), (false, 4, 4));
+        let between = json!({"search": "hello", "since": 150, "until": 300});
+        assert_eq!(hits(between), (true, 2, 2));
+        assert_eq!(hits(json!({"search": "world", "until": 99})), (true, 0, 0));
+        // Without, they're looked up.
+        let only = json!({"search": "-nothing", "since": 300});
+        assert_eq!(hits(only), (false, 2, 2));
+    }
+
+    #[test]
     fn ranks_by_relevance_or_recency() {
         let mut f = fixture();
         let once = signed(1, 300, 1, vec![], "rust and other things besides");
@@ -1746,6 +1913,9 @@ mod tests {
             }
             if rng.random_bool(0.3) {
                 filter.insert("since".into(), json!(rng.random_range(100..160)));
+            }
+            if rng.random_bool(0.3) {
+                filter.insert("until".into(), json!(rng.random_range(100..160)));
             }
             let limit = rng.random_range(1..40);
             filter.insert("limit".into(), json!(limit));
