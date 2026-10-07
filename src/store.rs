@@ -117,7 +117,7 @@ use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
 use crate::metrics::METRICS;
 use crate::rank::{self, Rank};
-use crate::record::{self, Element, EventView, tag_value};
+use crate::record::{self, Element, EventView, Header, tag_value};
 use crate::wot::{self, Wot};
 
 pub const STAMP_LEN: usize = 10;
@@ -671,6 +671,16 @@ impl Store {
             .get(self.tables.events, &seq.to_ne_bytes())?
             .and_then(EventView::new)
             .filter(|view| !view.is_expired(now)))
+    }
+
+    /// A stored, unexpired event's [`Header`], read without its tags or
+    /// content.
+    pub fn header<'t>(&self, txn: &'t Txn, seq: u64) -> Result<Option<Header<'t>>> {
+        let now = crate::event::now();
+        Ok(txn
+            .get(self.tables.events, &seq.to_ne_bytes())?
+            .and_then(Header::new)
+            .filter(|header| !header.is_expired(now)))
     }
 
     /// How many events are stored.

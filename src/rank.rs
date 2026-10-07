@@ -1273,19 +1273,33 @@ fn by_author(filter: &Filter, mode: u8) -> bool {
 
 /// An event's rank in a mode at `now`: 0 for none.
 fn rank_of(store: &Store, txn: &Txn, mode: u8, view: &EventView, now: u32) -> Result<u64> {
+    let (id, pubkey, created_at) = (view.id(), view.pubkey(), view.created_at());
+    rank_by(store, txn, mode, id, pubkey, created_at, now)
+}
+
+/// [`rank_of`], from what of an event its rank depends on.
+fn rank_by(
+    store: &Store,
+    txn: &Txn,
+    mode: u8,
+    id: &[u8; 32],
+    pubkey: &[u8; 32],
+    created_at: u32,
+    now: u32,
+) -> Result<u64> {
     let id = match mode {
-        PROFILE => return Ok(wot::score(store, txn, view.pubkey())?.max(0) as u64),
-        RECEIVED => recipient(view.pubkey()),
-        _ => *view.id(),
+        PROFILE => return Ok(wot::score(store, txn, pubkey)?.max(0) as u64),
+        RECEIVED => recipient(pubkey),
+        _ => *id,
     };
     let Some(score) = score_of(store, txn, &id)? else {
         return Ok(0);
     };
     Ok(match mode {
         TOP => score.score.max(0) as u64,
-        HOT if score.score > 0 => hot(score.score, view.created_at(), store.rank().half_life),
+        HOT if score.score > 0 => hot(score.score, created_at, store.rank().half_life),
         CONTROVERSIAL => controversial(score.comments, score.reactions).unwrap_or(0),
-        RISING => rising(score.score, view.created_at(), now).map_or(0, ordered),
+        RISING => rising(score.score, created_at, now).map_or(0, ordered),
         ZAPS | RECEIVED if score.zaps > 0 => ordered(score.zaps as f64),
         _ => 0,
     })
@@ -1340,7 +1354,11 @@ pub fn run<'t>(
     let mode = mode(store, filter, search.sort);
     let narrow = filter.ids.is_some() || filter.authors.is_some() || !filter.tags.is_empty();
     let mut found = if narrow {
-        match walk_narrow(store, txn, filter, limit)? {
+        let found = match walk_narrow(store, txn, filter, limit)? {
+            Some(found) => Some(found),
+            None => rank_candidates(store, txn, filter, search.sort, limit)?,
+        };
+        match found {
             Some(found) => found,
             None => {
                 let plain = unranked(filter);
@@ -1364,6 +1382,100 @@ pub fn run<'t>(
     }
     found.truncate(limit);
     Ok(found)
+}
+
+/// Candidates each thread ranking them takes, at least.
+const RANK_CHUNK: usize = if cfg!(test) { 4 } else { 64 };
+
+/// The most threads one filter's candidates are ranked on.
+const RANK_THREADS: usize = 8;
+
+/// The best of a narrow filter's matches, ranking every candidate the
+/// indexes give for it from its record's header, and reading whole only
+/// the best, as many as it takes to find `limit` that match. Ranking them
+/// read whole costs as much as reading them, which for posts of a thousand
+/// hashtags out of memory is a read from disk for every few kilobytes of
+/// tags. None if there are more than [`MAX_EXAMINED`] candidates.
+fn rank_candidates<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    filter: &Filter,
+    sort: Sort,
+    limit: usize,
+) -> Result<Option<Vec<(u64, EventView<'t>)>>> {
+    let Some(candidates) = crate::query::candidates(store, txn, filter, MAX_EXAMINED)? else {
+        return Ok(None);
+    };
+    let mode = mode(store, filter, sort);
+    let now = crate::event::now();
+    let authors: Option<HashMap<[u8; 32], u64>> = match by_author(filter, mode) {
+        true => {
+            let authors = ranked_authors(store, txn, mode)?;
+            let n = authors.len() as u64;
+            Some((0..).zip(authors).map(|(i, a)| (a, n - i)).collect())
+        }
+        false => None,
+    };
+    let rank_some = |txn: &Txn, seqs: &[u64]| -> Result<Vec<(u64, u64)>> {
+        let mut ranked = Vec::new();
+        for &seq in seqs {
+            let Some(header) = store.header(txn, seq)? else {
+                continue;
+            };
+            let pubkey = header.pubkey();
+            let rank = match &authors {
+                Some(authors) => authors.get(pubkey).copied().unwrap_or(0),
+                None => {
+                    let (id, created_at) = (header.id(), header.created_at());
+                    rank_by(store, txn, mode, id, pubkey, created_at, now)?
+                }
+            };
+            if rank > 0 {
+                ranked.push((rank, seq));
+            }
+        }
+        Ok(ranked)
+    };
+    // Out of memory, each header is a read from disk, which several
+    // threads wait on at once: each in a transaction of its own, as many as
+    // can be had.
+    let threads = (candidates.len() / RANK_CHUNK).clamp(1, RANK_THREADS);
+    let txns: Vec<_> = (1..threads).map_while(|_| store.read().ok()).collect();
+    let mut chunks = candidates.chunks(candidates.len().div_ceil(txns.len() + 1).max(1));
+    let first = chunks.next().unwrap_or_default();
+    let mut ranked = std::thread::scope(|scope| {
+        let others: Vec<_> = txns
+            .into_iter()
+            .zip(chunks)
+            .map(|(txn, seqs)| scope.spawn(move || rank_some(&txn, seqs)))
+            .collect();
+        let mut ranked = rank_some(txn, first)?;
+        for other in others {
+            ranked.extend(other.join().expect("ranking doesn't panic")?);
+        }
+        Ok::<_, crate::lmdb::Error>(ranked)
+    })?;
+    // Best first, ties the latest stored first, as walking `ranked` finds them.
+    ranked.sort_unstable_by(|a, b| b.cmp(a));
+    let distinct = filter.search.as_ref().is_some_and(|s| s.distinct_author);
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
+    for (_, seq) in ranked {
+        if found.len() >= limit {
+            break;
+        }
+        let Some(view) = store.load(txn, seq)? else {
+            continue;
+        };
+        if !filter.matches(&view) || !store.is_current(txn, seq, &view)? {
+            continue;
+        }
+        if distinct && !seen.insert(*view.pubkey()) {
+            continue;
+        }
+        found.push((seq, view));
+    }
+    Ok(Some(found))
 }
 
 /// A ranked filter as a plain one, for all its matches, to be ranked.
@@ -2781,6 +2893,19 @@ mod tests {
                 want.retain(|id| seen.insert(authors_of[id]));
             }
             want.truncate(limit);
+
+            // Ranked from their headers, as when walking would take too long.
+            let narrow = filter.authors.is_some() || !filter.tags.is_empty();
+            if !text && narrow {
+                let sort = filter.search.as_ref().unwrap().sort;
+                let found = rank_candidates(&store, &txn, &filter, sort, limit).unwrap();
+                let found: Vec<String> = found
+                    .unwrap()
+                    .iter()
+                    .map(|(_, v)| hex::encode(v.id()))
+                    .collect();
+                assert_eq!(found, want, "from headers: {raw}");
+            }
 
             let got: Vec<String> = match text {
                 false => ids(&store, raw.clone()),

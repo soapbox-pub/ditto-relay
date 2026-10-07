@@ -269,6 +269,44 @@ impl<'a> Content<'a> {
     }
 }
 
+/// What a record says ahead of its tags and content, read without them:
+/// for a record too big for a page, without touching the pages they're on.
+pub struct Header<'a> {
+    fixed: &'a [u8; FIXED],
+    expiration: Option<u32>,
+}
+
+impl<'a> Header<'a> {
+    /// `None` if the bytes aren't a record.
+    pub fn new(buf: &'a [u8]) -> Option<Header<'a>> {
+        let fixed: &[u8; FIXED] = buf.get(..FIXED)?.try_into().ok()?;
+        let expiration = match fixed[0] & FLAG_EXPIRATION {
+            0 => None,
+            _ => Some(u32::from_le_bytes(
+                buf.get(FIXED..FIXED + 4)?.try_into().ok()?,
+            )),
+        };
+        Some(Header { fixed, expiration })
+    }
+
+    pub fn id(&self) -> &'a [u8; 32] {
+        self.fixed[1..33].try_into().unwrap()
+    }
+
+    pub fn pubkey(&self) -> &'a [u8; 32] {
+        self.fixed[33..65].try_into().unwrap()
+    }
+
+    pub fn created_at(&self) -> u32 {
+        u32::from_le_bytes(self.fixed[129..133].try_into().unwrap())
+    }
+
+    /// Whether the event has expired by `now`.
+    pub fn is_expired(&self, now: u32) -> bool {
+        self.expiration.is_some_and(|at| at <= now)
+    }
+}
+
 impl<'a> EventView<'a> {
     /// `None` if the bytes aren't a record.
     pub fn new(buf: &'a [u8]) -> Option<EventView<'a>> {

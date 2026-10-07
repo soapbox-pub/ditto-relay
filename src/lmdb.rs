@@ -390,6 +390,11 @@ impl Drop for Txn<'_> {
 
 pub struct RoTxn<'env>(Txn<'env>);
 
+// SAFETY: the environments are opened with MDB_NOTLS, so a read-only
+// transaction belongs to no thread and may move to another; not being Sync,
+// it's still only used by one at a time, as LMDB requires.
+unsafe impl Send for RoTxn<'_> {}
+
 impl<'env> std::ops::Deref for RoTxn<'env> {
     type Target = Txn<'env>;
     fn deref(&self) -> &Txn<'env> {
