@@ -579,7 +579,7 @@ impl SearchIndex {
             authors.extend(unindexed.iter().map(|(_, view)| *view.pubkey()));
         }
 
-        let checked = self.checked_kinds(&searcher, filter)?;
+        let checked = self.checked_kinds(&searcher, filter, search)?;
         let (query, times) = self.query(filter, search, checked.is_none());
         let mut columns: HashMap<u32, Column<u64>> = HashMap::new();
         let mut kind_columns: HashMap<u32, Column<u64>> = HashMap::new();
@@ -766,15 +766,20 @@ impl SearchIndex {
 
     /// The kinds a search's hits are to be checked against one by one,
     /// rather than looked up with its terms: those of a filter that asks
-    /// for kinds making up most of the index.
+    /// for kinds making up most of the index, or for an autocomplete, most
+    /// of the names in it, which are profiles'.
     fn checked_kinds(
         &self,
         searcher: &Searcher,
         filter: &Filter,
+        search: &Search,
     ) -> anyhow::Result<Option<HashSet<u64>>> {
         let Some(kinds) = filter.kinds.as_ref().filter(|&k| *k != self.kinds) else {
             return Ok(None);
         };
+        if search.autocomplete && kinds.contains(&0) {
+            return Ok(Some(kinds.iter().map(|&k| k.into()).collect()));
+        }
         let mut docs = 0;
         for &kind in kinds {
             docs += searcher.doc_freq(&Term::from_field_u64(self.fields.kind, kind.into()))?;
