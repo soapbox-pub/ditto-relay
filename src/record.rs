@@ -434,9 +434,39 @@ fn push_hex_str(out: &mut String, bytes: &[u8]) {
     }
 }
 
+/// `value` as a JSON string, escaped as serde_json does: exactly what JSON
+/// requires, and nothing more.
 fn push_json_str(out: &mut String, value: &str) {
-    // serde_json escapes exactly what JSON requires, and nothing more.
-    out.push_str(&serde_json::to_string(value).expect("strings serialize"));
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.push('"');
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        let short = match byte {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0x08 => Some("\\b"),
+            0x0c => Some("\\f"),
+            0..0x20 => None,
+            _ => continue,
+        };
+        // Up to a byte below 0x80, so on a character boundary.
+        out.push_str(&value[start..i]);
+        match short {
+            Some(escape) => out.push_str(escape),
+            None => {
+                out.push_str("\\u00");
+                out.push(DIGITS[usize::from(byte >> 4)] as char);
+                out.push(DIGITS[usize::from(byte & 0xf)] as char);
+            }
+        }
+        start = i + 1;
+    }
+    out.push_str(&value[start..]);
+    out.push('"');
 }
 
 /// The tags of an event.
@@ -454,15 +484,20 @@ impl<'a> Iterator for Tags<'a> {
         }
         self.remaining -= 1;
         let count = get_varint(&mut self.buf)?;
-        // Measure the tag by walking it, so the next starts where it ends.
+        // Measure the tag by stepping over its elements, so the next starts
+        // where it ends.
         let start = self.buf;
-        let mut walk = Elements {
-            buf: start,
-            remaining: count,
-        };
-        while walk.next().is_some() {}
-        let len = start.len() - walk.buf.len();
-        self.buf = &start[len..];
+        for _ in 0..count {
+            let Some(len) = get_varint(&mut self.buf).and_then(|h| usize::try_from(h >> 1).ok())
+            else {
+                break;
+            };
+            match self.buf.get(len..) {
+                Some(rest) => self.buf = rest,
+                None => break,
+            }
+        }
+        let len = start.len() - self.buf.len();
         Some(Elements {
             buf: &start[..len],
             remaining: count,
@@ -630,6 +665,31 @@ mod tests {
         let record = encode(event);
         let view = EventView::new(&record).unwrap();
         serde_json::from_str(&view.to_json()).unwrap()
+    }
+
+    #[test]
+    fn escapes_strings_as_serde_json_does() {
+        let mut strings: Vec<String> = (0..0x80u8).map(|b| format!("a{}b", b as char)).collect();
+        strings.extend(
+            [
+                "",
+                "\"",
+                "plain",
+                "naïve \"quoted\"\n",
+                "日本\t語 🎉\u{7f}\u{1}",
+            ]
+            .map(String::from),
+        );
+        let mut all = String::new();
+        for s in &strings {
+            all.push_str(s);
+        }
+        strings.push(all);
+        for s in strings {
+            let mut out = String::new();
+            push_json_str(&mut out, &s);
+            assert_eq!(out, serde_json::to_string(&s).unwrap(), "{s:?}");
+        }
     }
 
     #[test]
