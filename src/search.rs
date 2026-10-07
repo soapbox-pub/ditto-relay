@@ -72,12 +72,13 @@ use tantivy::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::facets;
 use crate::filter::{Filter, Search, Sort};
 use crate::lmdb::Txn;
 use crate::query::{MAX_EXAMINED, TooExpensive};
 use crate::rank::WALK_BUDGET;
 use crate::record::{Content, Element, EventView};
-use crate::store::Store;
+use crate::store::{IndexedTags, Store};
 
 /// The name the analyzer is registered under.
 const ANALYZER: &str = "nostr";
@@ -312,6 +313,7 @@ struct Fields {
     created_at: Field,
     text: Field,
     names: Field,
+    facets: Field,
 }
 
 fn schema() -> Schema {
@@ -327,6 +329,8 @@ fn schema() -> Schema {
     builder.add_text_field("text", options.clone());
     // Pre-tokenized, as prefixes.
     builder.add_text_field("names", options);
+    // Its `facets` keys, less their kinds.
+    builder.add_bytes_field("facets", INDEXED);
     builder.build()
 }
 
@@ -341,6 +345,8 @@ pub struct SearchIndex {
     /// The fast field columns opened, by segment and field, which opening
     /// for every search would cost a good part of it.
     columns: Mutex<HashMap<(SegmentId, &'static str), Column<u64>>>,
+    /// The tags the LMDB indexes, whose names are facets.
+    indexed_tags: IndexedTags,
 }
 
 impl SearchIndex {
@@ -396,6 +402,7 @@ impl SearchIndex {
             created_at: field("created_at"),
             text: field("text"),
             names: field("names"),
+            facets: field("facets"),
         };
         let reader = index
             .reader_builder()
@@ -407,6 +414,7 @@ impl SearchIndex {
             kinds,
             indexed: AtomicU64::new(next_seq),
             columns: Mutex::default(),
+            indexed_tags: store.indexed_tags.clone(),
         });
         let indexer = Indexer {
             writer: index.writer(WRITER_MEMORY)?,
@@ -468,6 +476,9 @@ impl SearchIndex {
         if !names.is_empty() {
             doc.add_pre_tokenized_text(f.names, prefixes(&names));
         }
+        for key in facets::keys(view, &self.indexed_tags) {
+            doc.add_bytes(f.facets, &key[..key.len() - 2]);
+        }
         Some(doc)
     }
 
@@ -522,6 +533,20 @@ impl SearchIndex {
                 .iter()
                 .map(|&k| Term::from_field_u64(f.kind, k.into()));
             clauses.push((Occur::Must, any_of(terms.collect())));
+        }
+        // Conditions with an exact facet key are looked up, unscored; the
+        // rest, and these too, are checked on each hit.
+        for condition in &search.conditions {
+            if let Some((start, prefix)) = condition.lookup(&self.indexed_tags)
+                && start == prefix
+            {
+                let term = Term::from_field_bytes(f.facets, &start);
+                let query = TermQuery::new(term, IndexRecordOption::Basic);
+                clauses.push((
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(Box::new(query), 0.0)),
+                ));
+            }
         }
         if let Some(authors) = &filter.authors {
             let terms = authors.iter().map(|a| Term::from_field_bytes(f.pubkey, a));
@@ -1830,10 +1855,15 @@ mod tests {
             "supercalifragilisticky",
         ];
         let mut all = Vec::new();
+        // Some with media attached, video or not.
+        let media = ["https://m.test/a.jpg", "https://m.test/b.mp4"];
         for i in 0..300 {
-            let content: Vec<&str> = (0..rng.random_range(0..5))
+            let mut content: Vec<&str> = (0..rng.random_range(0..5))
                 .map(|_| words[rng.random_range(0..words.len())])
                 .collect();
+            if rng.random_bool(0.3) {
+                content.push(media[rng.random_range(0..2)]);
+            }
             let kind = KINDS[rng.random_range(0..3)];
             let d = i.to_string();
             let mut tags = vec![vec!["d", d.as_str()]];
@@ -1895,6 +1925,10 @@ mod tests {
                     "sentiment:neutral",
                     "-sentiment:neutral",
                     "language:en",
+                    "media:true",
+                    "media:false",
+                    "video:true",
+                    "-video:true",
                     "distinct:author",
                 ];
                 extensions.push(' ');
