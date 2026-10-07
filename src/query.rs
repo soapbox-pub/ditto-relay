@@ -1343,6 +1343,62 @@ mod tests {
         assert_eq!(count_of(&store, json!({"search": "-language:en"})).count, 2);
     }
 
+    /// A reaction is found by the last `p` tag, its target's author, and
+    /// not by those copied from what it reacts to, whichever index answers;
+    /// any other event by every `p` tag.
+    #[test]
+    fn finds_reactions_by_their_targets_author() {
+        let (_dir, store) = open();
+        let [copied, other, target] = [1, 2, 3].map(|n| hex::encode([n; 32]));
+        let tags = vec![
+            vec!["p", copied.as_str()],
+            vec!["e", "ab"],
+            vec!["p", other.as_str()],
+            vec!["p", target.as_str()],
+        ];
+        let reaction = signed(9, 100, 7, tags.clone(), "+");
+        let note = signed(9, 100, 1, tags, "hi");
+        put(&store, &reaction);
+        put(&store, &note);
+        // Others tagging each, so that a filter naming the author is
+        // answered from the author's events, checked one by one.
+        let mut others = Vec::new();
+        for p in [&copied, &other, &target] {
+            for n in 0..5 {
+                let event = signed(8, 101 + n, 1, vec![vec!["p", p.as_str()]], "");
+                put(&store, &event);
+                others.push((p, event.id));
+            }
+        }
+        let author = reaction.pubkey.clone();
+        for (p, theirs) in [
+            (&target, vec![&reaction.id, &note.id]),
+            (&copied, vec![&note.id]),
+            (&other, vec![&note.id]),
+        ] {
+            let everyones: Vec<&String> =
+                others.iter().filter(|o| o.0 == p).map(|o| &o.1).collect();
+            for (filter, want) in [
+                (
+                    json!({"#p": [p]}),
+                    [theirs.clone(), everyones.clone()].concat(),
+                ),
+                (json!({"#p": [p], "authors": [author]}), theirs.clone()),
+                (
+                    json!({"#p": [p], "kinds": [1, 7]}),
+                    [theirs.clone(), everyones.clone()].concat(),
+                ),
+            ] {
+                let mut got = ids(&store, std::slice::from_ref(&filter), 100);
+                got.sort();
+                let mut want: Vec<String> = want.iter().map(|id| id.to_string()).collect();
+                want.sort();
+                assert_eq!(got, want, "{filter}");
+                assert_eq!(count_of(&store, filter).count, want.len() as u64);
+            }
+        }
+    }
+
     #[test]
     fn does_not_index_long_tag_values() {
         let (_dir, store) = open();

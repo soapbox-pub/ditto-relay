@@ -384,7 +384,7 @@ impl Monitors {
         }
         if !self.tags.is_empty() {
             let mut value = Vec::new();
-            for (name, element) in event.tag_values() {
+            for (name, element) in event.filed_tag_values() {
                 if element.encoded_len() > MAX_INDEXED_TAG {
                     continue;
                 }

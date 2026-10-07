@@ -239,14 +239,14 @@ impl Filter {
         if n > 64 {
             // More than the bits to note them in: one pass per tag.
             return self.tags.iter().all(|(name, values)| {
-                event.tag_values().any(|(n, value)| {
+                event.filed_tag_values().any(|(n, value)| {
                     n == name && values.binary_search_by(|v| value.compare(v)).is_ok()
                 })
             });
         }
         let wanted = u64::MAX >> (64 - n);
         let mut found = 0u64;
-        for (name, value) in event.tag_values() {
+        for (name, value) in event.filed_tag_values() {
             let Ok(i) = self
                 .tags
                 .binary_search_by(|(tag, _)| tag.as_str().cmp(name))

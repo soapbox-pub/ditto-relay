@@ -1279,14 +1279,54 @@ impl Store {
 
     /// The `tags` keys an event is filed under.
     fn tag_keys(&self, view: &EventView) -> Vec<Vec<u8>> {
+        self.keys_of(view.kind(), view.filed_tag_values())
+    }
+
+    /// The `tags` keys an event was filed under before its filed tag values
+    /// left some of its tag values out (see
+    /// [`EventView::filed_tag_values`]), that it no longer is.
+    pub fn stale_tag_keys(&self, view: &EventView) -> Vec<Vec<u8>> {
+        let filed = self.tag_keys(view);
+        let mut keys = self.keys_of(view.kind(), view.tag_values());
+        keys.retain(|key| filed.binary_search(key).is_err());
+        keys
+    }
+
+    /// Take a stored event out of the `tags` keys it's no longer filed
+    /// under, if it's still filed under any, returning how many it was.
+    pub fn drop_stale_tag_keys(&self, txn: &mut RwTxn, seq: u64) -> Result<usize> {
+        let t = self.tables;
+        let Some(record) = self.record(txn, seq)? else {
+            return Ok(0);
+        };
+        let view = EventView::new(&record).expect("a stored record");
+        let stamp = stamp(view.created_at(), seq);
+        let mut dropped = 0;
+        for key in self.stale_tag_keys(&view) {
+            if txn.del(t.tags, &key, Some(&stamp))? {
+                dropped += 1;
+                if txn.cursor(t.tags)?.set(&key)?.is_none() {
+                    txn.del(t.hll, &key, None)?;
+                }
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// The `tags` keys of an event of `kind` with these tag values.
+    fn keys_of<'a>(
+        &self,
+        kind: u16,
+        values: impl Iterator<Item = (&'a str, Element<'a>)>,
+    ) -> Vec<Vec<u8>> {
         let mut keys = Vec::new();
-        for (name, value) in view.tag_values() {
+        for (name, value) in values {
             if !self.indexed_tags.contains(name) || value.encoded_len() > MAX_INDEXED_TAG {
                 continue;
             }
             let mut encoded = Vec::with_capacity(value.encoded_len());
             value.encode(&mut encoded);
-            keys.push(tag_key(name, &encoded, Some(view.kind())));
+            keys.push(tag_key(name, &encoded, Some(kind)));
         }
         keys.sort_unstable();
         keys.dedup();
@@ -2000,6 +2040,62 @@ pub mod tests {
             put(&store, event);
         }
         assert!(has(&store, &profiles[1]) && has(&store, &reaction));
+    }
+
+    /// A reaction filed under every `p` tag, as once they were, is taken
+    /// out of all but its last's; anything else is left as it is.
+    #[test]
+    fn drops_stale_tag_keys() {
+        let (_dir, store) = open();
+        let [copied, target] = [1, 2].map(|n| hex::encode([n; 32]));
+        let tags = vec![vec!["p", copied.as_str()], vec!["p", target.as_str()]];
+        let reaction = signed(9, 100, 7, tags.clone(), "+");
+        let note = signed(9, 100, 1, tags, "hi");
+        put(&store, &reaction);
+        put(&store, &note);
+        let t = store.tables;
+        let key = |kind| tag_key("p", &tag_value(&copied), Some(kind));
+        let mut txn = store.write().unwrap();
+        let seq = |txn: &RwTxn, id: &str| {
+            store
+                .seq_of(txn, &decode_hex(id).unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        let reaction_seq = seq(&txn, &reaction.id);
+        let note_seq = seq(&txn, &note.id);
+        // As it was filed before.
+        txn.put_dup(t.tags, &key(7), &stamp(100, reaction_seq))
+            .unwrap();
+        txn.put(t.hll, &key(7), &[0; hll::REGISTERS]).unwrap();
+        let view = EventView::new(
+            txn.get(t.events, &reaction_seq.to_ne_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(store.stale_tag_keys(&view), [key(7)]);
+
+        assert_eq!(
+            store.drop_stale_tag_keys(&mut txn, reaction_seq).unwrap(),
+            1
+        );
+        assert_eq!(
+            store.drop_stale_tag_keys(&mut txn, reaction_seq).unwrap(),
+            0
+        );
+        assert_eq!(store.drop_stale_tag_keys(&mut txn, note_seq).unwrap(), 0);
+        assert!(txn.cursor(t.tags).unwrap().set(&key(7)).unwrap().is_none());
+        assert!(txn.get(t.hll, &key(7)).unwrap().is_none());
+        assert!(txn.cursor(t.tags).unwrap().set(&key(1)).unwrap().is_some());
+        let target_key = tag_key("p", &tag_value(&target), Some(7));
+        assert!(
+            txn.cursor(t.tags)
+                .unwrap()
+                .set(&target_key)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

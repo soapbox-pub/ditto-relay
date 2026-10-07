@@ -54,6 +54,8 @@ const FIXED: usize = 1 + 32 + 32 + 64 + 4 + 2;
 const ADDRESS_FIXED: usize = 2 + 32;
 const NIP04_IV: &str = "?iv=";
 const NIP04_IV_LEN: usize = 16;
+/// NIP-25 reactions.
+const REACTION: u16 = 7;
 
 /// Encode an event, with its [analysis]. It must already be valid: ids and
 /// keys hex, numbers in range (see [`Event::verify`]).
@@ -403,6 +405,27 @@ impl<'a> EventView<'a> {
             };
             Some((name, tag.next()?))
         })
+    }
+
+    /// The [`tag_values`](Self::tag_values) filters match against, and the
+    /// indexes file the event under: for a NIP-25 reaction, of its `p`
+    /// tags only the last, which names whose event it reacts to. Some
+    /// clients copy every `p` tag of what's reacted to, thousands for some
+    /// posts, and everyone named would otherwise be notified of each.
+    pub fn filed_tag_values(&self) -> impl Iterator<Item = (&'a str, Element<'a>)> {
+        let last_p = match self.kind() {
+            REACTION => self
+                .tag_values()
+                .enumerate()
+                .filter(|(_, (n, _))| *n == "p")
+                .last(),
+            _ => None,
+        }
+        .map(|(i, _)| i);
+        self.tag_values()
+            .enumerate()
+            .filter(move |(i, (name, _))| last_p.is_none_or(|last| *name != "p" || *i == last))
+            .map(|(_, value)| value)
     }
 
     /// The first value of the first tag named `name`.
