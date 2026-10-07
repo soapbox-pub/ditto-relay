@@ -197,6 +197,18 @@ async fn stores_and_finds_events() {
 }
 
 #[tokio::test]
+async fn takes_messages_bigger_than_its_read_buffer() {
+    let relay = Relay::start().await;
+    let mut client = relay.connect().await;
+    let big = note(1, &"long post ".repeat(10 * super::READ_BUFFER / 8));
+    assert_eq!(client.publish(&big).await, (true, String::new()));
+    // And one small after, from what's left in the buffer.
+    let small = note(2, "short");
+    assert_eq!(client.publish(&small).await, (true, String::new()));
+    assert_eq!(client.req("a", &[json!({"kinds": [1]})]).await.len(), 2);
+}
+
+#[tokio::test]
 async fn refuses_bad_signatures() {
     let relay = Relay::start().await;
     let mut client = relay.connect().await;

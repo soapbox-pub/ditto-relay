@@ -148,6 +148,12 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// How much of a connection's read buffer is filled at a time. tungstenite
+/// zeroes all of it before every read, and messages are mostly a few hundred
+/// bytes: at its default of 128 KiB, that was a twentieth of what the relay
+/// did. A bigger frame gets room of its own.
+const READ_BUFFER: usize = 8 << 10;
+
 async fn root(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -160,6 +166,7 @@ async fn root(
         return ws
             .max_message_size(max)
             .max_frame_size(max)
+            .read_buffer_size(READ_BUFFER)
             .on_upgrade(move |socket| {
                 let connections = state.connections.clone();
                 connections.track_future(Connection::run(socket, state, ip))
