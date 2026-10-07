@@ -441,7 +441,17 @@ fn push_json_str(out: &mut String, value: &str) {
     out.push('"');
     let bytes = value.as_bytes();
     let mut start = 0;
-    for (i, &byte) in bytes.iter().enumerate() {
+    let mut i = 0;
+    while i < bytes.len() {
+        // Eight bytes at a time while there's nothing to escape.
+        if let Some(chunk) = bytes.get(i..i + 8)
+            && !needs_escape(u64::from_ne_bytes(chunk.try_into().unwrap()))
+        {
+            i += 8;
+            continue;
+        }
+        let byte = bytes[i];
+        i += 1;
         let short = match byte {
             b'"' => Some("\\\""),
             b'\\' => Some("\\\\"),
@@ -454,7 +464,7 @@ fn push_json_str(out: &mut String, value: &str) {
             _ => continue,
         };
         // Up to a byte below 0x80, so on a character boundary.
-        out.push_str(&value[start..i]);
+        out.push_str(&value[start..i - 1]);
         match short {
             Some(escape) => out.push_str(escape),
             None => {
@@ -463,10 +473,23 @@ fn push_json_str(out: &mut String, value: &str) {
                 out.push(DIGITS[usize::from(byte & 0xf)] as char);
             }
         }
-        start = i + 1;
+        start = i;
     }
     out.push_str(&value[start..]);
     out.push('"');
+}
+
+/// Whether any of eight bytes must be escaped in a JSON string: is below
+/// 0x20, a quote, or a backslash.
+fn needs_escape(chunk: u64) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = ONES * 0x80;
+    // Whether any byte is below n, for n up to 0x80; and is zero.
+    let below = |x: u64, n: u8| x.wrapping_sub(ONES * u64::from(n)) & !x & HIGH != 0;
+    let zero = |x: u64| below(x, 1);
+    below(chunk, 0x20)
+        || zero(chunk ^ (ONES * u64::from(b'"')))
+        || zero(chunk ^ (ONES * u64::from(b'\\')))
 }
 
 /// The tags of an event.
@@ -527,8 +550,18 @@ impl<'a> Iterator for Elements<'a> {
         match (header & 1 == 1, len) {
             (true, 32) => Some(Element::Hex(bytes.try_into().ok()?)),
             (true, _) => address_element(bytes),
-            (false, _) => Some(Element::Text(std::str::from_utf8(bytes).ok()?)),
+            (false, _) => Some(Element::Text(text(bytes)?)),
         }
+    }
+}
+
+/// Bytes as text, if they're UTF-8: most tag values are short and ASCII,
+/// which is quicker to check for.
+fn text(bytes: &[u8]) -> Option<&str> {
+    match bytes.is_ascii() {
+        // SAFETY: ASCII is UTF-8.
+        true => Some(unsafe { std::str::from_utf8_unchecked(bytes) }),
+        false => std::str::from_utf8(bytes).ok(),
     }
 }
 
@@ -668,6 +701,21 @@ mod tests {
     }
 
     #[test]
+    fn finds_bytes_to_escape_eight_at_a_time() {
+        for byte in 0..=255u8 {
+            let want = byte < 0x20 || byte == b'"' || byte == b'\\';
+            for at in 0..8 {
+                for fill in [b'a', 0x7f, 0xff, 0x20] {
+                    let mut chunk = [fill; 8];
+                    chunk[at] = byte;
+                    let fill_needs = fill < 0x20;
+                    assert_eq!(needs_escape(u64::from_ne_bytes(chunk)), want || fill_needs);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn escapes_strings_as_serde_json_does() {
         let mut strings: Vec<String> = (0..0x80u8).map(|b| format!("a{}b", b as char)).collect();
         strings.extend(
@@ -685,6 +733,16 @@ mod tests {
             all.push_str(s);
         }
         strings.push(all);
+        // Wherever they fall among the bytes taken eight at a time.
+        for special in ["\"", "\\", "\n", "\u{1f}", "é", "🎉"] {
+            for at in 0..20 {
+                strings.push(format!(
+                    "{}{special}{}",
+                    "x".repeat(at),
+                    "y".repeat(19 - at)
+                ));
+            }
+        }
         for s in strings {
             let mut out = String::new();
             push_json_str(&mut out, &s);
