@@ -426,27 +426,7 @@ impl<'a> EventView<'a> {
         out.push_str(",\"kind\":");
         out.push_str(&self.kind().to_string());
         out.push_str(",\"tags\":[");
-        for (i, tag) in self.tags().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('[');
-            for (j, element) in tag.enumerate() {
-                if j > 0 {
-                    out.push(',');
-                }
-                match element {
-                    Element::Text(text) => push_json_str(&mut out, text),
-                    Element::Hex(bytes) => {
-                        out.push('"');
-                        push_hex_str(&mut out, bytes);
-                        out.push('"');
-                    }
-                    Element::Address { .. } => push_json_str(&mut out, &element.to_text()),
-                }
-            }
-            out.push(']');
-        }
+        push_tags_json(&mut out, self.tags);
         out.push_str("],\"content\":");
         match self.content {
             Content::Text(text) => push_json_str(&mut out, text),
@@ -464,23 +444,95 @@ impl<'a> EventView<'a> {
     }
 }
 
-fn push_hex_str(out: &mut String, bytes: &[u8]) {
-    // Each byte's two digits.
-    const PAIRS: [[u8; 2]; 256] = {
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut pairs = [[0; 2]; 256];
-        let mut byte = 0;
-        while byte < 256 {
-            pairs[byte] = [DIGITS[byte >> 4], DIGITS[byte & 0xf]];
-            byte += 1;
-        }
-        pairs
+/// The elements of encoded tags as JSON arrays, comma separated, in one
+/// pass over them: walking them as [`Tags`] does goes over each tag twice,
+/// once to find where it ends, which for an event with thousands of tags is
+/// most of what writing it costs. A record's tags are only ever what
+/// [`encode`] wrote, but an element that doesn't read as that ends its tag,
+/// and one whose length doesn't, the tags, as they would walking them.
+fn push_tags_json(out: &mut String, mut buf: &[u8]) {
+    let Some(count) = get_varint(&mut buf) else {
+        return;
     };
+    for i in 0..count {
+        let Some(elements) = get_varint(&mut buf) else {
+            return;
+        };
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        let mut ended = false;
+        for j in 0..elements {
+            let Some((header, len)) =
+                get_varint(&mut buf).and_then(|h| Some((h, usize::try_from(h >> 1).ok()?)))
+            else {
+                out.push(']');
+                return;
+            };
+            let Some((bytes, rest)) = buf.split_at_checked(len) else {
+                out.push(']');
+                return;
+            };
+            buf = rest;
+            if ended {
+                continue;
+            }
+            let element = match (header & 1 == 1, len) {
+                (true, 32) => Some(Element::Hex(bytes.try_into().expect("32 bytes"))),
+                (true, _) => address_element(bytes),
+                (false, _) => text(bytes).map(Element::Text),
+            };
+            let Some(element) = element else {
+                ended = true;
+                continue;
+            };
+            if j > 0 {
+                out.push(',');
+            }
+            match element {
+                Element::Text(text) => push_json_str(out, text),
+                Element::Hex(bytes) => push_hex_json(out, bytes),
+                Element::Address { .. } => push_json_str(out, &element.to_text()),
+            }
+        }
+        out.push(']');
+    }
+}
+
+/// Each byte's two hex digits.
+const HEX_PAIRS: [[u8; 2]; 256] = {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut pairs = [[0; 2]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        pairs[byte] = [DIGITS[byte >> 4], DIGITS[byte & 0xf]];
+        byte += 1;
+    }
+    pairs
+};
+
+/// 32 bytes as a JSON string of their hex, quotes and all, appended at once.
+fn push_hex_json(out: &mut String, bytes: &[u8; 32]) {
+    let mut json = [b'"'; 66];
+    for (pair, &byte) in json[1..65].as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
+        *pair = HEX_PAIRS[usize::from(byte)];
+    }
+    // SAFETY: only quotes and ASCII digits are appended, so it stays UTF-8.
+    unsafe { out.as_mut_vec() }.extend_from_slice(&json);
+}
+
+fn push_hex_str(out: &mut String, bytes: &[u8]) {
     // SAFETY: only ASCII digits are appended, so it stays UTF-8.
     let out = unsafe { out.as_mut_vec() };
-    out.reserve(bytes.len() * 2);
-    for &byte in bytes {
-        out.extend_from_slice(&PAIRS[usize::from(byte)]);
+    // A key's worth at a time on the stack, appended at once: appending each
+    // pair checks for room and stores the length every time.
+    for chunk in bytes.chunks(32) {
+        let mut hex = [0u8; 64];
+        for (pair, &byte) in hex.as_chunks_mut::<2>().0.iter_mut().zip(chunk) {
+            *pair = HEX_PAIRS[usize::from(byte)];
+        }
+        out.extend_from_slice(&hex[..chunk.len() * 2]);
     }
 }
 
@@ -488,6 +540,14 @@ fn push_hex_str(out: &mut String, bytes: &[u8]) {
 /// requires, and nothing more.
 fn push_json_str(out: &mut String, value: &str) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    // Tag names and most short values, at once.
+    if value.len() <= 8 && !value.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\') {
+        let mut json = [b'"'; 10];
+        json[1..=value.len()].copy_from_slice(value.as_bytes());
+        // SAFETY: what's appended is `value`, UTF-8, between quotes.
+        unsafe { out.as_mut_vec() }.extend_from_slice(&json[..value.len() + 2]);
+        return;
+    }
     out.push('"');
     let bytes = value.as_bytes();
     let mut start = 0;
@@ -810,6 +870,69 @@ mod tests {
         let record = encode(&expiring);
         assert!(author_unless_expired(&record, 149).is_some());
         assert_eq!(author_unless_expired(&record, 150), None);
+    }
+
+    /// The tags as JSON the slow way, walking them as [`Tags`] does.
+    fn tags_by_walking(view: &EventView) -> String {
+        let tags: Vec<Vec<String>> = view
+            .tags()
+            .map(|tag| tag.map(|e| e.to_text().into_owned()).collect())
+            .collect();
+        serde_json::to_string(&tags).unwrap()
+    }
+
+    /// Random tags of every sort of element, written in one pass, read back
+    /// as they were written, and as walking them reads them; and so is a
+    /// record whose elements don't all read, as no record written has.
+    #[test]
+    fn writes_tags_as_walking_them_does() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(5);
+        let hex = "0123456789abcdef".repeat(4);
+        let address = format!("30023:{hex}:a \"d\"");
+        let texts = [
+            "",
+            "p",
+            "e",
+            "t",
+            "quote\"",
+            "back\\slash",
+            "nl\n",
+            "\u{1}",
+            "naïve",
+            "🎉 long enough to escape slowly \t",
+            "x".repeat(300).leak(),
+        ];
+        for _ in 0..300 {
+            let tags: Vec<Vec<&str>> = (0..rng.random_range(0..12))
+                .map(|_| {
+                    (0..rng.random_range(0..5))
+                        .map(|_| match rng.random_range(0..4) {
+                            0 => hex.as_str(),
+                            1 => address.as_str(),
+                            _ => texts[rng.random_range(0..texts.len())],
+                        })
+                        .collect()
+                })
+                .collect();
+            let event = signed(1, 100, 1, tags, "hi");
+            assert_eq!(roundtrip(&event), event);
+            let record = encode(&event);
+            let view = EventView::new(&record).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&view.to_json()).unwrap();
+            assert_eq!(json["tags"].to_string(), tags_by_walking(&view));
+        }
+
+        // A text element not UTF-8 ends its tag, and the rest go on.
+        let event = signed(1, 100, 1, vec![vec!["a", "bad", "c"], vec!["d", "e"]], "");
+        let mut record = encode(&event);
+        let at = record.windows(3).position(|w| w == b"bad").unwrap();
+        record[at] = 0xff;
+        let view = EventView::new(&record).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&view.to_json()).unwrap();
+        assert_eq!(json["tags"].to_string(), tags_by_walking(&view));
+        assert_eq!(json["tags"].to_string(), r#"[["a"],["d","e"]]"#);
     }
 
     #[test]
