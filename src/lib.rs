@@ -1,4 +1,4 @@
-//! The relay, as a library for its binary and its examples.
+//! The relay, as a library for its binary.
 
 pub mod analysis;
 pub mod auth;
