@@ -78,8 +78,12 @@ struct Relay {
 
 impl Relay {
     async fn start() -> Relay {
+        Relay::start_with(config()).await
+    }
+
+    async fn start_with(config: Config) -> Relay {
         let (dir, store) = store::tests::open();
-        let state = AppState::new(config(), Arc::new(store), None);
+        let state = AppState::new(config, Arc::new(store), None);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());
@@ -434,4 +438,36 @@ async fn counts() {
     let msg = client.next().await;
     assert_eq!(msg[0], "COUNT");
     assert_eq!(msg[2]["count"], 3);
+}
+
+#[tokio::test]
+async fn answers_queries_while_its_events_are_stored() {
+    // A write policy that takes its time, as a busy writer does.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slow.sh");
+    let body = r#"#!/bin/sh
+while read -r line; do
+  id=$(echo "$line" | sed 's/.*"id":"\([0-9a-f]*\)".*/\1/')
+  sleep 1
+  echo "{\"id\":\"$id\",\"action\":\"accept\"}"
+done
+"#;
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let relay = Relay::start_with(Config {
+        write_policy_plugin: Some(path.display().to_string()),
+        ..config()
+    })
+    .await;
+    let mut client = relay.connect().await;
+
+    let ev = note(1, "slow");
+    client.send(json!(["EVENT", ev])).await;
+    // Answered while the event is still being judged.
+    assert_eq!(
+        client.req("a", &[json!({"kinds": [7]})]).await,
+        Vec::<String>::new()
+    );
+    let ok = client.next().await;
+    assert_eq!(ok, json!(["OK", ev.id, true, ""]));
 }

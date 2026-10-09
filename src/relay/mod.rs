@@ -298,6 +298,21 @@ const OUTBOUND: usize = 16_384;
 /// Past this it's closed, and its client can ask again.
 const MAX_PENDING: usize = OUTBOUND;
 
+/// Events a connection may have waiting to be stored at once. Past this,
+/// its next message waits until one is answered, so a flood of events slows
+/// only the connection sending it.
+const MAX_PUBLISHING: usize = 64;
+
+/// How an event a connection published was answered, once it's been
+/// verified, judged, and stored.
+struct Published {
+    id: String,
+    accepted: bool,
+    msg: Cow<'static, str>,
+    /// Shadow-rejected: told it was accepted, but not counted as such.
+    shadow: bool,
+}
+
 struct Subscription {
     /// This REQ's own name: a later REQ of the same id gets a new one, so
     /// results meant for the one it replaced can be told apart.
@@ -390,6 +405,9 @@ impl Connection {
         let mut ping = tokio::time::interval_at(start, PING_INTERVAL);
         let mut heard = Instant::now();
         let mut queries = JoinSet::new();
+        // Events being stored apart from the loop, so a slow write holds up
+        // only its own OK, not the connection's queries and live events.
+        let mut publishing = JoinSet::new();
         let shutdown = state.shutdown.clone();
         let mut conn = Connection {
             cancel: shutdown.child_token(),
@@ -411,17 +429,20 @@ impl Connection {
                     break;
                 }
                 _ = ping.tick() => {
-                    if heard.elapsed() > 2 * PING_INTERVAL {
+                    // One waiting on its own events to be stored isn't silent.
+                    if heard.elapsed() > 2 * PING_INTERVAL && publishing.is_empty() {
                         tracing::debug!("dropping a client that went silent");
                         METRICS.dropped_silent.inc();
                         break;
                     }
                     write_within(conn.sink.send(Message::Ping(Default::default()))).await
                 }
-                msg = stream.next() => {
+                msg = stream.next(), if publishing.len() < MAX_PUBLISHING => {
                     heard = Instant::now();
                     match msg {
-                        Some(Ok(Message::Text(text))) => conn.on_message(text.as_str(), &mut queries).await,
+                        Some(Ok(Message::Text(text))) => {
+                            conn.on_message(text.as_str(), &mut queries, &mut publishing).await
+                        }
                         Some(Ok(Message::Binary(_))) => conn.notice("error: binary messages are not supported").await,
                         Some(Ok(Message::Ping(_) | Message::Pong(_))) => Ok(()),
                         Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Disconnect::Gone),
@@ -435,6 +456,11 @@ impl Connection {
                     // their panics.
                     Err(_) => Ok(()),
                 },
+                Some(done) = publishing.join_next(), if !publishing.is_empty() => match done {
+                    Ok(published) => conn.on_published(published).await,
+                    // Only aborted when the connection's gone.
+                    Err(_) => Ok(()),
+                },
             };
             if let Err(disconnect) = result {
                 if disconnect == Disconnect::Stalled {
@@ -443,6 +469,18 @@ impl Connection {
                 }
                 break;
             }
+        }
+
+        // At shutdown, answer the events being stored before closing.
+        if conn.state.shutdown.is_cancelled() {
+            let answer = async {
+                while let Some(Ok(published)) = publishing.join_next().await {
+                    if conn.on_published(published).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, answer).await;
         }
 
         // Dropping `queries` drops their tasks, but not what they left
@@ -481,13 +519,17 @@ impl Connection {
         &mut self,
         text: &str,
         queries: &mut JoinSet<Done>,
+        publishing: &mut JoinSet<Published>,
     ) -> Result<(), Disconnect> {
         let Ok(Value::Array(mut msg)) = serde_json::from_str::<Value>(text) else {
             return self.notice("invalid: message must be a JSON array").await;
         };
 
         match msg.first().and_then(Value::as_str) {
-            Some("EVENT") => self.on_event(msg.get_mut(1).map(Value::take)).await,
+            Some("EVENT") => {
+                self.on_event(msg.get_mut(1).map(Value::take), publishing)
+                    .await
+            }
             Some("REQ") => self.on_req(&msg[1..], queries).await,
             Some("COUNT") => self.on_count(&msg[1..], queries).await,
             Some("AUTH") => self.on_auth(msg.get_mut(1).map(Value::take)).await,
@@ -505,7 +547,13 @@ impl Connection {
         }
     }
 
-    async fn on_event(&mut self, value: Option<Value>) -> Result<(), Disconnect> {
+    /// Check an event, then verify, judge, and store it apart from the
+    /// connection's loop, which answers it once that's done.
+    async fn on_event(
+        &mut self,
+        value: Option<Value>,
+        publishing: &mut JoinSet<Published>,
+    ) -> Result<(), Disconnect> {
         let Some(value) = value else {
             return self.notice("invalid: EVENT requires an event").await;
         };
@@ -514,22 +562,54 @@ impl Connection {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let checked = match self.check(value) {
-            Ok(ev) => self.verify(ev).await,
-            Err(msg) => Err(msg),
+        let ev = match self.check(value) {
+            Ok(ev) => ev,
+            Err(msg) => {
+                let refused = Published {
+                    id,
+                    accepted: false,
+                    msg,
+                    shadow: false,
+                };
+                return self.on_published(refused).await;
+            }
         };
-        let (accepted, msg) = match checked {
-            Err(msg) => (false, msg),
-            Ok(None) => (true, DUPLICATE.into()),
-            Ok(Some(ev)) => match self.ask_plugin(&ev).await {
-                Verdict::Accept => self.accept(&id, ev).await,
-                Verdict::Reject(msg) => (false, msg.into()),
-                Verdict::ShadowReject(msg) => {
-                    METRICS.events_shadow_rejected.inc();
-                    return self.ok(&id, true, &msg).await;
-                }
-            },
-        };
+        let (state, ip, authed) = (self.state.clone(), self.ip, self.authed.clone());
+        publishing.spawn(async move {
+            let (accepted, msg, shadow) = match verify(&state, ev).await {
+                Err(msg) => (false, msg, false),
+                Ok(None) => (true, DUPLICATE.into(), false),
+                Ok(Some(ev)) => match ask_plugin(&state, ip, &authed, &ev).await {
+                    Verdict::Accept => {
+                        let (accepted, msg) = accept(&state, &id, ev).await;
+                        (accepted, msg, false)
+                    }
+                    Verdict::Reject(msg) => (false, msg.into(), false),
+                    Verdict::ShadowReject(msg) => (true, msg.into(), true),
+                },
+            };
+            Published {
+                id,
+                accepted,
+                msg,
+                shadow,
+            }
+        });
+        Ok(())
+    }
+
+    /// Answer an event the connection published.
+    async fn on_published(&mut self, published: Published) -> Result<(), Disconnect> {
+        let Published {
+            id,
+            accepted,
+            msg,
+            shadow,
+        } = published;
+        if shadow {
+            METRICS.events_shadow_rejected.inc();
+            return self.ok(&id, true, &msg).await;
+        }
         if msg.starts_with("auth-required:") && self.challenge.is_none() {
             let challenge = auth::challenge();
             self.send(&("AUTH", &challenge)).await?;
@@ -565,108 +645,6 @@ impl Connection {
             return Err("invalid: this request to vanish is for other relays".into());
         }
         Ok(ev)
-    }
-
-    /// The event if its id and signature are good, or None if it's stored
-    /// already. Both checks run on the blocking pool: the lookup can stall
-    /// on disk, and the signature takes a while.
-    async fn verify(&self, ev: Event) -> Result<Option<Event>, Cow<'static, str>> {
-        let Ok(_place) = self.state.verifiers.acquire().await else {
-            return Err("error: shutting down".into());
-        };
-        let store = self.state.store.clone();
-        let verified = tokio::task::spawn_blocking(move || {
-            // Events are resent all the time, and each would cost a
-            // signature check, so look first: one with the stored copy's
-            // signature is that event, verified when it was stored.
-            let id = event::decode_hex::<32>(&ev.id);
-            let sig = event::decode_hex::<64>(&ev.sig);
-            if let (Some(id), Some(sig)) = (id, sig) {
-                let stored = store.read().and_then(|txn| store.sig_of(&txn, &id));
-                if stored.ok().flatten() == Some(sig) {
-                    return Ok(None);
-                }
-            }
-            ev.verify()?;
-            Ok(Some(ev))
-        })
-        .await;
-        verified.unwrap_or_else(|err| {
-            tracing::error!("verifying an event panicked: {err}");
-            METRICS.errors_panic.inc();
-            Err("error: failed to check event".into())
-        })
-    }
-
-    /// What the write policy plugin makes of an event, if there is one.
-    async fn ask_plugin(&self, ev: &Event) -> Verdict {
-        let Some(plugin) = &self.state.plugin else {
-            return Verdict::Accept;
-        };
-        // strfry names one pubkey: the author's, if it's among them.
-        let author = event::decode_hex(&ev.pubkey).expect("verified");
-        let authed = match self.authed.contains(&author) {
-            true => Some(author),
-            false => self.authed.iter().next().copied(),
-        }
-        .map(hex::encode);
-        let source = plugin::Source {
-            ip: self.ip,
-            authed: authed.as_deref(),
-        };
-        let start = Instant::now();
-        let verdict = plugin.judge(ev, &source).await;
-        METRICS.plugin.since(start);
-        if let Verdict::Reject(msg) | Verdict::ShadowReject(msg) = &verdict
-            && !msg.is_empty()
-        {
-            tracing::debug!("write policy blocked event {}: {msg}", ev.id);
-        }
-        verdict
-    }
-
-    /// Stores an event, or sends it to live subscriptions, with a NIP-01
-    /// OK message.
-    async fn accept(&mut self, id: &str, ev: Event) -> (bool, Cow<'static, str>) {
-        let now = event::now();
-        let ephemeral = ev.kind_class() == KindClass::Ephemeral;
-        // Encoding guesses the event's language and sentiment, which takes
-        // a while for long text.
-        let record = match tokio::task::spawn_blocking(move || record::encode(&ev)).await {
-            Ok(record) => Arc::new(record),
-            Err(err) => {
-                tracing::error!("encoding event {id} panicked: {err}");
-                METRICS.errors_panic.inc();
-                return (false, "error: failed to store event".into());
-            }
-        };
-        let view = EventView::new(&record).expect("an encoded record");
-        if view.is_expired(now) {
-            return (false, EXPIRED.into());
-        }
-        if ephemeral {
-            self.state.hub.publish(vec![Live::new(record, None)]).await;
-            return (true, "".into());
-        }
-
-        // The writer sends what it stores to live subscriptions.
-        match self.state.writer.write(record).await {
-            Ok(Outcome::Stored(_)) => (true, "".into()),
-            // Kept, but old news: not sent to live subscriptions.
-            Ok(Outcome::Archived(_)) => (true, "".into()),
-            Ok(Outcome::Duplicate) => (true, DUPLICATE.into()),
-            Ok(Outcome::Expired) => (false, EXPIRED.into()),
-            Ok(Outcome::Deleted) => (false, "blocked: this event has been deleted".into()),
-            Ok(Outcome::Replaced) => (
-                false,
-                "duplicate: have a newer version of this event".into(),
-            ),
-            Err(err) => {
-                tracing::error!("failed to store event {id}: {err:#}");
-                METRICS.errors_write.inc();
-                (false, "error: failed to store event".into())
-            }
-        }
     }
 
     async fn on_req(
@@ -931,6 +909,113 @@ impl Connection {
             // Already covered by the subscription's initial query.
             None if seq.is_some_and(|seq| seq < state.floor) => Ok(()),
             None => self.send_event(&sub, &json).await,
+        }
+    }
+}
+
+/// The event if its id and signature are good, or None if it's stored
+/// already. Both checks run on the blocking pool: the lookup can stall
+/// on disk, and the signature takes a while.
+async fn verify(state: &AppState, ev: Event) -> Result<Option<Event>, Cow<'static, str>> {
+    let Ok(_place) = state.verifiers.acquire().await else {
+        return Err("error: shutting down".into());
+    };
+    let store = state.store.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        // Events are resent all the time, and each would cost a
+        // signature check, so look first: one with the stored copy's
+        // signature is that event, verified when it was stored.
+        let id = event::decode_hex::<32>(&ev.id);
+        let sig = event::decode_hex::<64>(&ev.sig);
+        if let (Some(id), Some(sig)) = (id, sig) {
+            let stored = store.read().and_then(|txn| store.sig_of(&txn, &id));
+            if stored.ok().flatten() == Some(sig) {
+                return Ok(None);
+            }
+        }
+        ev.verify()?;
+        Ok(Some(ev))
+    })
+    .await;
+    verified.unwrap_or_else(|err| {
+        tracing::error!("verifying an event panicked: {err}");
+        METRICS.errors_panic.inc();
+        Err("error: failed to check event".into())
+    })
+}
+
+/// What the write policy plugin makes of an event, if there is one.
+async fn ask_plugin(
+    state: &AppState,
+    ip: IpAddr,
+    authed: &HashSet<[u8; 32]>,
+    ev: &Event,
+) -> Verdict {
+    let Some(plugin) = &state.plugin else {
+        return Verdict::Accept;
+    };
+    // strfry names one pubkey: the author's, if it's among them.
+    let author = event::decode_hex(&ev.pubkey).expect("verified");
+    let authed = match authed.contains(&author) {
+        true => Some(author),
+        false => authed.iter().next().copied(),
+    }
+    .map(hex::encode);
+    let source = plugin::Source {
+        ip,
+        authed: authed.as_deref(),
+    };
+    let start = Instant::now();
+    let verdict = plugin.judge(ev, &source).await;
+    METRICS.plugin.since(start);
+    if let Verdict::Reject(msg) | Verdict::ShadowReject(msg) = &verdict
+        && !msg.is_empty()
+    {
+        tracing::debug!("write policy blocked event {}: {msg}", ev.id);
+    }
+    verdict
+}
+
+/// Stores an event, or sends it to live subscriptions, with a NIP-01
+/// OK message.
+async fn accept(state: &AppState, id: &str, ev: Event) -> (bool, Cow<'static, str>) {
+    let now = event::now();
+    let ephemeral = ev.kind_class() == KindClass::Ephemeral;
+    // Encoding guesses the event's language and sentiment, which takes
+    // a while for long text.
+    let record = match tokio::task::spawn_blocking(move || record::encode(&ev)).await {
+        Ok(record) => Arc::new(record),
+        Err(err) => {
+            tracing::error!("encoding event {id} panicked: {err}");
+            METRICS.errors_panic.inc();
+            return (false, "error: failed to store event".into());
+        }
+    };
+    let view = EventView::new(&record).expect("an encoded record");
+    if view.is_expired(now) {
+        return (false, EXPIRED.into());
+    }
+    if ephemeral {
+        state.hub.publish(vec![Live::new(record, None)]).await;
+        return (true, "".into());
+    }
+
+    // The writer sends what it stores to live subscriptions.
+    match state.writer.write(record).await {
+        Ok(Outcome::Stored(_)) => (true, "".into()),
+        // Kept, but old news: not sent to live subscriptions.
+        Ok(Outcome::Archived(_)) => (true, "".into()),
+        Ok(Outcome::Duplicate) => (true, DUPLICATE.into()),
+        Ok(Outcome::Expired) => (false, EXPIRED.into()),
+        Ok(Outcome::Deleted) => (false, "blocked: this event has been deleted".into()),
+        Ok(Outcome::Replaced) => (
+            false,
+            "duplicate: have a newer version of this event".into(),
+        ),
+        Err(err) => {
+            tracing::error!("failed to store event {id}: {err:#}");
+            METRICS.errors_write.inc();
+            (false, "error: failed to store event".into())
         }
     }
 }
