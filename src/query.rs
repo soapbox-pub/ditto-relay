@@ -35,6 +35,7 @@
 //! limits: scans and walks look every so often whether it's been
 //! cancelled.
 
+use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashSet};
 
 use secp256k1::Keypair;
@@ -124,17 +125,14 @@ pub fn run(
         if filter.never || limit == 0 {
             continue;
         }
-        let filter = &*crate::rank::windowed(store, filter);
-        let found = match (&filter.search, &filter.ids) {
-            (Some(query), None) if !query.terms.is_empty() => match search {
-                Some(search) => search.run(store, &txn, filter, query, limit)?,
-                None => Vec::new(),
-            },
-            (Some(query), _) if query.sort.is_ranked() => {
-                crate::rank::run(store, &txn, filter, limit, cancel)?
-            }
-            _ => run_filter(store, &txn, filter, limit, cancel)?,
-        };
+        let window = crate::rank::windowed(store, filter);
+        let mut found = find(store, search, &txn, &window, limit, cancel)?;
+        if let Cow::Owned(window) = &window {
+            fill_back(
+                store, search, &txn, filter, window, limit, &mut found, cancel,
+            )?;
+        }
+        let filter = &*window;
         let left = limit - found.len().min(limit);
         for (seq, view) in found {
             if seen.insert(seq) {
@@ -153,6 +151,81 @@ pub fn run(
         return Err(Cancelled.into());
     }
     Ok(Results { next_seq, events })
+}
+
+/// The most weeks one `sort:hot` filter looks back through to fill its
+/// page: see [`fill_back`].
+const MAX_HOT_WINDOWS: usize = 52;
+
+/// A filter's matches, up to `limit`, in its search's order.
+fn find<'t>(
+    store: &Store,
+    search: Option<&SearchIndex>,
+    txn: &'t Txn,
+    filter: &Filter,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Vec<(u64, EventView<'t>)>> {
+    Ok(match (&filter.search, &filter.ids) {
+        (Some(query), None) if !query.terms.is_empty() => match search {
+            Some(search) => search.run(store, txn, filter, query, limit)?,
+            None => Vec::new(),
+        },
+        (Some(query), _) if query.sort.is_ranked() => {
+            crate::rank::run(store, txn, filter, limit, cancel)?
+        }
+        _ => run_filter(store, txn, filter, limit, cancel)?,
+    })
+}
+
+/// `sort:hot` finds only a week's events back from `until` (see
+/// [`crate::rank::windowed`]), but a page short of its limit tells a client
+/// paging back there's nothing older, and an empty one that it's at the
+/// end. So a page `window` leaves short goes on to the week back from the
+/// newest older match, hot or not, ranked after the weeks before it, and so
+/// on until it's full, nothing older matches, or [`MAX_HOT_WINDOWS`].
+#[allow(clippy::too_many_arguments)]
+fn fill_back<'t>(
+    store: &Store,
+    search: Option<&SearchIndex>,
+    txn: &'t Txn,
+    filter: &Filter,
+    window: &Filter,
+    limit: usize,
+    found: &mut Vec<(u64, EventView<'t>)>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let distinct = filter.search.as_ref().is_some_and(|s| s.distinct_author);
+    let mut authors: HashSet<[u8; 32]> = match distinct {
+        true => found.iter().map(|(_, view)| *view.pubkey()).collect(),
+        false => HashSet::new(),
+    };
+    let mut since = window.since;
+    for _ in 1..MAX_HOT_WINDOWS {
+        if found.len() >= limit || since <= filter.since {
+            break;
+        }
+        if cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        let mut older = crate::rank::unranked(filter);
+        older.until = since - 1;
+        let Some((_, newest)) = find(store, search, txn, &older, 1, cancel)?.pop() else {
+            break;
+        };
+        let back = Filter {
+            until: newest.created_at(),
+            ..filter.clone()
+        };
+        let back = crate::rank::windowed(store, &back);
+        since = back.since;
+        for (seq, view) in find(store, search, txn, &back, limit - found.len(), cancel)? {
+            if !distinct || authors.insert(*view.pubkey()) {
+                found.push((seq, view));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A filter's newest matches, up to `limit` (and any tied with the last).

@@ -4,6 +4,13 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [Unreleased]
+
+- A `sort:hot` page that the week before its `until` leaves short of its
+  limit goes on to the weeks before, each ranked after the last, instead of
+  ending there. A week with nothing hot no longer comes back as an empty
+  page, which clients take for the end of what the filter matches.
+
 ## [2.0.0]
 
 The first release of Ditto Relay in Rust, rewritten on its own database in

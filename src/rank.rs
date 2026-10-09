@@ -61,9 +61,12 @@
 //! `score * 2^-(age / half_life)` does at any moment, so it needn't change
 //! as time passes; for `sort:controversial` by
 //! `min(comments, reactions) * sqrt(comments + reactions)`; and for
-//! `sort:zaps` by zaps. `sort:hot` finds only events from the week before
-//! a filter's `until`, or now, so it pages back by `until`. Profiles are ranked instead by their author's
-//! trust, and for `sort:zaps` by what their author has received.
+//! `sort:zaps` by zaps. `sort:hot` ranks only events from the week before
+//! a filter's `until`, or now, so it pages back by `until`; a page that
+//! week leaves short goes on to the week before the next older match, and
+//! so on, for up to a year of weeks with matches. Profiles are ranked
+//! instead by their author's trust, and for `sort:zaps` by what their
+//! author has received.
 //!
 //! `sort:rising` is score per second of age, and only for the past week's
 //! events. That changes as time passes, so it isn't filed: events are
@@ -1359,7 +1362,8 @@ pub fn sort<'t>(
 /// A filter as a ranked sort has it run: for `sort:hot`, with `since` no
 /// earlier than [`HOT_WINDOW`] before its `until`, or now, so that an old
 /// event, however much it's been engaged with, isn't hot, while a page
-/// further back finds what was hot then.
+/// further back finds what was hot then. A page the window leaves short
+/// goes on to older weeks: see `query::fill_back`.
 pub fn windowed<'f>(store: &Store, filter: &'f Filter) -> Cow<'f, Filter> {
     let hot = filter
         .search
@@ -1536,7 +1540,7 @@ pub fn rank_among<'t>(
 }
 
 /// A ranked filter as a plain one, for all its matches, to be ranked.
-fn unranked(filter: &Filter) -> Filter {
+pub(crate) fn unranked(filter: &Filter) -> Filter {
     let search = filter.search.as_ref().expect("a ranked search");
     let mut plain = filter.clone();
     plain.search = match search.has_text() || !search.conditions.is_empty() {
@@ -2529,23 +2533,37 @@ mod tests {
         for n in 20..60 {
             put(&store, &react(n, &ancient, "+"));
         }
+        // Weeks before that, after weeks with nothing at all.
+        let lost = event(5, base - 20 * DAY, 1, vec![], "lost");
+        put(&store, &lost);
+        put(&store, &react(20, &lost, "+"));
         let top = ids(&store, json!({"search": "sort:top", "kinds": [1]}));
-        assert_eq!(top, of(&[&ancient, &old, &mid, &new]));
+        assert_eq!(top, of(&[&ancient, &old, &mid, &lost, &new]));
+        let hot = json!({"search": "sort:hot", "kinds": [1], "limit": 3});
+        assert_eq!(ids(&store, hot), of(&[&new, &old, &mid]));
+        // A page short of its limit goes on to the weeks before, each
+        // ranked after the last, however many are empty between.
         let hot = ids(&store, json!({"search": "sort:hot", "kinds": [1]}));
-        assert_eq!(hot, of(&[&new, &old, &mid]));
+        assert_eq!(hot, of(&[&new, &old, &mid, &ancient, &lost]));
         let by = json!({"search": "sort:hot", "authors": [hex::encode(pubkey(4))]});
-        assert!(ids(&store, by).is_empty());
+        assert_eq!(ids(&store, by), of(&[&ancient]));
 
         // A page further back is hot as of its `until`, a week before it.
         let until = base + 12 * DAY;
         let back = json!({"search": "sort:hot", "kinds": [1], "until": until});
-        assert_eq!(ids(&store, back), of(&[&old, &mid, &ancient]));
+        assert_eq!(ids(&store, back), of(&[&old, &mid, &ancient, &lost]));
         let by = json!({"search": "sort:hot", "authors": [hex::encode(pubkey(4))], "until": until});
         assert_eq!(ids(&store, by), of(&[&ancient]));
+        // Not before the filter's own `since`.
         let since =
             json!({"search": "sort:hot", "kinds": [1], "until": until, "since": base + 9 * DAY});
         assert_eq!(ids(&store, since), of(&[&old, &mid]));
-        let gone = json!({"search": "sort:hot", "kinds": [1], "until": base + 4 * DAY});
+        let since =
+            json!({"search": "sort:hot", "kinds": [1], "until": until, "since": base - 10 * DAY});
+        assert_eq!(ids(&store, since), of(&[&old, &mid, &ancient]));
+        let back = json!({"search": "sort:hot", "kinds": [1], "until": base + 4 * DAY});
+        assert_eq!(ids(&store, back), of(&[&lost]));
+        let gone = json!({"search": "sort:hot", "kinds": [1], "until": base - 20 * DAY - 1});
         assert!(ids(&store, gone).is_empty());
     }
 
@@ -2872,11 +2890,12 @@ mod tests {
                 put(&store, &react(100 + m, e, "+"));
             }
         }
-        // Too old to rise or be hot, so not found.
+        // Too old to rise, so not found, or to be hot this week, so found
+        // only after this week's.
         let rising = json!({"search": "sort:rising", "kinds": [1]});
         assert_eq!(ids(&store, rising), of(&[&new, &mid]));
         let hot = json!({"search": "sort:hot", "kinds": [1]});
-        assert_eq!(ids(&store, hot), of(&[&mid, &new]));
+        assert_eq!(ids(&store, hot), of(&[&mid, &new, &old]));
     }
 
     /// Random posts and reactions, ranked by how fast they're rising, the
@@ -3009,7 +3028,19 @@ mod tests {
                     None => continue,
                 },
             };
+            // A hot page short of its limit goes on to older weeks.
+            let (got, older) = got.split_at(got.len().min(want.len()));
             assert_eq!(got, want, "{raw}");
+            let created: HashMap<&str, u64> = posts
+                .iter()
+                .map(|p| (p.id.as_str(), p.created_at))
+                .collect();
+            assert!(
+                older
+                    .iter()
+                    .all(|id| created[id.as_str()] < u64::from(filter.since)),
+                "{raw}"
+            );
         }
     }
 
