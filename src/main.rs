@@ -6,13 +6,13 @@ use axum::serve::ListenerExt;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-use ditto_relay_rs::config::Config;
-use ditto_relay_rs::rank::Rank;
-use ditto_relay_rs::relay::AppState;
-use ditto_relay_rs::search::SearchIndex;
-use ditto_relay_rs::store::{History, IndexedTags, Store};
-use ditto_relay_rs::wot::Wot;
-use ditto_relay_rs::{facets, metrics, relay, trends};
+use ditto_relay::config::Config;
+use ditto_relay::rank::Rank;
+use ditto_relay::relay::AppState;
+use ditto_relay::search::SearchIndex;
+use ditto_relay::store::{History, IndexedTags, Store};
+use ditto_relay::wot::Wot;
+use ditto_relay::{facets, metrics, relay, trends};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

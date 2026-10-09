@@ -20,7 +20,7 @@ and full-text search runs on [Tantivy](https://github.com/quickwit-oss/tantivy).
 
 ```sh
 cargo build --release
-RELAY_URL=ws://127.0.0.1:13131 ./target/release/ditto-relay-rs
+RELAY_URL=ws://127.0.0.1:13131 ./target/release/ditto-relay
 ```
 
 Configuration is read from `RELAY_*` environment variables; see
