@@ -4,13 +4,6 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
-## [Unreleased]
-
-- A `sort:hot` page that the week before its `until` leaves short of its
-  limit goes on to the weeks before, each ranked after the last, instead of
-  ending there. A week with nothing hot no longer comes back as an empty
-  page, which clients take for the end of what the filter matches.
-
 ## [2.0.0]
 
 The first release of Ditto Relay in Rust, rewritten on its own database in
@@ -26,6 +19,10 @@ place of the OpenSearch-backed relay that came before it.
   `sentiment:`, `media:`, `video:`, `nsfw:`, `protocol:`, `client:`, `tag:`,
   `pow:` and `distinct:author` extensions, each of which a leading `-`
   negates, and negative search terms.
+- A `sort:hot` page that the week before its `until` leaves short of its
+  limit goes on to the weeks before, each ranked after the last, so a week
+  with nothing hot never comes back as an empty page, which clients take for
+  the end of what the filter matches.
 - NIP-45 `COUNT`, with HyperLogLog sketches for large tags.
 - NIP-85 trusted assertions and trending labels, signed by the relay's own
   key.
