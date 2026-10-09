@@ -61,7 +61,8 @@
 //! `score * 2^-(age / half_life)` does at any moment, so it needn't change
 //! as time passes; for `sort:controversial` by
 //! `min(comments, reactions) * sqrt(comments + reactions)`; and for
-//! `sort:zaps` by zaps. Profiles are ranked instead by their author's
+//! `sort:zaps` by zaps. `sort:hot` finds only events from the week before
+//! a filter's `until`, or now, so it pages back by `until`. Profiles are ranked instead by their author's
 //! trust, and for `sort:zaps` by what their author has received.
 //!
 //! `sort:rising` is score per second of age, and only for the past week's
@@ -115,8 +116,9 @@ const WALK: &[u8] = b"rank_walk";
 /// The most entries rebuilt per write transaction.
 const REBUILD_CHUNK: usize = 10_000;
 
-/// `sort:hot` finds only events this new, in seconds, but for profiles,
-/// which go by their authors' trust.
+/// `sort:hot` finds only events this much older, in seconds, than its
+/// filter's `until`, or now, but for profiles, which go by their authors'
+/// trust.
 const HOT_WINDOW: u32 = 7 * 86_400;
 
 /// `sort:rising` ranks only events this new, in seconds,
@@ -1355,14 +1357,18 @@ pub fn sort<'t>(
 }
 
 /// A filter as a ranked sort has it run: for `sort:hot`, with `since` no
-/// earlier than [`HOT_WINDOW`] ago, so that an old event, however much it's
-/// been engaged with, isn't hot.
+/// earlier than [`HOT_WINDOW`] before its `until`, or now, so that an old
+/// event, however much it's been engaged with, isn't hot, while a page
+/// further back finds what was hot then.
 pub fn windowed<'f>(store: &Store, filter: &'f Filter) -> Cow<'f, Filter> {
     let hot = filter
         .search
         .as_ref()
         .is_some_and(|search| mode(store, filter, search.sort) == HOT);
-    let since = crate::event::now().saturating_sub(HOT_WINDOW);
+    let since = filter
+        .until
+        .min(crate::event::now())
+        .saturating_sub(HOT_WINDOW);
     match hot && filter.since < since {
         true => Cow::Owned(Filter {
             since,
@@ -2529,6 +2535,18 @@ mod tests {
         assert_eq!(hot, of(&[&new, &old, &mid]));
         let by = json!({"search": "sort:hot", "authors": [hex::encode(pubkey(4))]});
         assert!(ids(&store, by).is_empty());
+
+        // A page further back is hot as of its `until`, a week before it.
+        let until = base + 12 * DAY;
+        let back = json!({"search": "sort:hot", "kinds": [1], "until": until});
+        assert_eq!(ids(&store, back), of(&[&old, &mid, &ancient]));
+        let by = json!({"search": "sort:hot", "authors": [hex::encode(pubkey(4))], "until": until});
+        assert_eq!(ids(&store, by), of(&[&ancient]));
+        let since =
+            json!({"search": "sort:hot", "kinds": [1], "until": until, "since": base + 9 * DAY});
+        assert_eq!(ids(&store, since), of(&[&old, &mid]));
+        let gone = json!({"search": "sort:hot", "kinds": [1], "until": base + 4 * DAY});
+        assert!(ids(&store, gone).is_empty());
     }
 
     #[test]
