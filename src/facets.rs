@@ -227,6 +227,31 @@ pub fn media(view: &EventView) -> Media {
     }
 }
 
+/// Whether a word of an event's content is a link to media: one with a
+/// media file extension, or the URL of something attached.
+pub fn is_media_link(word: &str, attached: &[&str]) -> bool {
+    media_link(word.as_bytes()).is_some() || attached.contains(&word)
+}
+
+/// The URLs of what an event's NIP-92 `imeta` tags describe.
+pub fn attached_urls<'a>(view: &EventView<'a>) -> Vec<&'a str> {
+    let mut urls = Vec::new();
+    for mut tag in view.tags() {
+        if tag.next() != Some(Element::Text("imeta")) {
+            continue;
+        }
+        for element in tag {
+            if let Element::Text(entry) = element
+                && let Some(("url", url)) = entry.split_once(' ')
+                && !url.is_empty()
+            {
+                urls.push(url);
+            }
+        }
+    }
+    urls
+}
+
 /// What a link is to, by its file extension, if it's to media.
 fn media_link(word: &[u8]) -> Option<&'static str> {
     let rest = word

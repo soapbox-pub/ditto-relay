@@ -625,7 +625,7 @@ mod tests {
             100,
             1,
             vec![vec!["content-warning", "spiders"]],
-            "https://x.com/spider.png",
+            "A spider https://x.com/spider.png",
         );
         assert!(matches(json!({"search": "media:true"}), &pic));
         assert!(!matches(json!({"search": "-media:true"}), &pic));

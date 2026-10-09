@@ -182,7 +182,14 @@ pub fn text(view: &EventView) -> String {
             }
         }
     } else {
-        push(&content);
+        // Media links aren't what a note says: a search for a domain
+        // shouldn't find every picture hosted there.
+        let attached = facets::attached_urls(view);
+        let words: Vec<&str> = content
+            .split_ascii_whitespace()
+            .filter(|word| !facets::is_media_link(word, &attached))
+            .collect();
+        push(&words.join(" "));
     }
     for mut tag in view.tags() {
         if let (Some(Element::Text(name)), Some(Element::Text(value))) = (tag.next(), tag.next())
@@ -298,11 +305,18 @@ fn prefix(term: &str) -> &str {
         .map_or(term, |(end, _)| &term[..end])
 }
 
+/// What's indexed of an event, by [`text`] and [`names`]. An index built
+/// with another is rebuilt. 1: media links left out of the text.
+const VERSION: u32 = 1;
+
 /// What a commit records.
 #[derive(Serialize, Deserialize)]
 struct Payload {
     /// Every event stored below this sequence number has been indexed.
     next_seq: u64,
+    /// The [`VERSION`] it was indexed with.
+    #[serde(default)]
+    version: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -372,7 +386,11 @@ impl SearchIndex {
                 .and_then(|payload| serde_json::from_str::<Payload>(&payload).ok());
             match payload {
                 // Further along than the LMDB means it's another LMDB's.
-                Some(p) if p.next_seq <= store_next_seq && index.schema() == schema => {
+                Some(p)
+                    if p.next_seq <= store_next_seq
+                        && p.version == VERSION
+                        && index.schema() == schema =>
+                {
                     opened = Some((index, p.next_seq));
                 }
                 _ => {
@@ -1264,6 +1282,7 @@ impl Indexer {
         }
         let payload = Payload {
             next_seq: self.next_seq,
+            version: VERSION,
         };
         let mut commit = self.writer.prepare_commit()?;
         commit.set_payload(&serde_json::to_string(&payload)?);
@@ -1357,6 +1376,18 @@ mod tests {
             "body",
         );
         assert_eq!(view_text(&article), ["body", "big", "news"]);
+    }
+
+    #[test]
+    fn leaves_out_media_links() {
+        let pic = signed(
+            1,
+            100,
+            1,
+            vec![vec!["imeta", "url https://b.test/abc", "m image/png"]],
+            "Cats https://ditto.pub/a.jpeg\nhttps://b.test/abc join https://ditto.pub",
+        );
+        assert_eq!(view_text(&pic), ["cats", "join", "https", "ditto", "pub"]);
     }
 
     struct Fixture {
