@@ -327,7 +327,7 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
     out.metric(
         "lmdb_map_bytes",
         "gauge",
-        "How big each LMDB environment's map is (RELAY_MAP_SIZE).",
+        "How big each LMDB environment's map is (map_size).",
         &[
             (r#"env="main""#, main.map as f64),
             (r#"env="bodies""#, bodies.map as f64),

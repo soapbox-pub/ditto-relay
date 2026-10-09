@@ -20,12 +20,15 @@ and full-text search runs on [Tantivy](https://github.com/quickwit-oss/tantivy).
 
 ```sh
 cargo build --release
-RELAY_URL=ws://127.0.0.1:13131 ./target/release/ditto-relay
+echo 'url = "ws://127.0.0.1:13131"' > ditto-relay.toml
+./target/release/ditto-relay --config ditto-relay.toml
 ```
 
-Configuration is read from `RELAY_*` environment variables; see
-[`src/config.rs`](src/config.rs) for all of them and their defaults. Data is stored
-in `./data` unless `RELAY_DB_PATH` and `RELAY_SEARCH_PATH` say otherwise.
+Configuration is a TOML file, read from the path `--config` names, or else the first
+of `~/.config/ditto-relay/ditto-relay.toml` and `/etc/ditto-relay/ditto-relay.toml`.
+[`ditto-relay.example.toml`](ditto-relay.example.toml) lists every setting with its
+default; only `url` is required. Data is stored in `data_dir`, by default
+`~/.local/share/ditto-relay` (`/var/lib/ditto-relay` as root).
 
 ## Benchmarks
 

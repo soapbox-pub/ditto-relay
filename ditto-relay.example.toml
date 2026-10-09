@@ -1,0 +1,116 @@
+# Ditto Relay configuration. The relay reads the file --config names, or else
+# the first of ~/.config/ditto-relay/ditto-relay.toml and
+# /etc/ditto-relay/ditto-relay.toml.
+#
+# Only url is required; the rest are shown with their defaults. A key the
+# relay doesn't know is refused. Relative paths are relative to this file.
+
+# The relay's own URL, which NIP-42 authentication and NIP-62 requests to
+# vanish name it by.
+url = "wss://relay.example.com/"
+
+# Where the relay is reached over HTTP(S), which its icon and banner are linked
+# from. Defaults to url with ws:// made http:// and wss:// made https://.
+# public_url = "https://relay.example.com/"
+
+# bind = "127.0.0.1:13131"
+# Where to serve Prometheus metrics, apart from clients. "" turns them off.
+# metrics_bind = "127.0.0.1:13133"
+# The header a reverse proxy puts the client's IP in, such as "x-real-ip",
+# "x-forwarded-for", or "cf-connecting-ip". Unset, the peer's address is used.
+# real_ip_header = "x-real-ip"
+
+# What to log, as tracing EnvFilter directives.
+# log = "info,tantivy=warn"
+
+## Storage
+
+# Holds the database, in db/, and the search index, in search/. Defaults to
+# /var/lib/ditto-relay as root, else ~/.local/share/ditto-relay.
+# data_dir = "/var/lib/ditto-relay"
+# LMDB map size in bytes: virtual address space, not disk usage.
+# map_size = 1099511627776
+# Whether each write is on disk before it's answered. Turned off, writes are
+# several times faster, but a crash of the machine (not just the relay) can
+# lose recent writes or corrupt the database.
+# lmdb_sync = true
+
+## NIP-11
+
+# name = "Ditto Relay"
+# description = ""
+# The operator's pubkey, in hex.
+# pubkey = "0461fcbecc4c3374439932d6b8f11269ccdb7cc973ad7a50ae362db135a474dd"
+# contact = "mailto:admin@example.com"
+
+## The relay's key
+
+# A file holding the relay's secret key in 64 lowercase hex. It signs the
+# NIP-85 assertions the relay serves and the trends it labels; unset turns
+# them off.
+# secret_key_file = "secret.key"
+# How many seconds apart trends are labeled. 0 turns them off.
+# trends_interval = 900
+# How many seconds a trend label is kept.
+# trends_expiration = 691200
+
+## Limits
+
+# max_message_size = 4000000
+# max_subscriptions = 20
+# max_filters = 100
+# max_subid_length = 100
+# default_limit = 100
+# max_limit = 1000
+# The most values one field of a filter may list.
+# max_filter_values = 20000
+# Events with created_at further than this many seconds ahead are rejected.
+# max_future_seconds = 900
+
+## Indexing
+
+# Tags with names longer than a letter to index, so filter by.
+# indexed_tags = ["proxy", "client", "content-warning"]
+# Whether replaceable and addressable events keep the versions they replace.
+# history = true
+# Kinds whose old versions aren't kept.
+# history_excluded_kinds = [30382, 30383, 30384, 30385]
+# The most versions of an address kept, current included.
+# history_max_versions = 20
+
+## Search (NIP-50)
+
+# search = true
+# The kinds whose text is searchable. Autocomplete covers every kind.
+# search_kinds = [0, 1, 20, 1111, 9802, 30023]
+# How often, at most, new events become searchable.
+# search_commit_ms = 1000
+# Hashtags that mark media as adult, for the nsfw: extension. Defaults to a
+# built-in list.
+# nsfw_hashtags = ["nsfw"]
+
+## Web of trust and ranking
+
+# Hex pubkeys the web of trust is rooted at. Defaults to pubkey's, if set;
+# [] turns it off.
+# wot_seeds = []
+# How likely trust is to pass along a follow rather than stop.
+# wot_damping = 0.85
+# How many people's worth of trust weighs fully.
+# wot_full_trust = 100000
+# The least weight counted; less is 0.
+# wot_min_weight = 0.01
+# About how many follows to push trust along, or targets to rescore, per turn.
+# wot_budget = 10000
+# How many seconds it takes sort:hot to halve an event's worth.
+# hot_half_life = 86400
+# How far an engager's weight must move before what they've engaged with is
+# rescored.
+# rank_step = 0.05
+
+## Write policy
+
+# A strfry write policy plugin's command, run with sh -c.
+# write_policy_plugin = "/usr/local/bin/my-plugin"
+# How long the plugin may take to answer before it's restarted.
+# write_policy_timeout_seconds = 10

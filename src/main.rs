@@ -1,12 +1,14 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::serve::ListenerExt;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-use ditto_relay::config::Config;
+use ditto_relay::config::{Config, Environment};
 use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
@@ -16,13 +18,11 @@ use ditto_relay::{facets, metrics, relay, trends};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let config = Config::load(config_path()?.as_deref(), &Environment::current())?;
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,tantivy=warn".into()),
-        )
+        .with_env_filter(EnvFilter::try_new(&config.log).context("invalid log directives")?)
         .init();
 
-    let config = Config::from_env()?;
     facets::set_nsfw_hashtags(config.nsfw_hashtags.clone());
     let indexed_tags = IndexedTags::new(config.indexed_tags.clone())?;
     let history = History::new(
@@ -109,6 +109,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("shut down");
 
     Ok(())
+}
+
+/// The file `--config` (`-c`) names, if any.
+fn config_path() -> anyhow::Result<Option<PathBuf>> {
+    let mut args = std::env::args_os().skip(1);
+    let mut path = None;
+    while let Some(arg) = args.next() {
+        let value = match arg.to_str() {
+            Some("-c" | "--config") => args.next().context("--config needs a path")?,
+            Some(arg) if arg.starts_with("--config=") => arg["--config=".len()..].into(),
+            _ => anyhow::bail!("usage: ditto-relay [--config <path>]"),
+        };
+        path = Some(PathBuf::from(value));
+    }
+    Ok(path)
 }
 
 /// Ctrl-C, or SIGTERM from a service manager.

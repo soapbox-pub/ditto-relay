@@ -66,6 +66,7 @@ fn config() -> Config {
         write_policy_plugin: None,
         write_policy_timeout_seconds: 10,
         real_ip_header: None,
+        log: String::new(),
     }
 }
 
