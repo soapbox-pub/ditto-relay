@@ -1,0 +1,8 @@
+# The Rust that builds Ditto Relay, here and in CI alike. rustup reads this and
+# installs it on first use. Pinned rather than `stable` so a release is built by
+# the compiler its tests ran on, and so a newer stable can't quietly invalidate
+# every cached build.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

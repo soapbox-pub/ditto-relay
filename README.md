@@ -16,7 +16,22 @@ and full-text search runs on [Tantivy](https://github.com/quickwit-oss/tantivy).
 - strfry-compatible write policy plugins
 - Prometheus metrics
 
-## Running
+## Installing
+
+Each release publishes static binaries for x86_64 and aarch64 Linux, and `.deb` and
+`.rpm` packages, as a [NIP-82](https://github.com/nostr-protocol/nips/blob/master/82.md)
+release on Nostr. The packages install the binary, a systemd unit, and
+`/etc/ditto-relay/ditto-relay.toml`, and create the `ditto-relay` user and
+`/var/lib/ditto-relay`. Set `url` in the config, then:
+
+```sh
+sudo systemctl enable --now ditto-relay
+```
+
+The relay listens on `127.0.0.1:13131`; put a reverse proxy with TLS in front of it.
+[`CHANGELOG.md`](CHANGELOG.md) says what changed in each release.
+
+## Running from source
 
 ```sh
 cargo build --release

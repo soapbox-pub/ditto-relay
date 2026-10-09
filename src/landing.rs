@@ -138,7 +138,7 @@ pub fn render(info: &Value, relay_url: &str) -> String {
         .map(|c| format!(r#"<div class="meta"><span>{c}</span></div>"#))
         .unwrap_or_default();
     let version = version
-        .map(|v| format!(r#" <span class="version">{v}</span>"#))
+        .map(|v| format!(r#" <span class="version">v{v}</span>"#))
         .unwrap_or_default();
 
     format!(
@@ -172,13 +172,15 @@ pub fn render(info: &Value, relay_url: &str) -> String {
       </div>
     </div>
   </div>
-  <div class="footer">Ditto Relay{version}</div>
+  <div class="footer"><a href="{REPOSITORY}" target="_blank" rel="noopener">Ditto Relay</a>{version}</div>
   <script>{SCRIPT}</script>
 </body>
 </html>
 "#
     )
 }
+
+const REPOSITORY: &str = "https://gitworkshop.dev/soapbox.pub/ditto-relay";
 
 const STYLE: &str = r#"
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -217,6 +219,8 @@ const STYLE: &str = r#"
     .copy-btn svg{width:16px;height:16px;flex-shrink:0}
     .copy-btn .label{transition:opacity .1s}
     .footer{margin-top:24px;text-align:center;color:var(--text-dim);font-size:0.7rem}
+    .footer a{color:inherit;text-decoration:none}
+    .footer a:hover{text-decoration:underline}
   "#;
 
 const SCRIPT: &str = r#"
@@ -273,6 +277,13 @@ mod tests {
         assert!(!html.contains("javascript:"));
         assert!(html.contains(r#"src="https://x.example/b.jpg""#));
         assert!(html.contains("summary_large_image"));
+    }
+
+    #[test]
+    fn shows_the_version() {
+        let html = render(&json!({"version": "2.0.0"}), "wss://x.example");
+        assert!(html.contains(r#"<span class="version">v2.0.0</span>"#));
+        assert!(!render(&json!({}), "wss://x.example").contains(r#"class="version""#));
     }
 
     #[test]

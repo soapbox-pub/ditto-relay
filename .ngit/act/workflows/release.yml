@@ -1,0 +1,141 @@
+name: Release
+
+# A version tag (vX.Y.Z) publishes static Linux binaries for x86_64 and
+# aarch64, and the same binaries as .deb and .rpm packages (contrib/package/),
+# as a NIP-82 release (.ngit/release.yaml, notes from CHANGELOG.md), whose
+# asset events carry each file's SHA-256.
+#
+# One job, in order, so nothing is handed between containers. The binaries are
+# also uploaded as run artifacts before anything is published, so a failed
+# publish still leaves them on the CI result.
+#
+# ── Secrets ──────────────────────────────────────────────────────────────────
+#   NSYTE_BUNKER   nbunksec1... — a remote signer session on the Soapbox key
+#                  (npub10qdp2…), the same one npanel's and armada-stack's
+#                  releases use. That key owns the ditto-relay application
+#                  (`pubkey` in .ngit/release.yaml refuses any other). The
+#                  coordinator's #SOAPBOX alias only covers the Soapbox key's
+#                  own repositories, so this one needs it provisioned
+#                  separately.
+#
+# act enforces a step's `timeout-minutes` but not a job's, so the steps that
+# talk to the network carry their own.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Before any building, so a forgotten bump or changelog entry costs
+      # seconds rather than a whole build.
+      - name: Check the tag against Cargo.toml and CHANGELOG.md
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "Tag $TAG does not match Cargo.toml's version $version. Bump Cargo.toml, or tag v$version." >&2
+            exit 1
+          fi
+          if ! grep -qE "^## \[?v?$version\]?( |$)" CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for $version. Add one and tag again." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # rust-toolchain.toml says which Rust; rustup installs it, and both musl
+      # targets with it. contrib/release/tools.sh installs zig, cargo-zigbuild
+      # and nfpm, pinned with their checksums: they run with the release signer
+      # in the environment.
+      - name: Install Rust, zig, cargo-zigbuild and nfpm
+        run: |
+          set -eu
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install
+          tools="$(contrib/release/tools.sh "$RUNNER_TEMP/tools")"
+          echo "$tools" | tr ':' '\n' >> "$GITHUB_PATH"
+
+      - name: Restore the Rust build cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: release-zig-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: release-zig-
+
+      - name: Test
+        run: cargo test --locked
+
+      # The same script a build by hand runs.
+      - name: Build the binaries
+        run: contrib/release/build.sh dist
+
+      - name: Build the packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eu
+          for arch in x86_64 aarch64; do
+            contrib/package/build.sh "$VERSION" "$arch" "dist/ditto-relay-$VERSION-linux-$arch" dist
+          done
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ditto-relay-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+      - uses: danconwaydev/setup-ngit@v3
+        with:
+          version: 3.0.3
+
+      # A file rather than the command line, so the session stays out of the
+      # process list.
+      - name: Write the signer
+        env:
+          NSYTE_BUNKER: ${{ secrets.NSYTE_BUNKER }}
+        run: |
+          set -eu
+          # No apostrophes in that message: bash reads one inside ${var:?word}
+          # as opening a quoted section, even within double quotes.
+          : "${NSYTE_BUNKER:?NSYTE_BUNKER is not set. Ask the ngit-ci operator to provision the Soapbox session for this repository.}"
+          umask 077
+          printf '%s' "$NSYTE_BUNKER" > "$RUNNER_TEMP/nbunksec"
+
+      # The checkout has the tagged commit but not the tag itself, so the
+      # version and commit are given rather than found. A version with a suffix
+      # (2.1.0-rc.1) is a pre-release, on its own channel so that clients
+      # following main never offer it.
+      - name: Publish the release
+        timeout-minutes: 20
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eu
+          channel=main
+          case "$VERSION" in *-*) channel=beta ;; esac
+          ngit --nbunksec-file "$RUNNER_TEMP/nbunksec" release publish "$VERSION" \
+            --repo nostr://npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj/git.shakespeare.diy/ditto-relay \
+            --commit "$GITHUB_SHA" \
+            --channel "$channel" \
+            --defaults
+
+      - name: Remove the signer
+        if: ${{ always() }}
+        run: rm -f "$RUNNER_TEMP/nbunksec"

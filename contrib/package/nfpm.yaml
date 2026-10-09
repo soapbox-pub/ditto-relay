@@ -1,0 +1,59 @@
+# The .deb and .rpm each release publishes, built by build.sh, which sets the
+# variables below and runs nfpm in a directory holding every file named here.
+# They install what an install by hand would, in the places a package belongs:
+# the binary in /usr/bin rather than /usr/local/bin, and the unit with the
+# distribution's.
+name: ditto-relay
+version: ${DITTO_RELAY_VERSION}
+arch: ${DITTO_RELAY_ARCH}
+platform: linux
+section: net
+priority: optional
+maintainer: Soapbox <contact@soapbox.pub>
+description: High-performance Nostr relay on LMDB, with search and a web of trust
+homepage: https://gitworkshop.dev/soapbox.pub/ditto-relay
+license: AGPL-3.0-or-later
+
+# The binary is static; systemd is for the unit, and for the scripts, which
+# create the user and data_dir with systemd-sysusers and systemd-tmpfiles.
+depends:
+  - systemd
+
+contents:
+  - src: ditto-relay
+    dst: /usr/bin/ditto-relay
+    file_info:
+      mode: 0755
+  - src: ditto-relay.service
+    dst: /usr/lib/systemd/system/ditto-relay.service
+    file_info:
+      mode: 0644
+  - src: sysusers.conf
+    dst: /usr/lib/sysusers.d/ditto-relay.conf
+    file_info:
+      mode: 0644
+  - src: tmpfiles.conf
+    dst: /usr/lib/tmpfiles.d/ditto-relay.conf
+    file_info:
+      mode: 0644
+  # Never replaced on upgrade once installed; dpkg removes it on purge.
+  - src: ditto-relay.toml
+    dst: /etc/ditto-relay/ditto-relay.toml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/ditto-relay/copyright
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/licenses/ditto-relay/LICENSE
+    packager: rpm
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: postinstall.sh
+  preremove: preremove.sh
+  postremove: postremove.sh

@@ -1,2 +1,4 @@
 /target
 /data
+# What the release workflow publishes.
+/dist/

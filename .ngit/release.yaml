@@ -1,0 +1,44 @@
+# What `ngit release publish` publishes for a version tag: the NIP-82
+# application, release, and asset events, with the files on Blossom. Run by
+# .ngit/act/workflows/release.yml once the files below are built.
+schema: 1
+application: ditto-relay
+# Every release of an application has to come from the key that published the
+# first, so publishing fails before anything is uploaded under another one.
+pubkey: npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj
+name: Ditto Relay
+summary: High-performance Nostr relay on LMDB, with search and a web of trust
+description: |
+  A Nostr relay that runs on its own database: events are kept as compact
+  binary records in LMDB, and full-text search runs on Tantivy. NIP-50 search
+  with sort:hot and sort:top ranked by a web of trust, NIP-45 counts, NIP-85
+  assertions and trending labels, and strfry-compatible write policy plugins.
+  One static binary.
+tags: [nostr, relay, lmdb, search]
+license: AGPL-3.0-or-later
+repository: nostr://npub10qdp2fc9ta6vraczxrcs8prqnv69fru2k6s2dj48gqjcylulmtjsg9arpj/git.shakespeare.diy/ditto-relay
+icon: assets/icon.png
+release_notes: CHANGELOG.md
+publication:
+  blossom_servers:
+    - https://blossom.ditto.pub
+    - https://blossom.dreamith.to
+    - https://blossom.primal.net
+  relays:
+    - wss://relay.ditto.pub
+    - wss://relay.dreamith.to
+    - wss://relay.primal.net
+assets:
+  - file: dist/ditto-relay-{version}-linux-x86_64
+    platforms: [linux-x86_64]
+  - file: dist/ditto-relay-{version}-linux-aarch64
+    platforms: [linux-aarch64]
+  # The same binaries, packaged; told apart from them by their MIME types.
+  - file: dist/ditto-relay-{version}-linux-x86_64.deb
+    platforms: [linux-x86_64]
+  - file: dist/ditto-relay-{version}-linux-aarch64.deb
+    platforms: [linux-aarch64]
+  - file: dist/ditto-relay-{version}-linux-x86_64.rpm
+    platforms: [linux-x86_64]
+  - file: dist/ditto-relay-{version}-linux-aarch64.rpm
+    platforms: [linux-aarch64]

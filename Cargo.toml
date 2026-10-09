@@ -1,7 +1,8 @@
 [package]
 name = "ditto-relay"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
+description = "High-performance Nostr relay on LMDB, with search and a web of trust"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
@@ -32,3 +33,9 @@ whatlang = "0.18.0"
 rand = "0.10.3"
 tempfile = "3.27.0"
 tokio-tungstenite = "0.29.0"
+
+# A smaller, faster binary, from a build that takes several minutes every time.
+[profile.release]
+strip = "symbols"
+lto = "fat"
+codegen-units = 1

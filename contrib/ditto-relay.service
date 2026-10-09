@@ -1,0 +1,33 @@
+# Ditto Relay under systemd, for the release binary installed by hand. The
+# .deb and .rpm install this unit too, with the binary in /usr/bin.
+#
+# Expects /usr/local/bin/ditto-relay, a `ditto-relay` system user, and its
+# configuration in /etc/ditto-relay/ditto-relay.toml with data_dir set to
+# /var/lib/ditto-relay.
+
+[Unit]
+Description=Ditto Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ditto-relay
+Group=ditto-relay
+ExecStart=/usr/local/bin/ditto-relay --config /etc/ditto-relay/ditto-relay.toml
+Restart=on-failure
+RestartSec=5s
+# Every client holds a WebSocket open.
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ditto-relay
+
+[Install]
+WantedBy=multi-user.target
