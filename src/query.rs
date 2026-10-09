@@ -26,7 +26,9 @@
 //! bounds, and keys no event is filed under twice, it's the sum of LMDB's
 //! counts of the keys; otherwise the stamps between the bounds are walked,
 //! a page at a time. Only filters no index pins down load events, and only
-//! so many; past that, the relay declines.
+//! so many; past that, the relay declines. With `distinct:author`, a count
+//! is of the authors of the events found as without it, each read for its
+//! author, up to a bound of its own.
 //!
 //! A query stops as soon as nobody wants its results — its subscription
 //! closed or replaced, or its client gone — rather than running on to its
@@ -62,6 +64,9 @@ pub const MAX_EXAMINED: usize = 100_000;
 
 /// The most stamps a count may walk.
 const MAX_WALKED: usize = 2_000_000;
+
+/// The most events a `distinct:author` count may read the authors of.
+const MAX_AUTHORED: usize = 1_000_000;
 
 /// How many records a scan examines, or stamps a walk goes through,
 /// between looks at whether its query's been cancelled.
@@ -609,6 +614,9 @@ fn count_unless_cancelled(
     cancel: &CancellationToken,
 ) -> anyhow::Result<Count> {
     let txn = store.read()?;
+    if filters.iter().any(Filter::distinct_author) {
+        return count_authors(store, &txn, search, filters, cancel);
+    }
     let [filter] = filters else {
         // Events matching two filters count once.
         let mut seqs = HashSet::new();
@@ -776,6 +784,55 @@ fn collect(
         }
     }
     Ok(())
+}
+
+/// Count the authors of the events matching any of a COUNT's filters, for
+/// one any of whose filters has `distinct:author`. Their events are found
+/// as without it, so an index pins down as many filters as it would, and
+/// only each event's header is read, for its author.
+fn count_authors(
+    store: &Store,
+    txn: &Txn,
+    search: Option<&SearchIndex>,
+    filters: &[Filter],
+    cancel: &CancellationToken,
+) -> anyhow::Result<Count> {
+    let mut seqs = HashSet::new();
+    for filter in filters.iter().filter(|f| !f.never) {
+        collect(store, txn, search, &filter.every_event(), cancel, &mut seqs)?;
+    }
+    if seqs.len() > MAX_AUTHORED {
+        return Err(TooExpensive.into());
+    }
+    let mut seqs: Vec<u64> = seqs.into_iter().collect();
+    seqs.sort_unstable();
+    store.read_ahead(&seqs);
+    METRICS.events_examined.add(seqs.len() as u64);
+
+    // NIP-45 sketches a single filter's authors, which these all are.
+    let offset = match filters {
+        [filter] => filter.first_tag.as_deref().map(hll::offset),
+        _ => None,
+    };
+    let mut registers = [0; hll::REGISTERS];
+    let mut authors = HashSet::new();
+    for (i, &seq) in seqs.iter().enumerate() {
+        if i % CANCEL_CHECK == 0 && cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        let Some(header) = store.header(txn, seq)? else {
+            continue;
+        };
+        if authors.insert(*header.pubkey())
+            && let Some(offset) = offset
+        {
+            hll::add(&mut registers, offset, header.pubkey());
+        }
+    }
+    Ok(Count {
+        count: authors.len() as u64,
+        hll: offset.map(|_| registers),
+    })
 }
 
 /// Sketch the authors of some events, for a filter whose first tag value
@@ -1087,6 +1144,23 @@ mod tests {
             let filters = [parsed.clone(), parse(&other)];
             let counted = count(&store, None, &filters, &Default::default()).unwrap();
             assert_eq!(counted.count, union.len() as u64, "{filter} {other}");
+
+            // Asked for distinct authors, a count is of the authors.
+            let mut distinct = filter.clone();
+            let search = distinct.get("search").and_then(Value::as_str).unwrap_or("");
+            distinct["search"] = json!(format!("{search} distinct:author"));
+            let authors: HashSet<&str> = expected.iter().map(|e| e.pubkey.as_str()).collect();
+            let counted = count_of(&store, distinct.clone());
+            assert_eq!(counted.count, authors.len() as u64, "{distinct}");
+            assert_eq!(counted.hll, want.hll, "{distinct}");
+            let filters = [parse(&distinct), parse(&other)];
+            let counted = count(&store, None, &filters, &Default::default()).unwrap();
+            let authors: HashSet<&str> = expected
+                .iter()
+                .chain(&matching(&other))
+                .map(|e| e.pubkey.as_str())
+                .collect();
+            assert_eq!(counted.count, authors.len() as u64, "{distinct} {other}");
 
             expected.sort_by(|a, b| {
                 b.created_at

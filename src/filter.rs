@@ -86,6 +86,15 @@ impl Search {
     pub fn has_text(&self) -> bool {
         !self.terms.is_empty() || !self.excluded.is_empty()
     }
+
+    /// Whether there's anything to the search: text, extensions to meet,
+    /// one author's events each, or an order other than the newest first.
+    fn is_something(&self) -> bool {
+        self.has_text()
+            || !self.conditions.is_empty()
+            || self.distinct_author
+            || self.sort.is_ranked()
+    }
 }
 
 impl Filter {
@@ -268,6 +277,27 @@ impl Filter {
         false
     }
 
+    /// Whether its search asks for one event of each author.
+    pub fn distinct_author(&self) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|search| search.distinct_author)
+    }
+
+    /// The filter without `distinct:author`: every event it picks one of
+    /// each author's from. Without its search too if that was all there was
+    /// to it, so that an index can pin it down again.
+    pub fn every_event(&self) -> Filter {
+        let mut filter = self.clone();
+        if let Some(search) = &mut filter.search {
+            search.distinct_author = false;
+            if !search.is_something() {
+                filter.search = None;
+            }
+        }
+        filter
+    }
+
     /// Whether events of a kind can match.
     pub fn wants_kind(&self, kind: u16) -> bool {
         self.kinds
@@ -346,11 +376,7 @@ fn parse_search(value: &Value, profiles: bool) -> Result<(Option<Search>, usize)
         conditions,
         distinct_author,
     };
-    let something = search.has_text()
-        || !search.conditions.is_empty()
-        || distinct_author
-        || search.sort.is_ranked();
-    Ok((something.then_some(search), sorts))
+    Ok((search.is_something().then_some(search), sorts))
 }
 
 /// A NIP-50 extension's key and value. Not a URL's scheme and the rest.
