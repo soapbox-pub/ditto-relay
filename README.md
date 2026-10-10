@@ -45,6 +45,21 @@ of `~/.config/ditto-relay/ditto-relay.toml` and `/etc/ditto-relay/ditto-relay.to
 default; only `url` is required. Data is stored in `data_dir`, by default
 `~/.local/share/ditto-relay` (`/var/lib/ditto-relay` as root).
 
+## Deleting events
+
+```sh
+ditto-relay delete --filter '{"#t":["spam"]}' --dry-run
+ditto-relay delete --filter '{"kinds":[1]}' --age 7776000
+```
+
+`delete` removes every stored event a NIP-01 filter matches, as `strfry delete` does.
+`--age` only removes events at least that many seconds old. `--dry-run` only counts
+them. Run it with the relay's own config (as the relay's user) while the relay is
+running: it removes events in small transactions between the relay's writes, and the
+relay drops them from the search index within a few seconds. Removing an address's
+current version also removes its older versions that the filter matches, and the newest
+version left becomes current. Nothing stops deleted events from being published again.
+
 ## Benchmarks
 
 ![Ditto Relay vs. strfry. Queries per second: 19,200 vs. 3,700, 5.1× faster. p99 query latency: 4.8 vs. 19.1 ms, 4.0× lower. Publishing: 7,500 vs. 4,200 events/s, 1.8× faster. Importing: 4,500 vs. 3,500 events/s, 1.3× faster.](docs/benchmark.svg)

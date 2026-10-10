@@ -13,6 +13,8 @@
 //! a restart — or rebuilding from nothing — is the same as keeping up. The
 //! writer tells it when there's something new and what was removed, and it
 //! commits at most every so often, recording in the commit how far it got.
+//! What another process removes, which can't write the index while the
+//! relay holds it, is queued for it in the LMDB instead.
 //!
 //! Events stored since the last commit aren't searchable yet, so a search
 //! also checks the newest of them by hand. Everything a search's LMDB
@@ -46,7 +48,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Bound, RangeInclusive};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -115,6 +117,10 @@ const CATCH_UP_SPLIT: u64 = if cfg!(test) { 4 } else { 10_000 };
 /// How far ahead of the record it's on catching up reads records, and how
 /// far it goes before reading ahead again.
 const READ_AHEAD: usize = 64 << 20;
+
+/// How often an idle indexer looks for what another process has queued
+/// for it to delete.
+const QUEUE_POLL: Duration = Duration::from_secs(10);
 
 /// The most sequence numbers past the last commit a search checks by hand.
 const MAX_UNINDEXED: u64 = 10_000;
@@ -1302,9 +1308,29 @@ impl Indexer {
         self.commit()
     }
 
+    /// Delete what's [queued](Store::queue_for_search) for it, a chunk at
+    /// a time, each committed before it's taken off the queue, so a crash
+    /// between leaves it to be deleted again. Returns how many.
+    pub fn drain_queue(&mut self, store: &Store) -> anyhow::Result<usize> {
+        let mut drained = 0;
+        loop {
+            let seqs = store.search_queue(&*store.read()?, CATCH_UP_CHUNK)?;
+            if seqs.is_empty() {
+                return Ok(drained);
+            }
+            self.remove(&seqs);
+            self.commit()?;
+            let mut txn = store.write()?;
+            store.dequeue_for_search(&mut txn, &seqs)?;
+            txn.commit()?;
+            drained += seqs.len();
+        }
+    }
+
     /// Run on a thread of its own, committing at most every `interval`.
     /// Send it the sequence numbers of removed events (or none) after each
-    /// write.
+    /// write. It looks for what's queued for it after each commit, and
+    /// every [`QUEUE_POLL`] when there are none.
     pub fn spawn(mut self, store: Arc<Store>, interval: Duration) -> Sender<Vec<u64>> {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u64>>();
         std::thread::Builder::new()
@@ -1326,8 +1352,16 @@ impl Indexer {
     ) -> anyhow::Result<()> {
         self.catch_up_all(store)?;
         tracing::info!("search index caught up to {}", self.next_seq);
-        while let Ok(removed) = rx.recv() {
-            self.remove(&removed);
+        loop {
+            let drained = self.drain_queue(store)?;
+            if drained > 0 {
+                tracing::info!("deleted {drained} queued events from the search index");
+            }
+            match rx.recv_timeout(QUEUE_POLL) {
+                Ok(removed) => self.remove(&removed),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
             let deadline = Instant::now() + interval;
             while let Ok(removed) =
                 rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -1336,7 +1370,6 @@ impl Indexer {
             }
             self.catch_up_all(store)?;
         }
-        Ok(())
     }
 }
 
@@ -1728,6 +1761,32 @@ mod tests {
             f.search(json!({"search": "hello sort:new", "since": 120, "until": 200})),
             [b.id.as_str(), profile.id.as_str()]
         );
+    }
+
+    #[test]
+    fn deletes_what_is_queued() {
+        let mut f = fixture();
+        put(&f.store, &signed(1, 100, 1, vec![], "spam"));
+        put(&f.store, &signed(1, 200, 1, vec![], "ham"));
+        f.index_all();
+        let filter = Filter::parse(&json!({"until": 150}), &test_tags(), MAX_VALUES).unwrap();
+        assert_eq!(
+            crate::delete::delete(&f.store, &filter, true, false).unwrap(),
+            1
+        );
+        // Skipped until then, being gone from the store.
+        assert!(f.search(json!({"search": "spam"})).is_empty());
+        assert_eq!(f.index.reader.searcher().num_docs(), 2);
+
+        assert_eq!(f.indexer.drain_queue(&f.store).unwrap(), 1);
+        assert_eq!(f.index.reader.searcher().num_docs(), 1);
+        assert!(
+            f.store
+                .search_queue(&f.store.read().unwrap(), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(f.indexer.drain_queue(&f.store).unwrap(), 0);
     }
 
     #[test]

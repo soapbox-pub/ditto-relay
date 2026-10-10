@@ -289,6 +289,61 @@ pub fn newest<'t>(
     Ok(Some(newest_first(found, limit)))
 }
 
+/// The sequence numbers of every stored event a filter matches, expired
+/// or not, and with a limit, the newest that many. Unlike [`run_filter`],
+/// examines as many records as it takes. Old versions kept as history are
+/// found as a query finds them: by id, or by a filter shaped like their
+/// address.
+pub fn every_match(store: &Store, txn: &Txn, filter: &Filter) -> Result<Vec<u64>> {
+    if filter.never {
+        return Ok(Vec::new());
+    }
+    let mut found: Vec<(u32, u64)> = Vec::new();
+    if let Some(ids) = &filter.ids {
+        for id in ids {
+            if let Some(seq) = store.seq_of(txn, id)?
+                && let Some(view) = store.stored(txn, seq)?
+                && filter.matches(&view)
+            {
+                found.push((view.created_at(), seq));
+            }
+        }
+    } else {
+        let plan = plan(store, txn, filter)?;
+        for key in &plan.keys {
+            each_stamp(txn, plan.db, key, filter.since, filter.until, |entry| {
+                if plan.wants(entry) {
+                    found.push((stamp_created_at(entry), stamp_seq(entry)));
+                }
+                true
+            })?;
+        }
+        // The same event can be filed under two keys.
+        found.sort_unstable_by_key(|&(_, seq)| seq);
+        found.dedup_by_key(|&mut (_, seq)| seq);
+        if !plan.exact {
+            let mut kept = Vec::with_capacity(found.len());
+            for (created_at, seq) in found {
+                if store
+                    .stored(txn, seq)?
+                    .is_some_and(|view| filter.matches(&view))
+                {
+                    kept.push((created_at, seq));
+                }
+            }
+            found = kept;
+        }
+    }
+    if let Some(limit) = filter.limit {
+        found.sort_unstable_by(|a, b| b.cmp(a));
+        found.truncate(limit.try_into().unwrap_or(usize::MAX));
+    }
+    let mut seqs: Vec<u64> = found.into_iter().map(|(_, seq)| seq).collect();
+    seqs.sort_unstable();
+    seqs.dedup();
+    Ok(seqs)
+}
+
 /// Newest first; on a tie, the lowest id first (NIP-01). Up to `limit`.
 fn newest_first(mut found: Vec<(u64, EventView<'_>)>, limit: usize) -> Vec<(u64, EventView<'_>)> {
     found.sort_unstable_by(|(_, a), (_, b)| {

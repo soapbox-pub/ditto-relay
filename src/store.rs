@@ -31,6 +31,7 @@
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `history`       | address                      | stamps                 |
 //! | `expiring`      | `EXPIRING`                   | expiry stamps          |
+//! | `search_queue`  | seq (u64 BE)                 | nothing                |
 //! | `meta`          | name                         | value                  |
 //!
 //! `events` is in an environment of its own, `bodies/` inside the database's
@@ -94,6 +95,12 @@
 //! Engagement is counted, scored, and [ranked](rank) for the ranked sorts
 //! as events are indexed and unindexed.
 //!
+//! Events another process removes, as `ditto-relay delete` does, are
+//! queued in `search_queue` for the relay's [search indexer] to delete
+//! too: only one process at a time can write the search index.
+//!
+//! [search indexer]: crate::search::Indexer
+//!
 //! Each tag key with at least [`HLL_THRESHOLD`] events has a NIP-45
 //! [HyperLogLog](crate::hll) sketch of their authors in `hll`, kept up as
 //! events arrive; smaller ones are sketched when asked. Sketches can't
@@ -113,6 +120,7 @@ use crate::deletions;
 use crate::event::KindClass;
 use crate::event::decode_hex;
 use crate::facets;
+use crate::filter::Filter;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
 use crate::metrics::METRICS;
@@ -369,6 +377,7 @@ pub struct Tables {
     pub replaceable: Db,
     pub history: Db,
     pub expiring: Db,
+    pub search_queue: Db,
     pub meta: Db,
 }
 
@@ -435,6 +444,7 @@ impl Store {
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
             history: env.create_db("history", DbFlags::DUP_FIXED)?,
             expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,
+            search_queue: env.create_db("search_queue", DbFlags::PLAIN)?,
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         };
 
@@ -680,6 +690,13 @@ impl Store {
             .get(self.tables.events, &seq.to_ne_bytes())?
             .and_then(EventView::new)
             .filter(|view| !view.is_expired(now)))
+    }
+
+    /// A stored event, expired or not.
+    pub fn stored<'t>(&self, txn: &'t Txn, seq: u64) -> Result<Option<EventView<'t>>> {
+        Ok(txn
+            .get(self.tables.events, &seq.to_ne_bytes())?
+            .and_then(EventView::new))
     }
 
     /// Read the records of `seqs` on several threads at once, each in a
@@ -1209,6 +1226,106 @@ impl Store {
         self.remove(txn, seq)?;
         removed.push(seq);
         self.insert(txn, &record, now, removed)?;
+        Ok(())
+    }
+
+    /// The events [`remove_matching`](Self::remove_matching) removes for
+    /// `seq`, and the address it makes the newest version left current at,
+    /// if any.
+    fn matching_versions(
+        &self,
+        txn: &Txn,
+        seq: u64,
+        filter: &Filter,
+    ) -> Result<(Vec<u64>, Option<Vec<u8>>)> {
+        let Some(view) = self.stored(txn, seq)?.filter(|view| filter.matches(view)) else {
+            return Ok((Vec::new(), None));
+        };
+        let address = match address_of(&view) {
+            Some(address) if self.replaceable_seq(txn, &address)? == Some(seq) => address,
+            _ => return Ok((vec![seq], None)),
+        };
+        let mut history = Vec::new();
+        each_stamp(txn, self.tables.history, &address, 0, u32::MAX, |stamp| {
+            history.push(stamp_seq(stamp));
+            true
+        })?;
+        let mut seqs = vec![seq];
+        for old in history {
+            if old != seq
+                && self
+                    .stored(txn, old)?
+                    .is_some_and(|view| filter.matches(&view))
+            {
+                seqs.push(old);
+            }
+        }
+        Ok((seqs, Some(address)))
+    }
+
+    /// How many events [`remove_matching`](Self::remove_matching) would
+    /// remove for each of `seqs`, all told.
+    pub fn count_matching(&self, txn: &Txn, seqs: &[u64], filter: &Filter) -> Result<usize> {
+        let mut all = std::collections::HashSet::new();
+        for &seq in seqs {
+            all.extend(self.matching_versions(txn, seq, filter)?.0);
+        }
+        Ok(all.len())
+    }
+
+    /// Remove a stored event, expired or not, if `filter` matches it. If
+    /// it's an address's current version, so go the versions kept in its
+    /// history that `filter` matches, and the newest left is made current.
+    /// Notes in `removed` what search no longer has, and returns how many
+    /// went.
+    pub fn remove_matching(
+        &self,
+        txn: &mut RwTxn,
+        seq: u64,
+        filter: &Filter,
+        now: u32,
+        removed: &mut Vec<u64>,
+    ) -> Result<usize> {
+        let (seqs, promote) = self.matching_versions(txn, seq, filter)?;
+        for &seq in &seqs {
+            if self.remove(txn, seq)? {
+                removed.push(seq);
+            }
+        }
+        if let Some(address) = promote {
+            self.promote(txn, &address, now, removed)?;
+        }
+        Ok(seqs.len())
+    }
+
+    /// Queue removed events for the search indexer to delete: for another
+    /// process than the relay, which tells its indexer directly.
+    pub fn queue_for_search(&self, txn: &mut RwTxn, seqs: &[u64]) -> Result<()> {
+        for seq in seqs {
+            txn.put(self.tables.search_queue, &seq.to_be_bytes(), &[])?;
+        }
+        Ok(())
+    }
+
+    /// Up to `max` of the events queued for the search indexer to delete.
+    pub fn search_queue(&self, txn: &Txn, max: usize) -> Result<Vec<u64>> {
+        let mut seqs = Vec::new();
+        let mut cursor = txn.cursor(self.tables.search_queue)?;
+        let mut entry = cursor.first()?;
+        while let Some((key, _)) = entry
+            && seqs.len() < max
+        {
+            seqs.push(u64::from_be_bytes(key.try_into().unwrap_or_default()));
+            entry = cursor.next()?;
+        }
+        Ok(seqs)
+    }
+
+    /// Take events the search indexer has deleted off its queue.
+    pub fn dequeue_for_search(&self, txn: &mut RwTxn, seqs: &[u64]) -> Result<()> {
+        for seq in seqs {
+            txn.del(self.tables.search_queue, &seq.to_be_bytes(), None)?;
+        }
         Ok(())
     }
 

@@ -1,9 +1,10 @@
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow, bail};
 use axum::serve::ListenerExt;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -14,23 +15,52 @@ use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
 use ditto_relay::store::{History, IndexedTags, Store};
 use ditto_relay::wot::Wot;
-use ditto_relay::{facets, metrics, relay, trends};
+use ditto_relay::{delete, facets, metrics, relay, trends};
+
+const USAGE: &str = "usage: ditto-relay [--config <path>] \
+                     [delete [--filter <json>] [--age <seconds>] [--dry-run]]";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Config::load(config_path()?.as_deref(), &Environment::current())?;
+    let args = Args::parse(std::env::args_os().skip(1))?;
+    let config = Config::load(args.config.as_deref(), &Environment::current())?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&config.log).context("invalid log directives")?)
         .init();
 
     facets::set_nsfw_hashtags(config.nsfw_hashtags.clone());
+    let store = open_store(&config)?;
+    match args.command {
+        Command::Serve => serve(config, Arc::new(store)).await,
+        Command::Delete {
+            filter,
+            age,
+            dry_run,
+        } => {
+            let filter = delete::filter(
+                filter.as_deref(),
+                age,
+                ditto_relay::event::now(),
+                &store.indexed_tags,
+            )?;
+            let n = delete::delete(&store, &filter, config.search, dry_run)?;
+            match dry_run {
+                true => println!("would delete {n} events"),
+                false => println!("deleted {n} events"),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn open_store(config: &Config) -> anyhow::Result<Store> {
     let indexed_tags = IndexedTags::new(config.indexed_tags.clone())?;
     let history = History::new(
         config.history,
         config.history_excluded_kinds.clone(),
         config.history_max_versions,
     );
-    let store = Arc::new(Store::open(
+    let store = Store::open(
         &config.db_path,
         config.map_size,
         config.lmdb_sync,
@@ -44,9 +74,12 @@ async fn main() -> anyhow::Result<()> {
             config.wot_budget,
         ),
         Rank::new(config.hot_half_life, config.rank_step, config.wot_budget),
-    )?);
+    )?;
     tracing::info!("opened LMDB at {}", config.db_path.display());
+    Ok(store)
+}
 
+async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
     let search = if config.search {
         let (index, indexer) =
             SearchIndex::open(&config.search_path, config.search_kinds.clone(), &store)?;
@@ -111,19 +144,72 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The file `--config` (`-c`) names, if any.
-fn config_path() -> anyhow::Result<Option<PathBuf>> {
-    let mut args = std::env::args_os().skip(1);
-    let mut path = None;
-    while let Some(arg) = args.next() {
-        let value = match arg.to_str() {
-            Some("-c" | "--config") => args.next().context("--config needs a path")?,
-            Some(arg) if arg.starts_with("--config=") => arg["--config=".len()..].into(),
-            _ => anyhow::bail!("usage: ditto-relay [--config <path>]"),
+/// The command line.
+struct Args {
+    /// The file `--config` (`-c`) names, if any.
+    config: Option<PathBuf>,
+    command: Command,
+}
+
+enum Command {
+    /// Run the relay.
+    Serve,
+    /// Remove what a filter matches: see [`delete`].
+    Delete {
+        filter: Option<String>,
+        age: Option<u64>,
+        dry_run: bool,
+    },
+}
+
+impl Args {
+    /// Options are `--name value` or `--name=value`, before the command
+    /// or after.
+    fn parse(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Args> {
+        let mut parsed = Args {
+            config: None,
+            command: Command::Serve,
         };
-        path = Some(PathBuf::from(value));
+        let (mut filter, mut age, mut dry_run) = (None, None, false);
+        while let Some(arg) = args.next() {
+            let arg = arg.into_string().map_err(|_| anyhow!(USAGE))?;
+            let (name, inline) = match arg.split_once('=') {
+                Some((name, value)) if name.starts_with("--") => (name, Some(value.to_string())),
+                _ => (arg.as_str(), None),
+            };
+            let mut value = || match &inline {
+                Some(value) => Ok(value.clone()),
+                None => args
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .with_context(|| format!("{name} needs a value")),
+            };
+            match name {
+                "-c" | "--config" => parsed.config = Some(value()?.into()),
+                "delete" if matches!(parsed.command, Command::Serve) => {
+                    parsed.command = Command::Delete {
+                        filter: None,
+                        age: None,
+                        dry_run: false,
+                    }
+                }
+                "--filter" => filter = Some(value()?),
+                "--age" => age = Some(value()?.parse().context("--age must be seconds")?),
+                "--dry-run" if inline.is_none() => dry_run = true,
+                _ => bail!(USAGE),
+            }
+        }
+        match &mut parsed.command {
+            Command::Delete {
+                filter: f,
+                age: a,
+                dry_run: d,
+            } => (*f, *a, *d) = (filter, age, dry_run),
+            Command::Serve if filter.is_some() || age.is_some() || dry_run => bail!(USAGE),
+            Command::Serve => {}
+        }
+        Ok(parsed)
     }
-    Ok(path)
 }
 
 /// Ctrl-C, or SIGTERM from a service manager.
@@ -133,5 +219,55 @@ async fn signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &str) -> anyhow::Result<Args> {
+        Args::parse(args.split_whitespace().map(OsString::from))
+    }
+
+    #[test]
+    fn parses_the_command_line() {
+        let args = parse("").unwrap();
+        assert!(args.config.is_none() && matches!(args.command, Command::Serve));
+        let args = parse("--config=a.toml").unwrap();
+        assert_eq!(args.config, Some(PathBuf::from("a.toml")));
+
+        let args = parse("delete --filter {\"kinds\":[1]} -c a.toml --age 60 --dry-run").unwrap();
+        assert_eq!(args.config, Some(PathBuf::from("a.toml")));
+        let Command::Delete {
+            filter,
+            age,
+            dry_run,
+        } = args.command
+        else {
+            panic!("not delete");
+        };
+        assert_eq!(
+            (filter.as_deref(), age, dry_run),
+            (Some("{\"kinds\":[1]}"), Some(60), true)
+        );
+        let Command::Delete { filter, .. } =
+            parse("--filter={\"a\":\"=\"} delete").unwrap().command
+        else {
+            panic!("not delete");
+        };
+        assert_eq!(filter.as_deref(), Some("{\"a\":\"=\"}"));
+
+        for bad in [
+            "--dry-run",
+            "--age 5",
+            "delete delete",
+            "delete --age x",
+            "delete --filter",
+            "delete --dry-run=yes",
+            "serve",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 }

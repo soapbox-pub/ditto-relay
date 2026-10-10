@@ -4,6 +4,12 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [Unreleased]
+
+- `ditto-relay delete --filter <json> [--age <seconds>] [--dry-run]` removes
+  every stored event a filter matches, while the relay runs. The relay's
+  search indexer drops what it removes from the search index too.
+
 ## [2.0.0]
 
 The first release of Ditto Relay in Rust, rewritten on its own database in
