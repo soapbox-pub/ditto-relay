@@ -37,9 +37,17 @@ const INTERNAL_ERROR: &str = "error: internal error";
 /// The most requests written to the plugin before flushing.
 const BATCH: usize = 256;
 
+/// Who's on the other end of a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    Ip(IpAddr),
+    /// Someone over Tor, whose address the relay never sees.
+    Tor,
+}
+
 /// Where an event came from.
 pub struct Source<'a> {
-    pub ip: IpAddr,
+    pub peer: Peer,
     /// The pubkey the connection authenticated as, in hex.
     pub authed: Option<&'a str>,
 }
@@ -97,13 +105,21 @@ fn request_line(ev: &Event, source: &Source<'_>, now: u64) -> String {
         #[serde(skip_serializing_if = "Option::is_none")]
         authed: Option<&'a str>,
     }
-    let ip = source.ip.to_canonical();
+    // strfry has no type for Tor, and an address would be one the plugin
+    // could mistake for a client's own.
+    let (source_type, source_info) = match source.peer {
+        Peer::Ip(ip) => match ip.to_canonical() {
+            ip if ip.is_ipv4() => ("IP4", ip.to_string()),
+            ip => ("IP6", ip.to_string()),
+        },
+        Peer::Tor => ("Tor", String::new()),
+    };
     let input = Input {
         r#type: "new",
         event: ev,
         received_at: now,
-        source_type: if ip.is_ipv4() { "IP4" } else { "IP6" },
-        source_info: ip.to_string(),
+        source_type,
+        source_info,
         authed: source.authed,
     };
     let mut line = serde_json::to_string(&input).expect("plugin input serializes");
@@ -359,7 +375,7 @@ mod tests {
 
     fn source() -> Source<'static> {
         Source {
-            ip: "::ffff:1.2.3.4".parse().unwrap(),
+            peer: Peer::Ip("::ffff:1.2.3.4".parse().unwrap()),
             authed: None,
         }
     }
@@ -378,7 +394,7 @@ mod tests {
         assert!(value.get("authed").is_none());
 
         let authed = Source {
-            ip: "2001:db8::1".parse().unwrap(),
+            peer: Peer::Ip("2001:db8::1".parse().unwrap()),
             authed: Some(&ev.pubkey),
         };
         let value: serde_json::Value =
@@ -386,6 +402,14 @@ mod tests {
         assert_eq!(value["sourceType"], "IP6");
         assert_eq!(value["sourceInfo"], "2001:db8::1");
         assert_eq!(value["authed"], ev.pubkey.as_str());
+
+        let tor = Source {
+            peer: Peer::Tor,
+            authed: None,
+        };
+        let value: serde_json::Value = serde_json::from_str(&request_line(&ev, &tor, 123)).unwrap();
+        assert_eq!(value["sourceType"], "Tor");
+        assert_eq!(value["sourceInfo"], "");
     }
 
     /// A plugin written in shell, which judges events by their content.

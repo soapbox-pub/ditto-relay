@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::Router;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, header};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -27,7 +28,7 @@ use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
 use crate::landing;
 use crate::metrics::{Connected, METRICS};
-use crate::plugin::{self, Plugin, Verdict};
+use crate::plugin::{self, Peer, Plugin, Verdict};
 use crate::query::{self, Cancelled, Count, Results, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
@@ -59,21 +60,57 @@ pub struct AppState {
     /// A place per core for queries. A REQ or COUNT waits its turn, rather
     /// than being refused, when every core is busy.
     queries: Arc<Semaphore>,
-    /// The NIP-11 information document, and the landing page made from it.
+    /// What the relay is called by: its URL, and its onion's.
+    urls: Arc<[String]>,
+    /// What's served to clients at the relay's URL, and at its onion's, if
+    /// it's an onion service too.
+    clearnet: Arc<Pages>,
+    onion: Option<Arc<Pages>>,
+    /// Where Tor Browser is told to find the onion.
+    onion_location: Option<HeaderValue>,
+}
+
+/// The NIP-11 information document, and the landing page made from it.
+struct Pages {
     nip11: Arc<str>,
     landing: Arc<str>,
 }
 
+impl Pages {
+    /// For the relay at `url`, whose images are at `public_url`.
+    fn new(config: &Config, url: &str, public_url: &str) -> Self {
+        let info = nip11(config, public_url);
+        Self {
+            landing: landing::render(&info, url).into(),
+            nip11: info.to_string().into(),
+        }
+    }
+}
+
 impl AppState {
-    /// With `search`, the index and the channel to its indexer.
+    /// With `search`, the index and the channel to its indexer, and with
+    /// `onion`, the URL of the relay's onion service.
     pub fn new(
         config: Config,
         store: Arc<Store>,
         search: Option<(Arc<SearchIndex>, std::sync::mpsc::Sender<Vec<u64>>)>,
+        onion: Option<String>,
     ) -> Self {
         let (search, indexer) = search.unzip();
-        let info = nip11(&config);
-        let landing = landing::render(&info, &config.url).into();
+        let clearnet = Pages::new(&config, &config.url, &config.public_url);
+        // Images on the onion come from the onion, not from clearnet.
+        let onion_http = onion.as_ref().map(|url| url.replacen("ws", "http", 1));
+        let onion_pages = onion
+            .as_deref()
+            .zip(onion_http.as_deref())
+            .map(|(url, http)| Arc::new(Pages::new(&config, url, http)));
+        // Tor Browser only heeds the header over HTTPS.
+        let advertise = config.tor.as_ref().is_some_and(|tor| tor.onion_location)
+            && config.public_url.starts_with("https://");
+        let onion_location = onion_http
+            .filter(|_| advertise)
+            .and_then(|url| HeaderValue::from_str(&url).ok());
+        let urls = [config.url.clone()].into_iter().chain(onion).collect();
         let plugin = config.write_policy_plugin.clone().map(|command| {
             let timeout = Duration::from_secs(config.write_policy_timeout_seconds);
             Plugin::spawn(command, timeout)
@@ -90,8 +127,10 @@ impl AppState {
         };
         Self {
             plugin,
-            nip11: info.to_string().into(),
-            landing,
+            urls,
+            clearnet: Arc::new(clearnet),
+            onion: onion_pages,
+            onion_location,
             config: Arc::new(config),
             writer: Writer::spawn(store.clone(), indexer, stored),
             store,
@@ -136,6 +175,7 @@ fn cores() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
 }
 
+/// What serves clients that reach the relay at its URL.
 pub fn router(state: AppState) -> Router {
     let asset = |content_type: &'static str, body: &'static [u8]| {
         get(move || async move { ([(header::CONTENT_TYPE, content_type)], body) })
@@ -148,6 +188,36 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// What serves clients that reach the relay at its onion, which have no
+/// address to give.
+pub fn onion_router(state: AppState) -> Router {
+    router(state).layer(Extension(OverTor))
+}
+
+/// Marks a request that came over Tor.
+#[derive(Clone, Copy)]
+struct OverTor;
+
+/// How a request reached the relay.
+#[derive(Clone, Copy)]
+enum Via {
+    /// From the peer at an address, which may be a proxy.
+    Socket(SocketAddr),
+    Tor,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for Via {
+    type Rejection = <ConnectInfo<SocketAddr> as FromRequestParts<S>>::Rejection;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        if parts.extensions.get::<OverTor>().is_some() {
+            return Ok(Via::Tor);
+        }
+        let ConnectInfo(peer) = ConnectInfo::from_request_parts(parts, state).await?;
+        Ok(Via::Socket(peer))
+    }
+}
+
 /// How much of a connection's read buffer is filled at a time. tungstenite
 /// zeroes all of it before every read, and messages are mostly a few hundred
 /// bytes: at its default of 128 KiB, that was a twentieth of what the relay
@@ -156,24 +226,32 @@ const READ_BUFFER: usize = 8 << 10;
 
 async fn root(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via: Via,
     headers: HeaderMap,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     if let Ok(ws) = ws {
         let max = state.config.max_message_size;
-        let ip = client_ip(&state.config, &headers, peer);
+        // A header over Tor is the client's own, and can't be trusted.
+        let peer = match via {
+            Via::Socket(peer) => Peer::Ip(client_ip(&state.config, &headers, peer)),
+            Via::Tor => Peer::Tor,
+        };
         return ws
             .max_message_size(max)
             .max_frame_size(max)
             .read_buffer_size(READ_BUFFER)
             .on_upgrade(move |socket| {
                 let connections = state.connections.clone();
-                connections.track_future(Connection::run(socket, state, ip))
+                connections.track_future(Connection::run(socket, state, peer))
             })
             .into_response();
     }
 
+    let pages = match via {
+        Via::Tor => state.onion.as_ref().unwrap_or(&state.clearnet),
+        Via::Socket(_) => &state.clearnet,
+    };
     let wants_nip11 = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -184,19 +262,25 @@ async fn root(
                 (header::CONTENT_TYPE, "application/nostr+json"),
                 (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
             ],
-            state.nip11.to_string(),
+            pages.nip11.to_string(),
         )
             .into_response();
     }
 
-    (
+    let mut response = (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
         ],
-        state.landing.to_string(),
+        pages.landing.to_string(),
     )
-        .into_response()
+        .into_response();
+    if let (Via::Socket(_), Some(onion)) = (via, &state.onion_location) {
+        response
+            .headers_mut()
+            .insert("onion-location", onion.clone());
+    }
+    response
 }
 
 /// The client's IP: from the configured header if it's set and makes sense,
@@ -214,7 +298,8 @@ fn client_ip(config: &Config, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     ip.unwrap_or(peer.ip())
 }
 
-fn nip11(config: &Config) -> Value {
+/// For the relay whose images are at `public_url`.
+fn nip11(config: &Config, public_url: &str) -> Value {
     let mut nips = vec![1, 9, 11, 40, 42, 45, 62, 70];
     if config.search {
         nips.push(50);
@@ -226,8 +311,8 @@ fn nip11(config: &Config) -> Value {
         "supported_nips": nips,
         "software": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
-        "icon": landing::asset_url(&config.public_url, "/icon.png"),
-        "banner": landing::asset_url(&config.public_url, "/banner.jpg"),
+        "icon": landing::asset_url(public_url, "/icon.png"),
+        "banner": landing::asset_url(public_url, "/banner.jpg"),
         "limitation": {
             "max_message_length": config.max_message_size,
             "max_subscriptions": config.max_subscriptions,
@@ -263,12 +348,12 @@ const DUPLICATE: &str = "duplicate: already have this event";
 const VANISH: u16 = 62;
 
 /// Whether a NIP-62 request to vanish is addressed to this relay, which is
-/// at `url`: to every relay, or to this one.
-fn addressed_to(ev: &Event, url: &str) -> bool {
+/// at `urls`: to every relay, or to this one.
+fn addressed_to(ev: &Event, urls: &[impl AsRef<str>]) -> bool {
     ev.tags
         .iter()
         .filter(|tag| tag.len() >= 2 && tag[0] == "relay")
-        .any(|tag| tag[1] == "ALL_RELAYS" || auth::same_relay(&tag[1], url))
+        .any(|tag| tag[1] == "ALL_RELAYS" || auth::is_one_of(&tag[1], urls))
 }
 
 /// Whether an event is NIP-70 protected: only its author may publish it.
@@ -377,7 +462,7 @@ struct Connection {
     /// is shutting down.
     cancel: CancellationToken,
     sink: SplitSink<WebSocket, Message>,
-    ip: IpAddr,
+    peer: Peer,
     /// What this connection signs to authenticate (NIP-42), once it's
     /// been asked to: only to publish a NIP-70 protected event.
     challenge: Option<String>,
@@ -395,7 +480,7 @@ enum Disconnect {
 }
 
 impl Connection {
-    async fn run(socket: WebSocket, state: AppState, ip: IpAddr) {
+    async fn run(socket: WebSocket, state: AppState, peer: Peer) {
         let _connected = Connected::new();
         let (sink, mut stream) = socket.split();
         let id = state.next_conn.fetch_add(1, Ordering::Relaxed);
@@ -415,7 +500,7 @@ impl Connection {
             id,
             subs: HashMap::new(),
             sink,
-            ip,
+            peer,
             challenge: None,
             authed: HashSet::new(),
         };
@@ -574,12 +659,12 @@ impl Connection {
                 return self.on_published(refused).await;
             }
         };
-        let (state, ip, authed) = (self.state.clone(), self.ip, self.authed.clone());
+        let (state, peer, authed) = (self.state.clone(), self.peer, self.authed.clone());
         publishing.spawn(async move {
             let (accepted, msg, shadow) = match verify(&state, ev).await {
                 Err(msg) => (false, msg, false),
                 Ok(None) => (true, DUPLICATE.into(), false),
-                Ok(Some(ev)) => match ask_plugin(&state, ip, &authed, &ev).await {
+                Ok(Some(ev)) => match ask_plugin(&state, peer, &authed, &ev).await {
                     Verdict::Accept => {
                         let (accepted, msg) = accept(&state, &id, ev).await;
                         (accepted, msg, false)
@@ -641,7 +726,7 @@ impl Connection {
         if ev.created_at > u64::from(event::now()) + self.state.config.max_future_seconds {
             return Err("invalid: created_at is too far in the future".into());
         }
-        if ev.kind == VANISH && !addressed_to(&ev, &self.state.config.url) {
+        if ev.kind == VANISH && !addressed_to(&ev, &self.state.urls) {
             return Err("invalid: this request to vanish is for other relays".into());
         }
         Ok(ev)
@@ -811,7 +896,7 @@ impl Connection {
             let msg = "invalid: no challenge has been issued";
             return self.ok(&id, false, msg).await;
         };
-        match auth::verify(&ev, challenge, &self.state.config.url, event::now()) {
+        match auth::verify(&ev, challenge, &self.state.urls, event::now()) {
             Ok(pubkey) => {
                 self.authed.insert(pubkey);
                 self.ok(&id, true, "").await
@@ -947,7 +1032,7 @@ async fn verify(state: &AppState, ev: Event) -> Result<Option<Event>, Cow<'stati
 /// What the write policy plugin makes of an event, if there is one.
 async fn ask_plugin(
     state: &AppState,
-    ip: IpAddr,
+    peer: Peer,
     authed: &HashSet<[u8; 32]>,
     ev: &Event,
 ) -> Verdict {
@@ -962,7 +1047,7 @@ async fn ask_plugin(
     }
     .map(hex::encode);
     let source = plugin::Source {
-        ip,
+        peer,
         authed: authed.as_deref(),
     };
     let start = Instant::now();
@@ -1046,11 +1131,12 @@ mod tests {
     #[test]
     fn knows_which_vanish_requests_are_its_own() {
         let to = |relay: &str| signed(1, 100, VANISH, vec![vec!["relay", relay]], "");
-        let url = "wss://relay.example.com";
-        assert!(addressed_to(&to("ALL_RELAYS"), url));
-        assert!(addressed_to(&to("wss://relay.example.com"), url));
-        assert!(addressed_to(&to("WSS://Relay.Example.com/"), url));
-        assert!(!addressed_to(&to("wss://other.example.com"), url));
-        assert!(!addressed_to(&signed(1, 100, VANISH, vec![], ""), url));
+        let urls = ["wss://relay.example.com", "ws://relay.onion/"];
+        assert!(addressed_to(&to("ALL_RELAYS"), &urls));
+        assert!(addressed_to(&to("wss://relay.example.com"), &urls));
+        assert!(addressed_to(&to("WSS://Relay.Example.com/"), &urls));
+        assert!(addressed_to(&to("ws://relay.onion"), &urls));
+        assert!(!addressed_to(&to("wss://other.example.com"), &urls));
+        assert!(!addressed_to(&signed(1, 100, VANISH, vec![], ""), &urls));
     }
 }

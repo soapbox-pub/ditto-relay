@@ -14,6 +14,7 @@ use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
 use ditto_relay::store::{History, IndexedTags, Store};
+use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
 use ditto_relay::{delete, facets, metrics, relay, trends};
 
@@ -31,7 +32,13 @@ async fn main() -> anyhow::Result<()> {
     facets::set_nsfw_hashtags(config.nsfw_hashtags.clone());
     let store = open_store(&config)?;
     match args.command {
-        Command::Serve => serve(config, Arc::new(store)).await,
+        Command::Serve => {
+            serve(config, Arc::new(store)).await?;
+            // Everything of the relay's is closed by now. Arti leaves a
+            // thread behind, in a loop that never ends, which dropping the
+            // runtime would wait on, or panic in.
+            std::process::exit(0)
+        }
         Command::Delete {
             filter,
             age,
@@ -120,7 +127,23 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
         None => None,
     };
 
-    let state = AppState::new(config, store, search);
+    // Read, or made, before anything is served, so a key that's no good
+    // stops the relay rather than leaving it without its onion.
+    let onion = match &config.tor {
+        Some(tor_config) => Some((tor_config.clone(), OnionKey::open(&tor_config.key_file)?)),
+        None => None,
+    };
+    let onion_url = onion
+        .as_ref()
+        .map(|(tor_config, key)| tor::url(&key.address, tor_config.port));
+    let state = AppState::new(config, store, search, onion_url);
+    let tor = match onion {
+        Some((tor_config, key)) => {
+            let app = relay::onion_router(state.clone());
+            Some(Tor::start(&tor_config, key, app, state.shutdown.clone()).await?)
+        }
+        None => None,
+    };
     trends::spawn(state.clone());
     let shutdown = state.shutdown.clone();
     tokio::spawn(async move {
@@ -136,6 +159,9 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
     .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
     .await?;
     state.shut_down().await;
+    if let Some(tor) = tor {
+        tor.stop();
+    }
     if let Some(metrics) = metrics {
         metrics.abort();
     }

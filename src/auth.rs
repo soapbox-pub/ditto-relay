@@ -18,9 +18,20 @@ pub fn same_relay(a: &str, b: &str) -> bool {
     normalize(a) == normalize(b)
 }
 
+/// Whether `url` is one of `urls`.
+pub fn is_one_of(url: &str, urls: &[impl AsRef<str>]) -> bool {
+    urls.iter().any(|own| same_relay(url, own.as_ref()))
+}
+
 /// Check an AUTH event, for a connection given `challenge` by the relay at
-/// `url`. Returns the pubkey authenticated, or a NIP-01 error message.
-pub fn verify(ev: &Event, challenge: &str, url: &str, now: u32) -> Result<[u8; 32], String> {
+/// `urls`, any of which it may name. Returns the pubkey authenticated, or a
+/// NIP-01 error message.
+pub fn verify(
+    ev: &Event,
+    challenge: &str,
+    urls: &[impl AsRef<str>],
+    now: u32,
+) -> Result<[u8; 32], String> {
     if ev.kind != AUTH {
         return Err(format!("invalid: AUTH event must be kind {AUTH}"));
     }
@@ -31,7 +42,7 @@ pub fn verify(ev: &Event, challenge: &str, url: &str, now: u32) -> Result<[u8; 3
     if ev.tag("challenge") != Some(challenge) {
         return Err("invalid: wrong challenge".into());
     }
-    if !ev.tag("relay").is_some_and(|relay| same_relay(relay, url)) {
+    if !ev.tag("relay").is_some_and(|relay| is_one_of(relay, urls)) {
         return Err("invalid: wrong relay".into());
     }
     Ok(decode_hex(&ev.pubkey).expect("verified"))
@@ -50,6 +61,8 @@ mod tests {
     use crate::event::tests::signed;
 
     const URL: &str = "wss://relay.example.com";
+    const ONION: &str = "ws://relay.onion/";
+    const URLS: &[&str] = &[URL, ONION];
 
     fn pubkey(seed: u8) -> [u8; 32] {
         decode_hex(&signed(seed, 0, 1, vec![], "").pubkey).unwrap()
@@ -63,7 +76,10 @@ mod tests {
             signed(1, created_at, kind, tags, "")
         };
         let ok = auth(AUTH, now, "abc", "wss://Relay.Example.com/");
-        assert_eq!(verify(&ok, "abc", URL, now as u32), Ok(pubkey(1)));
+        assert_eq!(verify(&ok, "abc", URLS, now as u32), Ok(pubkey(1)));
+        let onion = auth(AUTH, now, "abc", "ws://relay.onion");
+        assert_eq!(verify(&onion, "abc", URLS, now as u32), Ok(pubkey(1)));
+        assert!(verify(&onion, "abc", &[URL], now as u32).is_err());
         for (ev, why) in [
             (auth(1, now, "abc", URL), "kind"),
             (auth(AUTH, now - 601, "abc", URL), "created_at"),
@@ -71,11 +87,11 @@ mod tests {
             (auth(AUTH, now, "xyz", URL), "challenge"),
             (auth(AUTH, now, "abc", "wss://other.example.com"), "relay"),
         ] {
-            let err = verify(&ev, "abc", URL, now as u32).unwrap_err();
+            let err = verify(&ev, "abc", URLS, now as u32).unwrap_err();
             assert!(err.starts_with("invalid:"), "{why}: {err}");
         }
         let mut tampered = ok.clone();
         tampered.created_at += 1;
-        assert!(verify(&tampered, "abc", URL, now as u32).is_err());
+        assert!(verify(&tampered, "abc", URLS, now as u32).is_err());
     }
 }

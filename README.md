@@ -15,6 +15,7 @@ and full-text search runs on [Tantivy](https://github.com/quickwit-oss/tantivy).
 - NIP-85 trusted assertions and trending labels, signed by the relay's own key
 - strfry-compatible write policy plugins
 - Prometheus metrics
+- Built-in Tor onion service, off by default
 
 ## Installing
 
@@ -76,6 +77,22 @@ running: it removes events in small transactions between the relay's writes, and
 relay drops them from the search index within a few seconds. Removing an address's
 current version also removes its older versions that the filter matches, and the newest
 version left becomes current. Nothing stops deleted events from being published again.
+
+## Tor
+
+```toml
+[tor]
+enabled = true
+```
+
+With Tor turned on, the relay is a Tor onion service too. Tor is built in (it's
+[Arti](https://arti.torproject.org/)), so there's nothing else to install or
+configure. The onion's address is logged at startup, and it answers about a minute
+later, once Tor has published it. The key the address is made from is kept in
+`data_dir/tor/hs_ed25519_secret_key`, in C Tor's format: back it up to keep the
+address, or put an existing onion's `hs_ed25519_secret_key` there to keep that one.
+[`ditto-relay.example.toml`](ditto-relay.example.toml) lists the rest of the settings,
+including Arti's own.
 
 ## Benchmarks
 

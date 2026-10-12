@@ -19,6 +19,12 @@ use crate::facets;
 pub const SYSTEM_PATH: &str = "/etc/ditto-relay/ditto-relay.toml";
 /// `data_dir` when the file doesn't say, for root.
 const SYSTEM_DATA_DIR: &str = "/var/lib/ditto-relay";
+/// `log` when the file doesn't say. Arti narrates its routine at info, and
+/// warns of each failure of an onion service's that it retries, of which a
+/// working service has dozens an hour; the relay says itself when Tor is up,
+/// and when the onion has been unreachable for long.
+const DEFAULT_LOG: &str =
+    "info,tantivy=warn,arti_client=warn,tor_=warn,tor_hsservice=error,tor_circmgr::hspool=error";
 
 /// The relay's configuration, resolved and validated.
 #[derive(Debug, Clone)]
@@ -106,6 +112,25 @@ pub struct Config {
     pub real_ip_header: Option<String>,
     /// What to log, as `tracing_subscriber`'s `EnvFilter` directives.
     pub log: String,
+    /// Serving the relay as a Tor onion service too. None turns it off.
+    pub tor: Option<Tor>,
+}
+
+/// Serving the relay as a Tor onion service, with Tor built in: see
+/// [`crate::tor`].
+#[derive(Debug, Clone)]
+pub struct Tor {
+    /// Where Tor keeps its state and its cache.
+    pub dir: PathBuf,
+    /// The onion's secret key, as C Tor keeps it. Made if it's missing.
+    pub key_file: PathBuf,
+    /// The port the onion answers on.
+    pub port: u16,
+    /// Whether the landing page, over HTTPS, names the onion in an
+    /// `Onion-Location` header, which Tor Browser offers to go to.
+    pub onion_location: bool,
+    pub client: arti_client::config::TorClientConfig,
+    pub service: arti_client::config::onion_service::OnionServiceConfig,
 }
 
 /// The file as written. Every key is optional but `url`, and a key the
@@ -154,6 +179,21 @@ struct File {
     write_policy_timeout_seconds: Option<u64>,
     real_ip_header: Option<String>,
     log: Option<String>,
+    tor: Option<TorFile>,
+}
+
+/// The `[tor]` table as written. `arti` and `service` are Arti's own
+/// settings, which it checks.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TorFile {
+    enabled: Option<bool>,
+    dir: Option<PathBuf>,
+    key_file: Option<PathBuf>,
+    port: Option<u16>,
+    onion_location: Option<bool>,
+    arti: Option<toml::Table>,
+    service: Option<toml::Table>,
 }
 
 /// What the defaults depend on, read once so that tests can supply their own.
@@ -289,6 +329,27 @@ impl Config {
             }
             None => None,
         };
+        // Checked when it's off too, so turning it on can't be what finds a
+        // mistake.
+        let tor = file.tor.unwrap_or_default();
+        let tor_dir = match tor.dir {
+            Some(dir) => resolve(dir),
+            None => data_dir.join("tor"),
+        };
+        let tor_port = tor.port.unwrap_or(80);
+        anyhow::ensure!(tor_port != 0, "tor.port must be a port");
+        let enabled = tor.enabled.unwrap_or(false);
+        let tor = Tor {
+            key_file: match tor.key_file {
+                Some(path) => resolve(path),
+                None => tor_dir.join("hs_ed25519_secret_key"),
+            },
+            client: crate::tor::client_config(&tor_dir, tor.arti.unwrap_or_default())?,
+            service: crate::tor::service_config(tor.service.unwrap_or_default())?,
+            dir: tor_dir,
+            port: tor_port,
+            onion_location: tor.onion_location.unwrap_or(true),
+        };
         Ok(Self {
             bind: file.bind.unwrap_or_else(|| "127.0.0.1:13131".into()),
             // An empty one turns them off.
@@ -362,7 +423,8 @@ impl Config {
                     .map(|t| t.to_string())
                     .collect()
             }),
-            log: file.log.unwrap_or_else(|| "info,tantivy=warn".into()),
+            log: file.log.unwrap_or_else(|| DEFAULT_LOG.into()),
+            tor: enabled.then_some(tor),
         })
     }
 }
@@ -433,6 +495,33 @@ mod tests {
         assert!(c.keypair.is_none());
         assert!(c.wot_seeds.is_empty());
         assert_eq!(c.indexed_tags, ["proxy", "client", "content-warning"]);
+        assert!(c.tor.is_none());
+    }
+
+    #[test]
+    fn tor_is_off_until_enabled() {
+        let c = config("url = \"ws://x\"\n[tor]\nport = 8080").unwrap();
+        assert!(c.tor.is_none());
+        // Checked all the same.
+        assert!(config("url = \"ws://x\"\n[tor]\nport = 0").is_err());
+        assert!(config("url = \"ws://x\"\n[tor.arti]\nnope = 1").is_err());
+
+        let c = config("url = \"ws://x\"\n[tor]\nenabled = true").unwrap();
+        let tor = c.tor.unwrap();
+        let dir = Path::new("/home/someone/.local/share/ditto-relay/tor");
+        assert_eq!(tor.dir, dir);
+        assert_eq!(tor.key_file, dir.join("hs_ed25519_secret_key"));
+        assert_eq!((tor.port, tor.onion_location), (80, true));
+
+        let c = config(
+            "url = \"ws://x\"\n[tor]\nenabled = true\ndir = \"tor\"\nkey_file = \"/k\"\n\
+             [tor.service]\nnum_intro_points = 5\n[tor.arti]\nvanguards.mode = \"full\"",
+        )
+        .unwrap();
+        let tor = c.tor.unwrap();
+        assert_eq!(tor.dir, Path::new("/etc/ditto-relay/tor"));
+        assert_eq!(tor.key_file, Path::new("/k"));
+        assert!(config("url = \"ws://x\"\n[tor]\nenabled = true\nonion = true").is_err());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use super::{AppState, router};
+use super::{AppState, onion_router, router};
 use crate::config::Config;
 use crate::event::tests::signed;
 use crate::event::{self, Event};
@@ -67,12 +67,15 @@ fn config() -> Config {
         write_policy_timeout_seconds: 10,
         real_ip_header: None,
         log: String::new(),
+        tor: None,
     }
 }
 
 /// A relay serving a fresh store on a free port.
 struct Relay {
     addr: SocketAddr,
+    /// Where the relay's onion router is served, if it's an onion service.
+    onion: Option<SocketAddr>,
     state: AppState,
     _dir: tempfile::TempDir,
 }
@@ -83,8 +86,24 @@ impl Relay {
     }
 
     async fn start_with(config: Config) -> Relay {
+        Relay::start_onion(config, None).await
+    }
+
+    /// With `onion`, an onion service at that URL too, whose router is served
+    /// on a port of its own, as it would be on Tor's streams.
+    async fn start_onion(config: Config, onion: Option<&str>) -> Relay {
         let (dir, store) = store::tests::open();
-        let state = AppState::new(config, Arc::new(store), None);
+        let state = AppState::new(config, Arc::new(store), None, onion.map(String::from));
+        let onion = match onion {
+            Some(_) => {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let app = onion_router(state.clone());
+                tokio::spawn(async move { axum::serve(listener, app).await });
+                Some(addr)
+            }
+            None => None,
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());
@@ -97,17 +116,29 @@ impl Relay {
         });
         Relay {
             addr,
+            onion,
             state,
             _dir: dir,
         }
     }
 
     async fn connect(&self) -> Client {
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}", self.addr))
-            .await
-            .unwrap();
-        Client { ws }
+        Client::connect(self.addr).await
     }
+}
+
+/// What a GET of `/` at `addr` that accepts `accept` is answered with: its
+/// head, lowercased, and its body.
+async fn get(addr: SocketAddr, accept: &str) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    (head.to_ascii_lowercase(), body.into())
 }
 
 struct Client {
@@ -115,6 +146,13 @@ struct Client {
 }
 
 impl Client {
+    async fn connect(addr: SocketAddr) -> Client {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        Client { ws }
+    }
+
     async fn send(&mut self, msg: Value) {
         self.ws.send(Message::text(msg.to_string())).await.unwrap();
     }
@@ -471,4 +509,70 @@ done
     );
     let ok = client.next().await;
     assert_eq!(ok, json!(["OK", ev.id, true, ""]));
+}
+
+/// An onion service's clients are told the onion, and may authenticate
+/// with it, while clearnet's are told where to find it.
+#[tokio::test]
+async fn serves_the_onion_as_the_onion() {
+    let dir = tempfile::tempdir().unwrap();
+    let tor = crate::config::Tor {
+        dir: dir.path().into(),
+        key_file: dir.path().join("key"),
+        port: 80,
+        onion_location: true,
+        client: crate::tor::client_config(dir.path(), Default::default()).unwrap(),
+        service: crate::tor::service_config(Default::default()).unwrap(),
+    };
+    let config = Config {
+        url: "wss://relay.test/".into(),
+        public_url: "https://relay.test/".into(),
+        tor: Some(tor),
+        ..config()
+    };
+    let relay = Relay::start_onion(config, Some("ws://relay.onion/")).await;
+    let onion = relay.onion.unwrap();
+
+    let (head, body) = get(onion, "application/nostr+json").await;
+    let info: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["icon"], "http://relay.onion/icon.png");
+    assert!(!head.contains("onion-location"), "{head}");
+    let (head, body) = get(onion, "text/html").await;
+    assert!(body.contains("ws://relay.onion/"), "{body}");
+    assert!(!head.contains("onion-location"), "{head}");
+
+    let (head, body) = get(relay.addr, "application/nostr+json").await;
+    let info: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["icon"], "https://relay.test/icon.png");
+    assert!(!head.contains("onion-location"), "{head}");
+    let (head, body) = get(relay.addr, "text/html").await;
+    assert!(!body.contains("relay.onion"), "{body}");
+    assert!(
+        head.contains("onion-location: http://relay.onion/\r\n"),
+        "{head}"
+    );
+
+    // NIP-70: a protected event needs its author to authenticate, which
+    // over the onion may name the onion.
+    let mut client = Client::connect(onion).await;
+    let ev = signed(1, event::now().into(), 1, vec![vec!["-"]], "hidden");
+    client.send(json!(["EVENT", ev])).await;
+    let challenge = client.next().await;
+    assert_eq!(challenge[0], "AUTH", "{challenge}");
+    let ok = client.next().await;
+    assert_eq!(ok[2], false, "{ok}");
+    let challenge = challenge[1].as_str().unwrap();
+    let auth = signed(
+        1,
+        event::now().into(),
+        crate::auth::AUTH,
+        vec![
+            vec!["challenge", challenge],
+            vec!["relay", "ws://relay.onion"],
+        ],
+        "",
+    );
+    client.send(json!(["AUTH", auth])).await;
+    assert_eq!(client.next().await, json!(["OK", auth.id, true, ""]));
+    assert_eq!(client.publish(&ev).await, (true, String::new()));
 }

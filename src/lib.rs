@@ -20,5 +20,6 @@ pub mod record;
 pub mod relay;
 pub mod search;
 pub mod store;
+pub mod tor;
 pub mod trends;
 pub mod wot;

@@ -9,6 +9,14 @@ it is tagged.
 - `ditto-relay delete --filter <json> [--age <seconds>] [--dry-run]` removes
   every stored event a filter matches, while the relay runs. The relay's
   search indexer drops what it removes from the search index too.
+- The relay can serve itself as a Tor onion service too, with Tor (Arti)
+  built in, by setting `enabled = true` under `[tor]`. The onion's key is a
+  file in C Tor's format, so an existing onion's address can be kept, and
+  `[tor.service]` and `[tor.arti]` take Arti's own settings. Over Tor the
+  landing page and NIP-11 name the onion, AUTH and requests to vanish may name
+  it, and the write policy plugin is told `sourceType` `"Tor"`. Over HTTPS,
+  the landing page points Tor Browser to the onion with `Onion-Location`.
+- The default `log` keeps Tor's routine out of the log.
 
 ## [2.0.0]
 

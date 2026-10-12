@@ -20,8 +20,10 @@ url = "wss://relay.example.com/"
 # "x-forwarded-for", or "cf-connecting-ip". Unset, the peer's address is used.
 # real_ip_header = "x-real-ip"
 
-# What to log, as tracing EnvFilter directives.
-# log = "info,tantivy=warn"
+# What to log, as tracing EnvFilter directives. Tor's own routine is kept out
+# of the log by default: the relay says itself when its onion is reachable, and
+# when it has been unreachable for long.
+# log = "info,tantivy=warn,arti_client=warn,tor_=warn,tor_hsservice=error,tor_circmgr::hspool=error"
 
 ## Storage
 
@@ -114,3 +116,46 @@ url = "wss://relay.example.com/"
 # write_policy_plugin = "/usr/local/bin/my-plugin"
 # How long the plugin may take to answer before it's restarted.
 # write_policy_timeout_seconds = 10
+
+## Tor
+
+# Serve the relay as a Tor onion service too, with Tor built in: there's
+# nothing else to install. The onion's address is logged at startup, and its
+# clients are shown it on the landing page and in NIP-11, and may name it in
+# NIP-42 AUTH and NIP-62 requests to vanish. They reach the write policy plugin
+# as sourceType "Tor", with no address. These tables have to come after every
+# other setting in the file.
+# [tor]
+# enabled = false
+# Holds the onion's key, unless key_file says otherwise, and Tor's state/ and
+# cache/, which make it faster and safer to start but can be lost. It, and
+# every directory above it, must not be writable by other users. Defaults to
+# tor/ in data_dir.
+# dir = "/var/lib/ditto-relay/tor"
+# The onion's secret key, which its address is made from. It's in C Tor's
+# format, so a HiddenServiceDir's hs_ed25519_secret_key can be used to keep
+# that onion's address. Made, with a new address, if it doesn't exist.
+# key_file = "/var/lib/ditto-relay/tor/hs_ed25519_secret_key"
+# The port the onion answers on.
+# port = 80
+# Whether the landing page, when public_url is https, tells Tor Browser about
+# the onion with an Onion-Location header.
+# onion_location = true
+
+# The onion service's own settings, as arti.toml takes them under
+# [onion_services.<name>]. For example:
+# [tor.service]
+# Introduction points, from 1 to 20.
+# num_intro_points = 3
+# Streams a circuit may have open at once before it's torn down.
+# max_concurrent_streams_per_circuit = 65535
+# How many introductions a second each introduction point may send.
+# rate_limit_at_intro = { rate = 100, burst = 200 }
+# Ask clients for proof of work when the service is overwhelmed.
+# enable_pow = false
+
+# Tor's own settings, as arti.toml takes them, except for storage's
+# directories and keystore, which dir and key_file decide. For example:
+# [tor.arti]
+# vanguards.mode = "full"
+# storage.permissions.dangerously_trust_everyone = false
