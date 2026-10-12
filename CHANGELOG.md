@@ -7,8 +7,14 @@ it is tagged.
 ## [Unreleased]
 
 - `ditto-relay delete --filter <json> [--age <seconds>] [--dry-run]` removes
-  every stored event a filter matches, while the relay runs. The relay's
-  search indexer drops what it removes from the search index too.
+  every stored event a filter matches, and drops it from the search index.
+  While the relay runs, `delete` asks it, over a Unix socket in the database
+  directory, and the relay's own writer removes the events between its other
+  writes; a second process asking LMDB for its writer lock could wait on a
+  busy relay indefinitely. With the relay stopped, `delete` does it itself,
+  holding a lock the relay waits for as it starts. `--dry-run` only reads.
+- `ditto-relay check` validates the configuration, and the onion key if Tor
+  is on, without starting the relay or opening its database.
 - The relay can serve itself as a Tor onion service too, with Tor (Arti)
   built in, by setting `enabled = true` under `[tor]`. The onion's key is a
   file in C Tor's format, so an existing onion's address can be kept, and

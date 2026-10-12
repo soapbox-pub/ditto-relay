@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use axum::serve::ListenerExt;
@@ -16,10 +16,10 @@ use ditto_relay::search::SearchIndex;
 use ditto_relay::store::{History, IndexedTags, Store};
 use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
-use ditto_relay::{delete, facets, metrics, relay, trends};
+use ditto_relay::{control, delete, facets, metrics, relay, trends};
 
 const USAGE: &str = "usage: ditto-relay [--config <path>] \
-                     [delete [--filter <json>] [--age <seconds>] [--dry-run]]";
+                     [check | delete [--filter <json>] [--age <seconds>] [--dry-run]]";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,49 +30,50 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     facets::set_nsfw_hashtags(config.nsfw_hashtags.clone());
-    let store = open_store(&config)?;
     match args.command {
         Command::Serve => {
+            let _lock = control::Lock::acquire(&config.db_path)?;
+            let store = open_store(&config)?;
             serve(config, Arc::new(store)).await?;
             // Everything of the relay's is closed by now. Arti leaves a
             // thread behind, in a loop that never ends, which dropping the
             // runtime would wait on, or panic in.
             std::process::exit(0)
         }
+        Command::Check => check(&config),
         Command::Delete {
             filter,
             age,
             dry_run,
-        } => {
-            let filter = delete::filter(
-                filter.as_deref(),
-                age,
-                ditto_relay::event::now(),
-                &store.indexed_tags,
-            )?;
-            let n = delete::delete(&store, &filter, config.search, dry_run)?;
-            match dry_run {
-                true => println!("would delete {n} events"),
-                false => println!("deleted {n} events"),
-            }
-            Ok(())
-        }
+        } => delete(&config, filter.as_deref(), age, dry_run),
     }
 }
 
+/// Open the store as the relay does, holding the [`control::Lock`].
 fn open_store(config: &Config) -> anyhow::Result<Store> {
-    let indexed_tags = IndexedTags::new(config.indexed_tags.clone())?;
-    let history = History::new(
-        config.history,
-        config.history_excluded_kinds.clone(),
-        config.history_max_versions,
-    );
+    let (indexed_tags, history, wot, rank) = store_settings(config)?;
     let store = Store::open(
         &config.db_path,
         config.map_size,
         config.lmdb_sync,
         indexed_tags,
         history,
+        wot,
+        rank,
+    )?;
+    tracing::info!("opened LMDB at {}", config.db_path.display());
+    Ok(store)
+}
+
+/// What the store is opened with.
+fn store_settings(config: &Config) -> anyhow::Result<(IndexedTags, History, Option<Wot>, Rank)> {
+    Ok((
+        IndexedTags::new(config.indexed_tags.clone())?,
+        History::new(
+            config.history,
+            config.history_excluded_kinds.clone(),
+            config.history_max_versions,
+        ),
         Wot::new(
             config.wot_seeds.clone(),
             config.wot_damping,
@@ -81,9 +82,86 @@ fn open_store(config: &Config) -> anyhow::Result<Store> {
             config.wot_budget,
         ),
         Rank::new(config.hot_half_life, config.rank_step, config.wot_budget),
-    )?;
-    tracing::info!("opened LMDB at {}", config.db_path.display());
-    Ok(store)
+    ))
+}
+
+/// Say whether the configuration would start a relay, without starting one
+/// or opening its database: it's been read, and its log directives checked,
+/// by now.
+fn check(config: &Config) -> anyhow::Result<()> {
+    println!("url: {}", config.url);
+    println!("database: {}", config.db_path.display());
+    match &config.tor {
+        Some(tor) => match OnionKey::read(&tor.key_file)? {
+            Some(key) => println!(
+                "tor: {}, with the key in {}",
+                tor::url(&key.address, tor.port),
+                tor.key_file.display()
+            ),
+            None => println!(
+                "tor: on, with a new key to be made in {}",
+                tor.key_file.display()
+            ),
+        },
+        None => println!("tor: off"),
+    }
+    println!("the configuration is valid");
+    Ok(())
+}
+
+/// `ditto-relay delete`: see [`delete`]. The running relay is asked to do
+/// it, if there is one; else it's done here, holding the [`control::Lock`]
+/// so that no relay starts meanwhile.
+fn delete(
+    config: &Config,
+    json: Option<&str>,
+    age: Option<u64>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let (indexed_tags, history, wot, rank) = store_settings(config)?;
+    // Checked here, so a mistake is told before anything's asked.
+    let filter = delete::filter(json, age, ditto_relay::event::now(), &indexed_tags)?;
+    if dry_run {
+        let store = Store::open_read_only(
+            &config.db_path,
+            config.map_size,
+            indexed_tags,
+            history,
+            wot,
+            rank,
+        )?;
+        println!("would delete {} events", delete::count(&store, &filter)?);
+        return Ok(());
+    }
+
+    let mut said = Instant::now();
+    let mut progress = |deleted| {
+        if said.elapsed() >= Duration::from_secs(1) {
+            eprintln!("deleted {deleted} events so far");
+            said = Instant::now();
+        }
+    };
+    let socket = control::socket_path(&config.db_path);
+    if let Some(deleted) = control::request_delete(&socket, json, age, &mut progress)? {
+        println!("deleted {deleted} events");
+        return Ok(());
+    }
+    let Some(_lock) = control::Lock::try_acquire(&config.db_path)? else {
+        bail!(
+            "the relay is using the database but isn't answering on {}: it may be starting or stopping, so try again",
+            socket.display()
+        );
+    };
+    let store = open_store(config)?;
+    let mut indexer = match config.search {
+        true => {
+            Some(SearchIndex::open(&config.search_path, config.search_kinds.clone(), &store)?.1)
+        }
+        false => None,
+    };
+    let deleted = delete::delete(&store, &filter, indexer.as_mut(), &mut progress)?;
+    println!("deleted {deleted} events");
+    Ok(())
 }
 
 async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
@@ -137,6 +215,13 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
         .as_ref()
         .map(|(tor_config, key)| tor::url(&key.address, tor_config.port));
     let state = AppState::new(config, store, search, onion_url);
+    let socket = control::socket_path(&state.config.db_path);
+    let control = control::serve(
+        &socket,
+        state.store.clone(),
+        state.writer.clone(),
+        state.shutdown.clone(),
+    )?;
     let tor = match onion {
         Some((tor_config, key)) => {
             let app = relay::onion_router(state.clone());
@@ -159,6 +244,8 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
     .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
     .await?;
     state.shut_down().await;
+    control.abort();
+    let _ = std::fs::remove_file(&socket);
     if let Some(tor) = tor {
         tor.stop();
     }
@@ -180,6 +267,8 @@ struct Args {
 enum Command {
     /// Run the relay.
     Serve,
+    /// Check the configuration.
+    Check,
     /// Remove what a filter matches: see [`delete`].
     Delete {
         filter: Option<String>,
@@ -212,6 +301,9 @@ impl Args {
             };
             match name {
                 "-c" | "--config" => parsed.config = Some(value()?.into()),
+                "check" if matches!(parsed.command, Command::Serve) => {
+                    parsed.command = Command::Check
+                }
                 "delete" if matches!(parsed.command, Command::Serve) => {
                     parsed.command = Command::Delete {
                         filter: None,
@@ -231,8 +323,10 @@ impl Args {
                 age: a,
                 dry_run: d,
             } => (*f, *a, *d) = (filter, age, dry_run),
-            Command::Serve if filter.is_some() || age.is_some() || dry_run => bail!(USAGE),
-            Command::Serve => {}
+            Command::Serve | Command::Check if filter.is_some() || age.is_some() || dry_run => {
+                bail!(USAGE)
+            }
+            Command::Serve | Command::Check => {}
         }
         Ok(parsed)
     }
@@ -262,6 +356,8 @@ mod tests {
         assert!(args.config.is_none() && matches!(args.command, Command::Serve));
         let args = parse("--config=a.toml").unwrap();
         assert_eq!(args.config, Some(PathBuf::from("a.toml")));
+        let args = parse("check -c a.toml").unwrap();
+        assert!(matches!(args.command, Command::Check) && args.config.is_some());
 
         let args = parse("delete --filter {\"kinds\":[1]} -c a.toml --age 60 --dry-run").unwrap();
         assert_eq!(args.config, Some(PathBuf::from("a.toml")));
@@ -292,6 +388,9 @@ mod tests {
             "delete --filter",
             "delete --dry-run=yes",
             "serve",
+            "check delete",
+            "delete check",
+            "check --dry-run",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

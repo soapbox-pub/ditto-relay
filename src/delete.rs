@@ -1,15 +1,17 @@
-//! `ditto-relay delete`: remove every stored event a filter matches, from
-//! a process of its own beside the running relay, as `strfry delete` does.
+//! `ditto-relay delete`: remove every stored event a filter matches, as
+//! `strfry delete` does, while the relay runs or not.
 //!
-//! LMDB's writers take turns, whichever process they're in, so it removes
-//! [`CHUNK`] events' worth per transaction, and the relay's writer waits no
-//! longer than one of those. The search index has only one writer, the
-//! relay's indexer, so what's removed is queued for it in the LMDB
-//! instead (see [`Store::queue_for_search`]).
-//!
-//! It must open the store with the relay's configuration: opened with
-//! another web of trust or other ranking parameters, the store rebuilds
-//! them, under the running relay.
+//! LMDB has one writer at a time, and the running relay's hardly ever lets
+//! go of it between commits, so another process would wait on it
+//! indefinitely. While the relay runs, it does the deleting, asked over its
+//! [control socket](crate::control): its writer removes the matches a
+//! [`CHUNK`] per transaction, between its other work, and tells its search
+//! indexer what went, as it does for NIP-09 deletions. Only when the relay
+//! isn't running does `delete` write the store, and the search index,
+//! itself, and then it must open them with the relay's configuration:
+//! opened with another web of trust or other ranking parameters, the store
+//! rebuilds them. Counting what would go, for `--dry-run`, only reads,
+//! which LMDB never makes wait.
 //!
 //! Events are removed as a NIP-09 deletion removes them, with what's
 //! derived from them; removing an address's current version takes the
@@ -22,6 +24,7 @@ use serde_json::Value;
 
 use crate::filter::Filter;
 use crate::query;
+use crate::search::Indexer;
 use crate::store::{IndexedTags, Store};
 
 /// The most matches removed per write transaction.
@@ -56,36 +59,59 @@ pub fn filter(
     Ok(filter)
 }
 
-/// Remove every stored event `filter` matches, or with `dry_run`, only
-/// count them. With `search`, queue what's removed for the search indexer.
-/// Returns how many.
+/// The sequence numbers of the stored events `filter` matches, to hand to
+/// [`remove`] a [`CHUNK`] at a time.
+pub fn matching(store: &Store, filter: &Filter) -> anyhow::Result<Vec<u64>> {
+    Ok(query::every_match(store, &*store.read()?, filter)?)
+}
+
+/// How many events deleting by `filter` would remove, as of now.
+pub fn count(store: &Store, filter: &Filter) -> anyhow::Result<usize> {
+    let txn = store.read()?;
+    let seqs = query::every_match(store, &txn, filter)?;
+    Ok(store.count_matching(&txn, &seqs, filter)?)
+}
+
+/// Remove those of `seqs` that `filter` matches, in one transaction.
+/// Returns how many went, and what the search index no longer has.
+pub fn remove(
+    store: &Store,
+    seqs: &[u64],
+    filter: &Filter,
+) -> crate::lmdb::Result<(usize, Vec<u64>)> {
+    let (mut deleted, mut removed) = (0, Vec::new());
+    if seqs.is_empty() {
+        return Ok((deleted, removed));
+    }
+    let now = crate::event::now();
+    let mut txn = store.write()?;
+    for &seq in seqs {
+        deleted += store.remove_matching(&mut txn, seq, filter, now, &mut removed)?;
+    }
+    txn.commit()?;
+    Ok((deleted, removed))
+}
+
+/// Remove every stored event `filter` matches, from a store no running
+/// relay has open, and from its search index, if there's one, telling
+/// `progress` how many so far after each chunk. Returns how many.
 pub fn delete(
     store: &Store,
     filter: &Filter,
-    search: bool,
-    dry_run: bool,
+    mut indexer: Option<&mut Indexer>,
+    mut progress: impl FnMut(usize),
 ) -> anyhow::Result<usize> {
-    let seqs = {
-        let txn = store.read()?;
-        let seqs = query::every_match(store, &txn, filter)?;
-        if dry_run {
-            return Ok(store.count_matching(&txn, &seqs, filter)?);
-        }
-        seqs
-    };
     let mut deleted = 0;
-    for chunk in seqs.chunks(CHUNK) {
-        let now = crate::event::now();
-        let mut removed = Vec::new();
-        let mut txn = store.write()?;
-        for &seq in chunk {
-            deleted += store.remove_matching(&mut txn, seq, filter, now, &mut removed)?;
+    for chunk in matching(store, filter)?.chunks(CHUNK) {
+        let (n, removed) = remove(store, chunk, filter)?;
+        if let Some(indexer) = indexer.as_deref_mut() {
+            indexer.remove(&removed);
         }
-        if search {
-            store.queue_for_search(&mut txn, &removed)?;
-        }
-        txn.commit()?;
-        tracing::debug!("deleted {deleted} events so far");
+        deleted += n;
+        progress(deleted);
+    }
+    if let Some(indexer) = indexer {
+        indexer.commit()?;
     }
     Ok(deleted)
 }
@@ -124,9 +150,9 @@ mod tests {
             put(&store, event);
         }
         let filter = parse(json!({"#t": ["spam"]}));
-        assert_eq!(delete(&store, &filter, false, true).unwrap(), 2);
+        assert_eq!(count(&store, &filter).unwrap(), 2);
         assert!(has(&store, &spam));
-        assert_eq!(delete(&store, &filter, false, false).unwrap(), 2);
+        assert_eq!(delete(&store, &filter, None, |_| {}).unwrap(), 2);
         assert!(!has(&store, &spam) && !has(&store, &more) && has(&store, &fine));
         assert_eq!(found(&store, json!({"kinds": [1]})), 1);
         // Nothing keeps them out.
@@ -144,7 +170,7 @@ mod tests {
         }
         let author = signed(1, 0, 1, vec![], "").pubkey;
         let filter = parse(json!({"authors": [author], "#t": ["x"]}));
-        assert_eq!(delete(&store, &filter, false, false).unwrap(), 1);
+        assert_eq!(delete(&store, &filter, None, |_| {}).unwrap(), 1);
         assert!(!has(&store, &a) && has(&store, &b) && has(&store, &c));
     }
 
@@ -156,7 +182,7 @@ mod tests {
             put(&store, event);
         }
         let filter = parse(json!({"kinds": [1], "limit": 2}));
-        assert_eq!(delete(&store, &filter, false, false).unwrap(), 2);
+        assert_eq!(delete(&store, &filter, None, |_| {}).unwrap(), 2);
         assert!(has(&store, &events[2]) && !has(&store, &events[3]) && !has(&store, &events[4]));
     }
 
@@ -172,8 +198,8 @@ mod tests {
         // The current version and the history it matches go; what's left
         // is current again.
         let filter = parse(json!({"#t": ["spam"]}));
-        assert_eq!(delete(&store, &filter, false, true).unwrap(), 2);
-        assert_eq!(delete(&store, &filter, false, false).unwrap(), 2);
+        assert_eq!(count(&store, &filter).unwrap(), 2);
+        assert_eq!(delete(&store, &filter, None, |_| {}).unwrap(), 2);
         assert!(has(&store, &v1) && !has(&store, &v2) && !has(&store, &v3));
         assert_eq!(found(&store, json!({"kinds": [0]})), 1);
 
@@ -182,27 +208,31 @@ mod tests {
         put(&store, &v4);
         let author = v4.pubkey.clone();
         let old = parse(json!({"kinds": [0], "authors": [author], "until": 399}));
-        assert_eq!(delete(&store, &old, false, false).unwrap(), 1);
+        assert_eq!(delete(&store, &old, None, |_| {}).unwrap(), 1);
         assert!(!has(&store, &v1) && has(&store, &v4));
 
         // By author, every version.
         put(&store, &signed(1, 500, 0, vec![], "v5"));
         let all = parse(json!({"authors": [author]}));
-        assert_eq!(delete(&store, &all, false, false).unwrap(), 2);
+        assert_eq!(delete(&store, &all, None, |_| {}).unwrap(), 2);
         assert!(!has(&store, &v4));
         assert_eq!(found(&store, json!({"kinds": [0]})), 0);
     }
 
     #[test]
-    fn queues_for_search_only_when_asked() {
+    fn says_how_it_goes() {
         let (_dir, store) = open();
-        put(&store, &signed(1, 100, 1, vec![], "a"));
-        put(&store, &signed(1, 200, 1, vec![], "b"));
-        let queued = |store: &Store| store.search_queue(&store.read().unwrap(), 10).unwrap();
-        delete(&store, &parse(json!({"until": 150})), false, false).unwrap();
-        assert!(queued(&store).is_empty());
-        delete(&store, &parse(json!({"until": 250})), true, false).unwrap();
-        assert_eq!(queued(&store), [2]);
+        for i in 0..(CHUNK as u64 + 5) {
+            put(&store, &signed(1, 100 + i, 1, vec![], ""));
+        }
+        let mut seen = Vec::new();
+        let filter = parse(json!({"kinds": [1]}));
+        assert_eq!(
+            delete(&store, &filter, None, |n| seen.push(n)).unwrap(),
+            CHUNK + 5
+        );
+        assert_eq!(seen, [CHUNK, CHUNK + 5]);
+        assert_eq!(remove(&store, &[], &filter).unwrap(), (0, vec![]));
     }
 
     #[test]

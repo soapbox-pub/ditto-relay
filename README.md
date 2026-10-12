@@ -61,7 +61,9 @@ Configuration is a TOML file, read from the path `--config` names, or else the f
 of `~/.config/ditto-relay/ditto-relay.toml` and `/etc/ditto-relay/ditto-relay.toml`.
 [`ditto-relay.example.toml`](ditto-relay.example.toml) lists every setting with its
 default; only `url` is required. Data is stored in `data_dir`, by default
-`~/.local/share/ditto-relay` (`/var/lib/ditto-relay` as root).
+`~/.local/share/ditto-relay` (`/var/lib/ditto-relay` as root). `ditto-relay check`
+says whether a configuration is valid, and what it would serve, without starting the
+relay or opening its database.
 
 ## Deleting events
 
@@ -72,11 +74,14 @@ ditto-relay delete --filter '{"kinds":[1]}' --age 7776000
 
 `delete` removes every stored event a NIP-01 filter matches, as `strfry delete` does.
 `--age` only removes events at least that many seconds old. `--dry-run` only counts
-them. Run it with the relay's own config (as the relay's user) while the relay is
-running: it removes events in small transactions between the relay's writes, and the
-relay drops them from the search index within a few seconds. Removing an address's
-current version also removes its older versions that the filter matches, and the newest
-version left becomes current. Nothing stops deleted events from being published again.
+them, and only reads, so it never holds up the relay. Run it with the relay's own
+config, as the relay's user. While the relay is running, `delete` asks it to do the
+deleting: the relay removes the events in small transactions between its own writes,
+and drops them from the search index. Progress is shown as it goes, and Ctrl-C stops
+it. With the relay stopped, `delete` removes the events itself, and a relay started
+meanwhile waits for it to finish. Removing an address's current version also removes
+its older versions that the filter matches, and the newest version left becomes
+current. Nothing stops deleted events from being published again.
 
 ## Tor
 

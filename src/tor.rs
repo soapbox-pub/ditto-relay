@@ -134,22 +134,27 @@ impl OnionKey {
     /// The key in the file at `path`, which is made, with a new key, if
     /// there's nothing there.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        if let Some(key) = Self::read(path)? {
+            return Ok(key);
+        }
+        let key = Self::generate();
+        key.create(path)
+            .with_context(|| format!("couldn't write a new onion key to {}", path.display()))?;
+        tracing::info!("made a new onion key in {}", path.display());
+        Ok(key)
+    }
+
+    /// The key in the file at `path`, if there's one.
+    pub fn read(path: &Path) -> anyhow::Result<Option<Self>> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let key = Self::generate();
-                key.create(path).with_context(|| {
-                    format!("couldn't write a new onion key to {}", path.display())
-                })?;
-                tracing::info!("made a new onion key in {}", path.display());
-                return Ok(key);
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("couldn't read the onion key {}", path.display()));
             }
         };
-        Self::parse(&bytes).with_context(|| {
+        Self::parse(&bytes).map(Some).with_context(|| {
             format!(
                 "{} is not an onion key: it must be C Tor's hs_ed25519_secret_key",
                 path.display()

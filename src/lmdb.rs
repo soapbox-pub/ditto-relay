@@ -111,7 +111,7 @@ impl DbFlags {
     };
 
     fn bits(self) -> u32 {
-        let mut bits = ffi::MDB_CREATE;
+        let mut bits = 0;
         if self.dup_sort {
             bits |= ffi::MDB_DUPSORT;
         }
@@ -143,6 +143,9 @@ pub struct Usage {
 
 pub struct Env {
     ptrs: Vec<*mut ffi::MDB_env>,
+    /// Opened only to read: no write transaction can begin, so the writer's
+    /// lock, which another process may hold, is never waited on.
+    read_only: bool,
 }
 
 // SAFETY: an MDB_env is safe to share between threads; transactions opened
@@ -161,7 +164,10 @@ impl Env {
         max_dbs: u32,
         max_readers: u32,
     ) -> Result<Env> {
-        let mut env = Env { ptrs: Vec::new() };
+        let mut env = Env {
+            ptrs: Vec::new(),
+            read_only: false,
+        };
         // Writing each dirty page with its own pwrite, as LMDB otherwise
         // does, is most of what a commit costs, and on ZFS most of what
         // the writer does. Writing into the map instead, the kernel
@@ -171,6 +177,22 @@ impl Env {
             false => ffi::MDB_WRITEMAP | ffi::MDB_MAPASYNC,
         };
         env.add(path, map_size, flags, max_dbs, max_readers)?;
+        Ok(env)
+    }
+
+    /// Open the existing environment in the directory `path` only to read.
+    /// Its tables must exist already, and are opened without writing.
+    pub fn open_read_only(
+        path: &Path,
+        map_size: usize,
+        max_dbs: u32,
+        max_readers: u32,
+    ) -> Result<Env> {
+        let mut env = Env {
+            ptrs: Vec::new(),
+            read_only: true,
+        };
+        env.add(path, map_size, ffi::MDB_RDONLY, max_dbs, max_readers)?;
         Ok(env)
     }
 
@@ -190,9 +212,10 @@ impl Env {
         max_readers: u32,
     ) -> Result<usize> {
         assert!(self.ptrs.len() < MAX_ENVS, "too many environments");
-        let flags = match sync {
-            true => 0,
-            false => ffi::MDB_NOSYNC,
+        let flags = match (self.read_only, sync) {
+            (true, _) => ffi::MDB_RDONLY,
+            (false, true) => 0,
+            (false, false) => ffi::MDB_NOSYNC,
         };
         self.add(path, map_size, flags, max_dbs, max_readers)?;
         Ok(self.ptrs.len() - 1)
@@ -225,8 +248,10 @@ impl Env {
         }
     }
 
-    /// Open a table, creating it if need be. Call these at startup, before
-    /// any other transaction: LMDB forbids opening tables concurrently.
+    /// Open a table, creating it if need be, or if the environment is
+    /// [read-only](Self::open_read_only), only if it exists. Call these at
+    /// startup, before any other transaction: LMDB forbids opening tables
+    /// concurrently.
     pub fn create_db(&self, name: &str, flags: DbFlags) -> Result<Db> {
         self.create_db_in(0, name, flags)
     }
@@ -234,14 +259,35 @@ impl Env {
     /// Open a table in the environment `env`, as [`create_db`](Self::create_db).
     pub fn create_db_in(&self, env: usize, name: &str, flags: DbFlags) -> Result<Db> {
         let name = CString::new(name).map_err(|_| Error(libc::EINVAL))?;
+        let (txn, bits) = match self.read_only {
+            true => (self.begin(ffi::MDB_RDONLY)?, flags.bits()),
+            false => (self.write_txn()?.0, flags.bits() | ffi::MDB_CREATE),
+        };
+        let mut dbi = 0;
+        // SAFETY: a live transaction and a NUL-terminated name.
+        check(unsafe { ffi::mdb_dbi_open(txn.ptrs[env], name.as_ptr(), bits, &mut dbi) })?;
+        // Committed, even only to read, so the handle outlives it.
+        RwTxn(txn).commit()?;
+        Ok(Db { dbi, env })
+    }
+
+    /// Delete the table `name` in the first environment, if there is one,
+    /// returning how many entries it held.
+    pub fn remove_db(&self, name: &str) -> Result<Option<usize>> {
+        let name = CString::new(name).map_err(|_| Error(libc::EINVAL))?;
         let txn = self.write_txn()?;
         let mut dbi = 0;
         // SAFETY: a live write transaction and a NUL-terminated name.
-        check(unsafe {
-            ffi::mdb_dbi_open(txn.0.ptrs[env], name.as_ptr(), flags.bits(), &mut dbi)
-        })?;
+        if found(unsafe { ffi::mdb_dbi_open(txn.0.ptrs[0], name.as_ptr(), 0, &mut dbi) })?.is_none()
+        {
+            return Ok(None);
+        }
+        let entries = txn.len(Db { dbi, env: 0 })?;
+        // SAFETY: a live write transaction; 1 deletes the table and closes
+        // its handle, which nothing else holds.
+        check(unsafe { ffi::mdb_drop(txn.0.ptrs[0], dbi, 1) })?;
         txn.commit()?;
-        Ok(Db { dbi, env })
+        Ok(Some(entries))
     }
 
     /// Write a compacted copy of the environment `env` into the directory
@@ -660,6 +706,54 @@ mod tests {
     }
 
     /// Writing into the map, commits outlive the environment all the same.
+    #[test]
+    fn opens_tables_only_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        {
+            let mut env = Env::open(dir.path(), 1 << 24, true, 4, 16).unwrap();
+            env.attach(&other, 1 << 24, true, 4, 16).unwrap();
+            let main = env.create_db("dups", DbFlags::DUP_FIXED).unwrap();
+            let appended = env
+                .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
+                .unwrap();
+            let mut txn = env.write_txn().unwrap();
+            txn.put(main, b"a", b"1").unwrap();
+            txn.append(appended, &1u64.to_ne_bytes(), b"one").unwrap();
+            txn.commit().unwrap();
+        }
+
+        let mut env = Env::open_read_only(dir.path(), 1 << 24, 4, 16).unwrap();
+        env.attach(&other, 1 << 24, true, 4, 16).unwrap();
+        let main = env.create_db("dups", DbFlags::DUP_FIXED).unwrap();
+        let appended = env
+            .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
+            .unwrap();
+        let txn = env.read_txn().unwrap();
+        assert_eq!(txn.get(main, b"a").unwrap(), Some(&b"1"[..]));
+        assert_eq!(
+            txn.get(appended, &1u64.to_ne_bytes()).unwrap(),
+            Some(&b"one"[..])
+        );
+        drop(txn);
+        // Nothing is made, and nothing written.
+        assert!(env.create_db("missing", DbFlags::PLAIN).is_err());
+        assert!(env.write_txn().is_err());
+    }
+
+    #[test]
+    fn removes_tables() {
+        let (_dir, env) = open();
+        let db = env.create_db("gone", DbFlags::PLAIN).unwrap();
+        let mut txn = env.write_txn().unwrap();
+        txn.put(db, b"a", b"1").unwrap();
+        txn.put(db, b"b", b"2").unwrap();
+        txn.commit().unwrap();
+        assert_eq!(env.remove_db("gone").unwrap(), Some(2));
+        assert_eq!(env.remove_db("gone").unwrap(), None);
+    }
+
     #[test]
     fn keeps_writes_without_sync() {
         let dir = tempfile::tempdir().unwrap();

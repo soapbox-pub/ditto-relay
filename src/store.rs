@@ -31,7 +31,6 @@
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `history`       | address                      | stamps                 |
 //! | `expiring`      | `EXPIRING`                   | expiry stamps          |
-//! | `search_queue`  | seq (u64 BE)                 | nothing                |
 //! | `meta`          | name                         | value                  |
 //!
 //! `events` is in an environment of its own, `bodies/` inside the database's
@@ -95,11 +94,11 @@
 //! Engagement is counted, scored, and [ranked](rank) for the ranked sorts
 //! as events are indexed and unindexed.
 //!
-//! Events another process removes, as `ditto-relay delete` does, are
-//! queued in `search_queue` for the relay's [search indexer] to delete
-//! too: only one process at a time can write the search index.
-//!
-//! [search indexer]: crate::search::Indexer
+//! Another process only ever opens the store [to read](Store::open_read_only)
+//! while the relay runs: the relay's writer hardly ever lets go of LMDB's
+//! writer lock, so one that asked for it would wait on it indefinitely.
+//! What `ditto-relay delete` removes, the writer [removes](Writer::delete)
+//! for it.
 //!
 //! Each tag key with at least [`HLL_THRESHOLD`] events has a NIP-45
 //! [HyperLogLog](crate::hll) sketch of their authors in `hll`, kept up as
@@ -116,6 +115,7 @@ use anyhow::{Context, anyhow, bail};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+use crate::delete;
 use crate::deletions;
 use crate::event::KindClass;
 use crate::event::decode_hex;
@@ -377,8 +377,35 @@ pub struct Tables {
     pub replaceable: Db,
     pub history: Db,
     pub expiring: Db,
-    pub search_queue: Db,
     pub meta: Db,
+}
+
+impl Tables {
+    fn open(env: &Env, bodies: usize) -> Result<Tables> {
+        Ok(Tables {
+            events: env.create_db_in(bodies, "events", DbFlags::INTEGER_KEY)?,
+            ids: env.create_db("ids", DbFlags::PLAIN)?,
+            created: env.create_db("created", DbFlags::DUP_FIXED)?,
+            kinds: env.create_db("kinds", DbFlags::DUP_FIXED)?,
+            authors: env.create_db("authors", DbFlags::DUP_FIXED)?,
+            author_kinds: env.create_db("author_kinds", DbFlags::DUP_FIXED)?,
+            tags: env.create_db("tags", DbFlags::DUP_FIXED)?,
+            hll: env.create_db("hll", DbFlags::PLAIN)?,
+            facets: env.create_db("facets", DbFlags::DUP_FIXED)?,
+            wot: env.create_db("wot", DbFlags::PLAIN)?,
+            wot_queue: env.create_db("wot_queue", DbFlags::PLAIN)?,
+            engagement: env.create_db("engagement", DbFlags::PLAIN)?,
+            scores: env.create_db("scores", DbFlags::PLAIN)?,
+            ranked: env.create_db("ranked", DbFlags::DUP_FIXED)?,
+            applied: env.create_db("applied", DbFlags::PLAIN)?,
+            rank_queue: env.create_db("rank_queue", DbFlags::PLAIN)?,
+            zaps: env.create_db("zaps", DbFlags::PLAIN)?,
+            replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
+            history: env.create_db("history", DbFlags::DUP_FIXED)?,
+            expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,
+            meta: env.create_db("meta", DbFlags::PLAIN)?,
+        })
+    }
 }
 
 pub struct Store {
@@ -423,30 +450,16 @@ impl Store {
         let bodies = env
             .attach(&bodies, map_size, sync, 1, 1024)
             .with_context(|| format!("Could not open the database at {}", bodies.display()))?;
-        let tables = Tables {
-            events: env.create_db_in(bodies, "events", DbFlags::INTEGER_KEY)?,
-            ids: env.create_db("ids", DbFlags::PLAIN)?,
-            created: env.create_db("created", DbFlags::DUP_FIXED)?,
-            kinds: env.create_db("kinds", DbFlags::DUP_FIXED)?,
-            authors: env.create_db("authors", DbFlags::DUP_FIXED)?,
-            author_kinds: env.create_db("author_kinds", DbFlags::DUP_FIXED)?,
-            tags: env.create_db("tags", DbFlags::DUP_FIXED)?,
-            hll: env.create_db("hll", DbFlags::PLAIN)?,
-            facets: env.create_db("facets", DbFlags::DUP_FIXED)?,
-            wot: env.create_db("wot", DbFlags::PLAIN)?,
-            wot_queue: env.create_db("wot_queue", DbFlags::PLAIN)?,
-            engagement: env.create_db("engagement", DbFlags::PLAIN)?,
-            scores: env.create_db("scores", DbFlags::PLAIN)?,
-            ranked: env.create_db("ranked", DbFlags::DUP_FIXED)?,
-            applied: env.create_db("applied", DbFlags::PLAIN)?,
-            rank_queue: env.create_db("rank_queue", DbFlags::PLAIN)?,
-            zaps: env.create_db("zaps", DbFlags::PLAIN)?,
-            replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
-            history: env.create_db("history", DbFlags::DUP_FIXED)?,
-            expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,
-            search_queue: env.create_db("search_queue", DbFlags::PLAIN)?,
-            meta: env.create_db("meta", DbFlags::PLAIN)?,
-        };
+        let tables = Tables::open(&env, bodies)?;
+        // Where an older `ditto-relay delete`, which wrote the store itself,
+        // left what it removed for the search indexer to delete.
+        if let Some(queued) = env.remove_db("search_queue")?
+            && queued > 0
+        {
+            tracing::warn!(
+                "dropped {queued} removed events queued for the search index; searches skip them, but they're kept in the index until it's rebuilt"
+            );
+        }
 
         let deletions = deletions::Filter::new(DELETION_FILTER_BITS);
         let deletions_path = dir.join(DELETION_FILTER_FILE);
@@ -477,6 +490,39 @@ impl Store {
         wot::open(&store, store.wot.as_ref())?;
         rank::open(&store)?;
         Ok(store)
+    }
+
+    /// Open the store at `dir` only to read, from another process than the
+    /// relay, which may be running: no write transaction is begun, so
+    /// nothing waits on the relay's writer, and none of what the relay does
+    /// as it opens the store is done.
+    pub fn open_read_only(
+        dir: &Path,
+        map_size: usize,
+        indexed_tags: IndexedTags,
+        history: History,
+        wot: Option<Wot>,
+        rank: Rank,
+    ) -> anyhow::Result<Store> {
+        let opening = || format!("Could not open the database at {}", dir.display());
+        let mut env = Env::open_read_only(dir, map_size, 32, 1024).with_context(opening)?;
+        let bodies = env
+            .attach(&dir.join(BODIES_DIR), map_size, true, 1, 1024)
+            .with_context(opening)?;
+        let tables = Tables::open(&env, bodies).with_context(opening)?;
+        Ok(Store {
+            env,
+            bodies,
+            tables,
+            indexed_tags,
+            history,
+            wot,
+            rank,
+            // Never ready, so never consulted.
+            deletions: deletions::Filter::new(DELETION_FILTER_BITS),
+            deletions_path: dir.join(DELETION_FILTER_FILE),
+            deletions_from: 1,
+        })
     }
 
     /// Remove the records a crash left in `bodies` under sequence numbers
@@ -1298,37 +1344,6 @@ impl Store {
         Ok(seqs.len())
     }
 
-    /// Queue removed events for the search indexer to delete: for another
-    /// process than the relay, which tells its indexer directly.
-    pub fn queue_for_search(&self, txn: &mut RwTxn, seqs: &[u64]) -> Result<()> {
-        for seq in seqs {
-            txn.put(self.tables.search_queue, &seq.to_be_bytes(), &[])?;
-        }
-        Ok(())
-    }
-
-    /// Up to `max` of the events queued for the search indexer to delete.
-    pub fn search_queue(&self, txn: &Txn, max: usize) -> Result<Vec<u64>> {
-        let mut seqs = Vec::new();
-        let mut cursor = txn.cursor(self.tables.search_queue)?;
-        let mut entry = cursor.first()?;
-        while let Some((key, _)) = entry
-            && seqs.len() < max
-        {
-            seqs.push(u64::from_be_bytes(key.try_into().unwrap_or_default()));
-            entry = cursor.next()?;
-        }
-        Ok(seqs)
-    }
-
-    /// Take events the search indexer has deleted off its queue.
-    pub fn dequeue_for_search(&self, txn: &mut RwTxn, seqs: &[u64]) -> Result<()> {
-        for seq in seqs {
-            txn.del(self.tables.search_queue, &seq.to_be_bytes(), None)?;
-        }
-        Ok(())
-    }
-
     /// Keep a record under the next sequence number, findable by id.
     fn put_record(&self, txn: &mut RwTxn, view: &EventView, record: &[u8]) -> Result<u64> {
         let t = self.tables;
@@ -1780,8 +1795,63 @@ pub struct Writer {
 
 enum Request {
     Write(WriteJob),
+    Delete(Box<Deletion>),
     /// Store what's queued before this, then stop.
     Stop,
+}
+
+/// How a deletion the writer's making is going: see [`Writer::delete`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Deleting {
+    /// This many events removed so far.
+    SoFar(usize),
+    /// Finished, having removed this many.
+    Done(usize),
+    Failed(String),
+}
+
+/// Events to remove, a [`delete::CHUNK`] per transaction, between the
+/// writer's other work.
+struct Deletion {
+    filter: Filter,
+    seqs: Vec<u64>,
+    /// How far through `seqs` it's got.
+    next: usize,
+    deleted: usize,
+    progress: tokio::sync::mpsc::UnboundedSender<Deleting>,
+}
+
+/// Remove the next chunk of `deletion`'s events, and `tell` what went.
+/// Returns whether it's over: finished, failed, or abandoned by whoever
+/// asked for it.
+fn delete_chunk(store: &Store, deletion: &mut Deletion, tell: &impl Fn(Written)) -> bool {
+    if deletion.progress.is_closed() {
+        tracing::info!(
+            "a deletion was abandoned, after {} events",
+            deletion.deleted
+        );
+        return true;
+    }
+    let end = (deletion.next + delete::CHUNK).min(deletion.seqs.len());
+    let chunk = &deletion.seqs[deletion.next..end];
+    match delete::remove(store, chunk, &deletion.filter) {
+        Ok((deleted, removed)) => {
+            tell((Vec::new(), removed));
+            deletion.deleted += deleted;
+            deletion.next = end;
+            let done = end == deletion.seqs.len();
+            let _ = deletion.progress.send(match done {
+                true => Deleting::Done(deletion.deleted),
+                false => Deleting::SoFar(deletion.deleted),
+            });
+            done
+        }
+        Err(err) => {
+            tracing::error!("deleting failed, after {} events: {err}", deletion.deleted);
+            let _ = deletion.progress.send(Deleting::Failed(err.to_string()));
+            true
+        }
+    }
 }
 
 impl Writer {
@@ -1834,6 +1904,14 @@ impl Writer {
                 let mut saving: Option<JoinHandle<()>> = None;
                 // Whether the web of trust may have pushing to do.
                 let mut trust = true;
+                let mut deleting = std::collections::VecDeque::<Box<Deletion>>::new();
+                let step = |deleting: &mut std::collections::VecDeque<Box<Deletion>>| {
+                    if let Some(deletion) = deleting.front_mut()
+                        && delete_chunk(&store, deletion, &tell)
+                    {
+                        deleting.pop_front();
+                    }
+                };
                 let turn = |trust: &mut bool| {
                     *trust = store.turn().unwrap_or_else(|err| {
                         tracing::error!("a background turn failed: {err}");
@@ -1866,7 +1944,7 @@ impl Writer {
                         }
                         next_save = Instant::now() + DELETION_FILTER_SAVE_INTERVAL;
                     }
-                    let wait = match trust {
+                    let wait = match trust || !deleting.is_empty() {
                         true => Duration::ZERO,
                         false => next_sweep.saturating_duration_since(Instant::now()),
                     };
@@ -1875,8 +1953,13 @@ impl Writer {
                             METRICS.write_queue.dec();
                             job
                         }
+                        Ok(Request::Delete(deletion)) => {
+                            deleting.push_back(deletion);
+                            continue;
+                        }
                         Ok(Request::Stop) => break,
                         Err(RecvTimeoutError::Timeout) => {
+                            step(&mut deleting);
                             if trust {
                                 turn(&mut trust);
                             }
@@ -1892,6 +1975,7 @@ impl Writer {
                                 METRICS.write_queue.dec();
                                 batch.push(job);
                             }
+                            Ok(Request::Delete(deletion)) => deleting.push_back(deletion),
                             Ok(Request::Stop) => {
                                 stop = true;
                                 break;
@@ -1905,8 +1989,15 @@ impl Writer {
                         break;
                     }
                     // A follow list in the batch may have moved trust; a
-                    // turn between batches keeps it from falling behind.
+                    // turn between batches keeps it from falling behind. A
+                    // deletion's chunk between them keeps it going however
+                    // busy the relay is.
                     turn(&mut trust);
+                    step(&mut deleting);
+                }
+                for deletion in deleting {
+                    let stopped = format!("the relay stopped, after {} events", deletion.deleted);
+                    let _ = deletion.progress.send(Deleting::Failed(stopped));
                 }
                 if let Some(saving) = saving {
                     let _ = saving.join();
@@ -1935,6 +2026,32 @@ impl Writer {
         {
             tracing::error!("the writer thread panicked");
         }
+    }
+
+    /// Remove those of `seqs` that `filter` matches, as `ditto-relay delete`
+    /// asks, a [`delete::CHUNK`] per transaction, between the writer's other
+    /// work, and tell the search indexer what went. Dropping what's
+    /// returned abandons what's left.
+    pub fn delete(
+        &self,
+        filter: Filter,
+        seqs: Vec<u64>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Deleting> {
+        let (progress, rx) = tokio::sync::mpsc::unbounded_channel();
+        let deletion = Box::new(Deletion {
+            filter,
+            seqs,
+            next: 0,
+            deleted: 0,
+            progress,
+        });
+        if let Err(std::sync::mpsc::SendError(Request::Delete(deletion))) =
+            self.tx.send(Request::Delete(deletion))
+        {
+            let gone = Deleting::Failed("the writer thread is gone".into());
+            let _ = deletion.progress.send(gone);
+        }
+        rx
     }
 
     /// Store an encoded record.
