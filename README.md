@@ -22,7 +22,24 @@ Each release publishes static binaries for x86_64 and aarch64 Linux, and `.deb` 
 `.rpm` packages, as a [NIP-82](https://github.com/nostr-protocol/nips/blob/master/82.md)
 release on Nostr. The packages install the binary, a systemd unit, and
 `/etc/ditto-relay/ditto-relay.toml`, and create the `ditto-relay` user and
-`/var/lib/ditto-relay`. Set `url` in the config, then:
+`/var/lib/ditto-relay`.
+
+Debian and Ubuntu:
+
+```sh
+sudo curl -fsSL -o /etc/apt/sources.list.d/ditto-relay.sources https://pkg.soapbox.pub/deb/soapbox.pub/ditto-relay/source
+sudo apt update
+sudo apt install ditto-relay
+```
+
+Fedora and RHEL:
+
+```sh
+sudo curl -fsSL -o /etc/yum.repos.d/ditto-relay.repo https://pkg.soapbox.pub/rpm/soapbox.pub/ditto-relay/repo
+sudo dnf install ditto-relay
+```
+
+Set `url` in `/etc/ditto-relay/ditto-relay.toml`, then:
 
 ```sh
 sudo systemctl enable --now ditto-relay
