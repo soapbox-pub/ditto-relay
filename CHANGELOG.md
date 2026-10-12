@@ -4,7 +4,7 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
-## [Unreleased]
+## [2.1.0]
 
 - `ditto-relay delete --filter <json> [--age <seconds>] [--dry-run]` removes
   every stored event a filter matches, and drops it from the search index.
