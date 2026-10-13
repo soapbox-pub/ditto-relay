@@ -117,8 +117,7 @@ dependencies = [
 [[package]]
 name = "arti-client"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43e6531f26fe6f44d71dabdc63b7845bae81547cc738aa942f0e3e482f776388"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -533,8 +532,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "caret"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3135adcc2ec978dbad556b41b7c71e0be7625d70b79159a8a19b5879a761115"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 
 [[package]]
 name = "cc"
@@ -1381,8 +1379,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "equix"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f61e068d09db92a488f5a8ecdcd9d59319e142e9c05d198d8706f6efde82c41"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "arrayvec",
  "hashx",
@@ -1555,8 +1552,7 @@ dependencies = [
 [[package]]
 name = "fs-mistrust"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc7f210768dd30e30895a6024be8472615bd7b6caec6df4f4105fc03e7608bdd"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive_builder_fork_arti",
  "dirs",
@@ -1582,8 +1578,7 @@ dependencies = [
 [[package]]
 name = "fslock-guard"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8082ded4af6b2e8e75d0ff71848ad7649d1ddff369a718e8e1db918795967bce"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
@@ -1836,8 +1831,7 @@ dependencies = [
 [[package]]
 name = "hashx"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c65d9ee1962b53009278d24d72355bed6e1dda293c29e2ef3888a587eae029b"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "arrayvec",
  "blake2",
@@ -2741,8 +2735,7 @@ checksum = "269bca4c2591a28585d6bf10d9ed0332b7d76900a1b02bec41bdc3a2cdcda107"
 [[package]]
 name = "oneshot-fused-workaround"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40e2e88d3d699c52530078d715a6b5b10b3010afe570cfdc0240fee1c9d764ba"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "futures",
 ]
@@ -3401,8 +3394,7 @@ dependencies = [
 [[package]]
 name = "retry-error"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90a0dea62e6084ede74beea58ee263fd2d70bdb59260a3bf3ede338dfb76f5cc"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "humantime",
  "web-time",
@@ -3576,8 +3568,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "safelog"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e091498d7a0a629f344befcf15b1f823a24d5a83d584feeacacc7c764e67c11"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive_more",
  "educe",
@@ -3607,8 +3598,7 @@ dependencies = [
 [[package]]
 name = "saturating-time"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a586db154f85f3faf78398c37b6792d71f99d2253d3277571e14f8a8c6e49a65"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "web-time-compat",
 ]
@@ -3970,8 +3960,7 @@ dependencies = [
 [[package]]
 name = "slotmap-careful"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dae6673c710ab011fc8d2ff604b16201df0a59f943976d911d83bbac2a1854f"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "paste",
  "serde",
@@ -4610,8 +4599,7 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 [[package]]
 name = "tor-async-utils"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64e39ddd4c352b8e3166ea0ec49b82a33ad9eeae8bdbbf76e1d2f1e856a6316b"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "cfg-if",
  "derive-deftly",
@@ -4636,8 +4624,7 @@ dependencies = [
 [[package]]
 name = "tor-basic-utils"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e44c7b006f22966d44a2a0a6c1ee71e472c62182c7f0460077df3294d52f23c4"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive-deftly",
  "derive_more",
@@ -4662,8 +4649,7 @@ dependencies = [
 [[package]]
 name = "tor-bytes"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccfed3adc9db61334445e921b95c26c896994db64e031c31e5cc48bd73e57ac7"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "bytes",
  "derive-deftly",
@@ -4680,8 +4666,7 @@ dependencies = [
 [[package]]
 name = "tor-cell"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2d6398fd085306de5af739899d0390674b8646d4ff6cfb69d65f40a5f9d88da"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "bitflags 2.13.2",
@@ -4711,8 +4696,7 @@ dependencies = [
 [[package]]
 name = "tor-cert"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98dec924caf6e9548b4860878373132bf89536eb0d1658666df12dff72b855cd"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "caret",
  "derive_builder_fork_arti",
@@ -4729,8 +4713,7 @@ dependencies = [
 [[package]]
 name = "tor-chanmgr"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "431ba53bf020ea8681ef0c2fbf0f0f854997fca9afe1b2c081f41f14ec00cf5d"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -4772,8 +4755,7 @@ dependencies = [
 [[package]]
 name = "tor-checkable"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e58a50a2dbf5d21758c9e2dbaaf085403670b8bf52475c815dd1185698b7af9a"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "humantime",
  "itertools 0.15.0",
@@ -4786,8 +4768,7 @@ dependencies = [
 [[package]]
 name = "tor-circmgr"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6b55747c690e0c931c5a081640ffdca6d1003c01b57b8102afcbdbaf3ec3fd"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "async-trait",
@@ -4836,8 +4817,7 @@ dependencies = [
 [[package]]
 name = "tor-config"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b849c69c695b9534cf945c0422b85eaf5760bb6141a73c47b72fd6f95ea4d719"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "cfg-if",
@@ -4871,8 +4851,7 @@ dependencies = [
 [[package]]
 name = "tor-config-path"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b7f10bfd0d0fb159a8abc13d2593625bfd9f9a394715605262236d01bc5500f"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "directories",
  "serde",
@@ -4885,8 +4864,7 @@ dependencies = [
 [[package]]
 name = "tor-consdiff"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6ed097865bfb6d453d9258620cbc952cf7481e9dcfc8901071ee1b8506cea86"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive_more",
  "digest 0.10.7",
@@ -4902,8 +4880,7 @@ dependencies = [
 [[package]]
 name = "tor-dirclient"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f942f4ebaf2ac5275e48d02d77abe1616ce2e8854f032a1b0698ede0566dddfc"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "async-compression",
  "base64ct",
@@ -4930,8 +4907,7 @@ dependencies = [
 [[package]]
 name = "tor-dircommon"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c16065e5166e529492d1be856e1e40316e2532053027c6b7ab5a4a53c14d8c51"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "base64ct",
  "derive-deftly",
@@ -4951,8 +4927,7 @@ dependencies = [
 [[package]]
 name = "tor-dirmgr"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34ea5e77b43bf1ef5fa213a89cb67080f218df6b418c82527e6bb9862a39aef5"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -5008,8 +4983,7 @@ dependencies = [
 [[package]]
 name = "tor-error"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca01de513501849b2298e4f16f8760832ef43344b10fe17600daed9a35128b24"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive_more",
  "futures",
@@ -5026,8 +5000,7 @@ dependencies = [
 [[package]]
 name = "tor-general-addr"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72965a7044f573bb121467404d423d296592dd3cef87ad7aca4c96cc2b65e75a"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive_more",
  "thiserror 2.0.21",
@@ -5037,8 +5010,7 @@ dependencies = [
 [[package]]
 name = "tor-guardmgr"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87694603d6dcee5e0b050f0e7ac8be86348eb78ecb90c36ee8b70bd5822f3eff"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "base64ct",
@@ -5081,8 +5053,7 @@ dependencies = [
 [[package]]
 name = "tor-hsclient"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42addb7f2a7a86e813df223ed4485f2fb61b5736aff040cb5e8f551f83dfade0"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -5127,8 +5098,7 @@ dependencies = [
 [[package]]
 name = "tor-hscrypto"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6613c5336b71ebd34b8d90c233a7b6b06a0b81899d0545c656b0cac6f24e54a2"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "arrayvec",
  "blake2",
@@ -5163,8 +5133,7 @@ dependencies = [
 [[package]]
 name = "tor-hsservice"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55809560d9295dcc2ee77002c5a4275d1f5f5a54203de7cd6acb52215f5344bd"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "arrayvec",
@@ -5226,8 +5195,7 @@ dependencies = [
 [[package]]
 name = "tor-key-forge"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5534581a7f347ffcade7ea32ecccdbc035d36468bc8c03b0dce83363b6d41801"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive-deftly",
  "derive_more",
@@ -5248,8 +5216,7 @@ dependencies = [
 [[package]]
 name = "tor-keymgr"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e269210a2ba305bf6524990a3c37aab4529b92a01f3d15ef6af23c067c8eb2c4"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "arrayvec",
@@ -5290,8 +5257,7 @@ dependencies = [
 [[package]]
 name = "tor-linkspec"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d287978bd5e1ffbe7ca2eb8daadb4e06e42d084bdad26bea4d4bbe1ff877e10f"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "base64ct",
  "by_address",
@@ -5317,8 +5283,7 @@ dependencies = [
 [[package]]
 name = "tor-llcrypto"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95f921a609ff73736e8e21d11dbee6617cd7568841790f2e3327295627a51b75"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "aes",
  "base64ct",
@@ -5360,8 +5325,7 @@ dependencies = [
 [[package]]
 name = "tor-log-ratelim"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2096a87f0691f0781bf564249c524d62b5338c3954ba1c6ef10ec90df1d97733"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "futures",
  "humantime",
@@ -5376,8 +5340,7 @@ dependencies = [
 [[package]]
 name = "tor-memquota"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96853fc516264fe2ebefbe40d276b6a3b84e15fc08b74fd7a85e2c5df9f11c37"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "cfg-if",
  "derive-deftly",
@@ -5408,8 +5371,7 @@ dependencies = [
 [[package]]
 name = "tor-memquota-cost"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5e5712bfe2995a60eddcc32d07e2e38a42120318a8f5411d621bf0a8fa77219"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive-deftly",
  "itertools 0.15.0",
@@ -5420,8 +5382,7 @@ dependencies = [
 [[package]]
 name = "tor-netdir"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd22ffd4d6aa9389ec8e20e9b0d579d61101682c5ec8379115a388e473e83297"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -5453,8 +5414,7 @@ dependencies = [
 [[package]]
 name = "tor-netdoc"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78dc8a397a86fd00b17607941b204281dd8a77a6018ca8eedc257bdccb4f3aa7"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "base64ct",
@@ -5506,8 +5466,7 @@ dependencies = [
 [[package]]
 name = "tor-persist"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7a3bc60cbe74bf41cd63e2506a9a16bd52047668771578b12ff2453ec4c7522"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "derive-deftly",
@@ -5535,8 +5494,7 @@ dependencies = [
 [[package]]
 name = "tor-proto"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fceb9d4017849440584e541054b6a26517655a3ae48942b6e67476c5376262c3"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "aes",
  "amplify",
@@ -5604,8 +5562,7 @@ dependencies = [
 [[package]]
 name = "tor-protover"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e69fbc196208a9d6232d2c38e32806f3bb064792fd84ac6ee12b5ba1e482240"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "caret",
  "derive-deftly",
@@ -5619,8 +5576,7 @@ dependencies = [
 [[package]]
 name = "tor-relay-selection"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e420365ef1e89ee93b34b5ab71a6aa840cadcbe04e2ac4b72043846fb2f9e002"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "rand 0.10.3",
  "serde",
@@ -5633,8 +5589,7 @@ dependencies = [
 [[package]]
 name = "tor-rtcompat"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99036f7a4fa9735e0beac7f241592da1a072c94a018e4fa702001700f5922291"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "async-trait",
@@ -5670,8 +5625,7 @@ dependencies = [
 [[package]]
 name = "tor-rtmock"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9140515718465f1ede62fa33e96cc929acf075a3893cb349d1c606976c846a21"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "amplify",
  "assert_matches",
@@ -5700,8 +5654,7 @@ dependencies = [
 [[package]]
 name = "tor-socksproto"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62d1f5c19f2339b2634556ed35865844276ab889708b482dc351fa18184c5b24"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "caret",
  "derive-deftly",
@@ -5716,8 +5669,7 @@ dependencies = [
 [[package]]
 name = "tor-units"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa976f4c84404c9aaf7e8690fe30904a69084d0069ff7b2dfc0c58919d65eebd"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "derive-deftly",
  "derive_more",
@@ -6127,8 +6079,7 @@ dependencies = [
 [[package]]
 name = "web-time-compat"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1c38a07cb4a2705c91feaedc9013a65481ec1b38d818b885d642b9f06ec6edd"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
 dependencies = [
  "web-time",
 ]

@@ -48,6 +48,65 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 vader-parity = "0.1.0"
 whatlang = "0.18.0"
 
+# Soapbox's fork of Arti, a branch per release it patches: relay selection
+# compares family members as plain bytes, where upstream's constant-time
+# comparison cost ~0.4 s of CPU per relay picked, and each onion service
+# descriptor upload gets at least 120 seconds, where upstream gave up on slow
+# HSDirs after 30 and never published to them. The branch must match the
+# release arti-client is pinned to. Every Arti crate is listed: the fork's
+# crates depend on each other by path, so one taken from crates.io would be a
+# second copy whose types don't match.
+[patch.crates-io]
+arti-client              = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+caret                    = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+equix                    = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+fs-mistrust              = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+fslock-guard             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+hashx                    = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+oneshot-fused-workaround = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+retry-error              = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+safelog                  = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+saturating-time          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+slotmap-careful          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-async-utils          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-basic-utils          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-bytes                = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-cell                 = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-cert                 = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-chanmgr              = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-checkable            = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-circmgr              = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-config               = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-config-path          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-consdiff             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-dirclient            = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-dircommon            = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-dirmgr               = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-error                = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-general-addr         = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-guardmgr             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-hsclient             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-hscrypto             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-hsservice            = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-key-forge            = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-keymgr               = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-linkspec             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-llcrypto             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-log-ratelim          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-memquota             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-memquota-cost        = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-netdir               = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-netdoc               = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-persist              = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-proto                = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-protover             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-relay-selection      = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-rtcompat             = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-rtmock               = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-socksproto           = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+tor-units                = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+web-time-compat          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+
 [dev-dependencies]
 rand = "0.10.3"
 tempfile = "3.27.0"
