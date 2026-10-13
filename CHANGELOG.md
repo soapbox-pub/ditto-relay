@@ -4,6 +4,12 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [2.1.2]
+
+- Clients are pinged every 30 seconds rather than every 60, well under the
+  60 seconds nginx waits by default on a quiet connection before closing it.
+  A client not heard from in a minute is now dropped.
+
 ## [2.1.1]
 
 - The onion service stays reachable. Arti now comes from Soapbox's fork,
