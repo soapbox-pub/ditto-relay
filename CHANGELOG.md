@@ -4,6 +4,14 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [2.1.1]
+
+- The onion service stays reachable. Arti now comes from Soapbox's fork,
+  where each descriptor upload waits at least 120 seconds: Arti gave up on
+  slow directory relays after 30 and never published to them, so the onion
+  dropped out for minutes to an hour at a time, about twenty times a day. The
+  fork also makes choosing relays far cheaper in CPU.
+
 ## [2.1.0]
 
 - `ditto-relay delete --filter <json> [--age <seconds>] [--dry-run]` removes
