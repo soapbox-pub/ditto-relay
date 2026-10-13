@@ -372,8 +372,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often a client is pinged. One not heard from in two of these, pong
-/// or otherwise, has gone without closing, and is dropped.
-const PING_INTERVAL: Duration = Duration::from_secs(60);
+/// or otherwise, has gone without closing, and is dropped. Kept well under
+/// the 60 seconds a reverse proxy like nginx waits on a quiet connection
+/// before closing it.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Live events waiting to go out to one client. One that falls this far
 /// behind is dropped: holding more for it would be without end.
