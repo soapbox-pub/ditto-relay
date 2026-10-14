@@ -99,6 +99,8 @@ pub struct Metrics {
     /// Time spent querying for REQs, not sending what's found.
     pub reqs: Timer,
     pub counts: Timer,
+    /// Time spent finding NIP-77 syncs' events and answering their messages.
+    pub syncs: Timer,
     /// Filters that examined as many events as they may before finding
     /// their limit, so may have missed some.
     pub filters_cut_short: Counter,
@@ -132,6 +134,7 @@ pub static METRICS: Metrics = Metrics {
     write_queue: Gauge::new(),
     reqs: Timer::new(),
     counts: Timer::new(),
+    syncs: Timer::new(),
     filters_cut_short: Counter::new(),
     events_examined: Counter::new(),
     counts_refused: Counter::new(),
@@ -232,6 +235,7 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
     );
     out.timer("req", "REQ queries", &m.reqs);
     out.timer("count", "COUNT queries", &m.counts);
+    out.timer("sync", "NIP-77 sync messages answered", &m.syncs);
     out.one(
         "filters_cut_short_total",
         "counter",

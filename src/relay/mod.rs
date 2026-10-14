@@ -15,6 +15,7 @@ use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use negentropy::{Id, Negentropy, NegentropyStorageVector};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
@@ -303,8 +304,11 @@ fn nip11(config: &Config, public_url: &str) -> Value {
     let mut nips = vec![1, 9, 11, 40, 42, 45, 62, 70];
     if config.search {
         nips.push(50);
-        nips.sort_unstable();
     }
+    if config.negentropy {
+        nips.push(77);
+    }
+    nips.sort_unstable();
     let mut info = json!({
         "name": config.name,
         "description": config.description,
@@ -420,12 +424,40 @@ impl Drop for Subscription {
     }
 }
 
-/// A finished query: a REQ's, by its subscription's name, or a COUNT's,
-/// by its id.
+/// A NIP-77 sync.
+struct NegSync {
+    /// As a [`Subscription`]'s.
+    name: Arc<str>,
+    /// The `created_at` and id of every event its filter matched, once
+    /// they've been found. Kept for its every message.
+    storage: Option<Arc<NegentropyStorageVector>>,
+    /// Stops its query.
+    cancel: CancellationToken,
+}
+
+impl Drop for NegSync {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// The most bytes of a negentropy message the relay sends, before it's
+/// hex-encoded: strfry's.
+const NEG_FRAME_SIZE: u64 = 500_000;
+
+/// A sync's answer to a message, and the events it covers.
+struct Reconciled {
+    storage: Arc<NegentropyStorageVector>,
+    msg: Vec<u8>,
+}
+
+/// A finished query: a REQ's, by its subscription's name, a COUNT's, by
+/// its id, or a sync's, by its name.
 enum Done {
     Req(Arc<str>, anyhow::Result<Results>),
     /// Boxed: a count's HyperLogLog is big.
     Count(String, anyhow::Result<Box<Count>>),
+    Sync(Arc<str>, anyhow::Result<Reconciled>),
 }
 
 /// Run a query on the blocking pool when a core is free, unless `cancel`
@@ -460,6 +492,8 @@ struct Connection {
     id: ConnId,
     /// By subscription id.
     subs: HashMap<String, Subscription>,
+    /// By their own ids, apart from subscriptions'.
+    syncs: HashMap<String, NegSync>,
     /// Stops every query of the connection's once it's gone, or the relay
     /// is shutting down.
     cancel: CancellationToken,
@@ -501,6 +535,7 @@ impl Connection {
             state,
             id,
             subs: HashMap::new(),
+            syncs: HashMap::new(),
             sink,
             peer,
             challenge: None,
@@ -539,6 +574,7 @@ impl Connection {
                 Some(done) = queries.join_next(), if !queries.is_empty() => match done {
                     Ok(Done::Req(name, results)) => conn.on_results(name, results).await,
                     Ok(Done::Count(id, count)) => conn.on_count_done(&id, count).await,
+                    Ok(Done::Sync(name, reconciled)) => conn.on_reconciled(name, reconciled).await,
                     // Cancelled tasks aren't aborted, and the others catch
                     // their panics.
                     Err(_) => Ok(()),
@@ -620,6 +656,18 @@ impl Connection {
             Some("REQ") => self.on_req(&msg[1..], queries).await,
             Some("COUNT") => self.on_count(&msg[1..], queries).await,
             Some("AUTH") => self.on_auth(msg.get_mut(1).map(Value::take)).await,
+            Some("NEG-OPEN") => self.on_neg_open(&msg[1..], queries).await,
+            Some("NEG-MSG") => self.on_neg_msg(&msg[1..], queries).await,
+            Some("NEG-CLOSE") => match msg.get(1).and_then(Value::as_str) {
+                Some(id) => {
+                    self.syncs.remove(id);
+                    Ok(())
+                }
+                None => {
+                    self.notice("invalid: NEG-CLOSE requires a subscription id")
+                        .await
+                }
+            },
             Some("CLOSE") => match msg.get(1).and_then(Value::as_str) {
                 Some(sub_id) => {
                     self.end(sub_id).await;
@@ -965,6 +1013,166 @@ impl Connection {
         }
     }
 
+    /// NIP-77: `["NEG-OPEN", id, filter, message]`. Finds the events the
+    /// filter matches, then answers the message with them.
+    async fn on_neg_open(
+        &mut self,
+        args: &[Value],
+        queries: &mut JoinSet<Done>,
+    ) -> Result<(), Disconnect> {
+        let config = self.state.config.clone();
+        let Some(id) = args.first().and_then(Value::as_str) else {
+            return self
+                .notice("invalid: NEG-OPEN requires a subscription id")
+                .await;
+        };
+        if id.is_empty() || id.len() > config.max_subid_length {
+            return self.neg_err(id, "invalid: bad subscription id").await;
+        }
+        // One reusing an id replaces that sync.
+        self.syncs.remove(id);
+        if !config.negentropy {
+            return self.neg_err(id, "blocked: negentropy is disabled").await;
+        }
+        let filter = match args.get(1) {
+            Some(value @ Value::Object(_)) => self.filters(std::slice::from_ref(value)),
+            _ => Err("invalid: NEG-OPEN requires a filter".into()),
+        };
+        let filter = match filter.map(|mut filters| filters.pop()) {
+            Ok(Some(filter)) if filter.search.is_none() => filter,
+            Ok(_) => {
+                return self
+                    .neg_err(id, "unsupported: search can't be synced")
+                    .await;
+            }
+            Err(msg) => return self.neg_err(id, &msg).await,
+        };
+        let Some(msg) = args
+            .get(2)
+            .and_then(Value::as_str)
+            .and_then(|m| hex::decode(m).ok())
+        else {
+            return self
+                .neg_err(id, "invalid: NEG-OPEN requires a hex message")
+                .await;
+        };
+        if self.syncs.len() >= config.max_subscriptions {
+            return self.neg_err(id, "blocked: too many syncs").await;
+        }
+
+        let name: Arc<str> = id.into();
+        let cancel = self.cancel.child_token();
+        self.syncs.insert(
+            id.to_string(),
+            NegSync {
+                name: name.clone(),
+                storage: None,
+                cancel: cancel.clone(),
+            },
+        );
+        let state = self.state.clone();
+        queries.spawn(async move {
+            let store = state.store.clone();
+            let start = Instant::now();
+            let stop = cancel.clone();
+            let reconciled = run_query(&state, &cancel, move || {
+                let txn = store.read()?;
+                let found =
+                    query::every_id(&store, &txn, &filter, config.negentropy_max_events, &stop)?;
+                drop(txn);
+                let mut storage = NegentropyStorageVector::with_capacity(found.len());
+                for (created_at, id) in found {
+                    storage.insert(created_at.into(), Id::from_byte_array(id))?;
+                }
+                storage.seal()?;
+                reconcile(Arc::new(storage), &msg)
+            })
+            .await;
+            METRICS.syncs.since(start);
+            Done::Sync(name, reconciled)
+        });
+        Ok(())
+    }
+
+    /// NIP-77: `["NEG-MSG", id, message]`.
+    async fn on_neg_msg(
+        &mut self,
+        args: &[Value],
+        queries: &mut JoinSet<Done>,
+    ) -> Result<(), Disconnect> {
+        let Some(id) = args.first().and_then(Value::as_str) else {
+            return self
+                .notice("invalid: NEG-MSG requires a subscription id")
+                .await;
+        };
+        let Some(sync) = self.syncs.get(id) else {
+            return self.neg_err(id, "closed: no such sync").await;
+        };
+        let Some(storage) = sync.storage.clone() else {
+            self.syncs.remove(id);
+            return self
+                .neg_err(id, "invalid: NEG-MSG before NEG-OPEN was answered")
+                .await;
+        };
+        let Some(msg) = args
+            .get(1)
+            .and_then(Value::as_str)
+            .and_then(|m| hex::decode(m).ok())
+        else {
+            self.syncs.remove(id);
+            return self
+                .neg_err(id, "invalid: NEG-MSG requires a hex message")
+                .await;
+        };
+        let (state, name, cancel) = (self.state.clone(), sync.name.clone(), sync.cancel.clone());
+        queries.spawn(async move {
+            let start = Instant::now();
+            let reconciled = run_query(&state, &cancel, move || reconcile(storage, &msg)).await;
+            METRICS.syncs.since(start);
+            Done::Sync(name, reconciled)
+        });
+        Ok(())
+    }
+
+    /// A sync's answer to the last message, or why there isn't one.
+    async fn on_reconciled(
+        &mut self,
+        name: Arc<str>,
+        reconciled: anyhow::Result<Reconciled>,
+    ) -> Result<(), Disconnect> {
+        // Closed or replaced while it ran.
+        let Some(sync) = self
+            .syncs
+            .get_mut(&*name)
+            .filter(|sync| Arc::ptr_eq(&sync.name, &name))
+        else {
+            return Ok(());
+        };
+        let err = match reconciled {
+            Ok(Reconciled { storage, msg }) => {
+                sync.storage = Some(storage);
+                return self.send(&("NEG-MSG", &*name, hex::encode(msg))).await;
+            }
+            Err(err) => err,
+        };
+        self.syncs.remove(&*name);
+        if err.is::<TooExpensive>() {
+            let max = self.state.config.negentropy_max_events;
+            let msg = "blocked: too many events to sync";
+            return self.send(&("NEG-ERR", &*name, msg, max)).await;
+        }
+        if let Some(err) = err.downcast_ref::<negentropy::Error>() {
+            return self.neg_err(&name, &format!("invalid: {err}")).await;
+        }
+        tracing::error!("sync failed: {err:#}");
+        METRICS.errors_query.inc();
+        self.neg_err(&name, "error: sync failed").await
+    }
+
+    async fn neg_err(&mut self, id: &str, msg: &str) -> Result<(), Disconnect> {
+        self.send(&("NEG-ERR", id, msg)).await
+    }
+
     /// Close a subscription, stopping its query. One the connection doesn't
     /// have costs nothing, so a flood of them can't crowd the shards' queues.
     async fn end(&mut self, sub_id: &str) {
@@ -1105,6 +1313,12 @@ async fn accept(state: &AppState, id: &str, ev: Event) -> (bool, Cow<'static, st
             (false, "error: failed to store event".into())
         }
     }
+}
+
+/// Answer a sync's message from the events it covers.
+fn reconcile(storage: Arc<NegentropyStorageVector>, msg: &[u8]) -> anyhow::Result<Reconciled> {
+    let msg = Negentropy::borrowed(&*storage, NEG_FRAME_SIZE)?.reconcile(msg)?;
+    Ok(Reconciled { storage, msg })
 }
 
 /// `["EVENT", sub_id, event]`, with the event already serialized.

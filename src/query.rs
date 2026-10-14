@@ -344,6 +344,82 @@ pub fn every_match(store: &Store, txn: &Txn, filter: &Filter) -> Result<Vec<u64>
     Ok(seqs)
 }
 
+/// The `created_at` and id of every unexpired event a filter matches, for
+/// a NIP-77 sync, with a limit the newest that many. Like
+/// [`every_match`], examines as many records as it takes, but fails with
+/// [`TooExpensive`] past `max` index entries or matches, and with
+/// [`Cancelled`] once `cancel` is. A search's text isn't looked up.
+pub fn every_id(
+    store: &Store,
+    txn: &Txn,
+    filter: &Filter,
+    max: usize,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Vec<(u32, [u8; 32])>> {
+    if filter.never {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    if let Some(ids) = &filter.ids {
+        for id in ids {
+            if let Some(seq) = store.seq_of(txn, id)?
+                && let Some(view) = store.load(txn, seq)?
+                && filter.matches(&view)
+            {
+                found.push((view.created_at(), *id));
+            }
+        }
+    } else if let Some(limit) = filter.limit.and_then(|l| usize::try_from(l).ok())
+        && limit <= max
+    {
+        // Newest first, so only as far back as the limit, and the ties
+        // with the last.
+        let plan = plan(store, txn, filter)?;
+        let mut views = Vec::new();
+        let budget = max.saturating_add(MAX_TIES);
+        if scan(store, txn, filter, &plan, limit, budget, cancel, &mut views)? {
+            return Err(TooExpensive.into());
+        }
+        if cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        let views = newest_first(views, limit);
+        found.extend(
+            views
+                .iter()
+                .map(|(_, view)| (view.created_at(), *view.id())),
+        );
+    } else {
+        let plan = plan(store, txn, filter)?;
+        let mut seqs = Vec::new();
+        walk_up_to(txn, filter, &plan, max, cancel, |seq| seqs.push(seq))?;
+        seqs.sort_unstable();
+        seqs.dedup();
+        store.read_ahead(&seqs);
+        METRICS.events_examined.add(seqs.len() as u64);
+        for (i, seq) in seqs.into_iter().enumerate() {
+            if i % CANCEL_CHECK == 0 && cancel.is_cancelled() {
+                return Err(Cancelled.into());
+            }
+            if plan.exact {
+                if let Some(header) = store.header(txn, seq)? {
+                    found.push((header.created_at(), *header.id()));
+                }
+            } else if let Some(view) = store.load(txn, seq)?.filter(|view| filter.matches(view)) {
+                found.push((view.created_at(), *view.id()));
+            }
+        }
+    }
+    if let Some(limit) = filter.limit {
+        found.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        found.truncate(limit.try_into().unwrap_or(usize::MAX));
+    }
+    if found.len() > max {
+        return Err(TooExpensive.into());
+    }
+    Ok(found)
+}
+
 /// Newest first; on a tie, the lowest id first (NIP-01). Up to `limit`.
 fn newest_first(mut found: Vec<(u64, EventView<'_>)>, limit: usize) -> Vec<(u64, EventView<'_>)> {
     found.sort_unstable_by(|(_, a), (_, b)| {
@@ -838,6 +914,18 @@ fn walk(
     filter: &Filter,
     plan: &Plan,
     cancel: &CancellationToken,
+    f: impl FnMut(u64),
+) -> anyhow::Result<()> {
+    walk_up_to(txn, filter, plan, MAX_WALKED, cancel, f)
+}
+
+/// [`walk`], up to `max` stamps.
+fn walk_up_to(
+    txn: &Txn,
+    filter: &Filter,
+    plan: &Plan,
+    max: usize,
+    cancel: &CancellationToken,
     mut f: impl FnMut(u64),
 ) -> anyhow::Result<()> {
     let mut walked = 0;
@@ -847,9 +935,9 @@ fn walk(
             if plan.wants(entry) {
                 f(stamp_seq(entry));
             }
-            walked <= MAX_WALKED && (walked % CANCEL_CHECK != 0 || !cancel.is_cancelled())
+            walked <= max && (walked % CANCEL_CHECK != 0 || !cancel.is_cancelled())
         })?;
-        if walked > MAX_WALKED {
+        if walked > max {
             return Err(TooExpensive.into());
         }
         if cancel.is_cancelled() {
@@ -1296,6 +1384,26 @@ mod tests {
                     .then_with(|| a.id.cmp(&b.id))
             });
             let expected: Vec<String> = expected.iter().take(limit).map(|e| e.id.clone()).collect();
+
+            // A sync finds the same, and without a limit, every match.
+            if parsed.search.is_none() {
+                let txn = store.read().unwrap();
+                let cancel = Default::default();
+                let synced = |filter: &Filter| -> HashSet<String> {
+                    every_id(&store, &txn, filter, 1000, &cancel)
+                        .unwrap()
+                        .iter()
+                        .map(|(_, id)| hex::encode(id))
+                        .collect()
+                };
+                let newest: HashSet<String> = expected.iter().cloned().collect();
+                assert_eq!(synced(&parsed), newest, "{filter}");
+                let unlimited = Filter {
+                    limit: None,
+                    ..parsed.clone()
+                };
+                assert_eq!(synced(&unlimited).len() as u64, want.count, "{filter}");
+            }
             assert_eq!(found(&store, &[parsed], 500), expected, "{filter}");
         }
     }

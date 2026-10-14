@@ -91,6 +91,13 @@ url = "wss://relay.example.com/"
 # built-in list.
 # nsfw_hashtags = ["nsfw"]
 
+## Syncing (NIP-77)
+
+# Whether clients and other relays may sync with negentropy.
+# negentropy = true
+# The most events one sync may cover. A filter matching more is refused.
+# negentropy_max_events = 1000000
+
 ## Web of trust and ranking
 
 # Hex pubkeys the web of trust is rooted at. Defaults to pubkey's, if set;

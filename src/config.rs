@@ -87,6 +87,10 @@ pub struct Config {
     pub search_commit_ms: u64,
     /// Hashtags that mark media as adult, for the `nsfw:` search extension.
     pub nsfw_hashtags: Vec<String>,
+    /// Whether NIP-77 negentropy syncing is on.
+    pub negentropy: bool,
+    /// The most events one sync may cover.
+    pub negentropy_max_events: usize,
     /// Whom the web of trust is rooted at. None turns it off.
     pub wot_seeds: Vec<[u8; 32]>,
     /// How likely trust is to pass along a follow rather than stop.
@@ -168,6 +172,8 @@ struct File {
     search_kinds: Option<Vec<u16>>,
     search_commit_ms: Option<u64>,
     nsfw_hashtags: Option<Vec<String>>,
+    negentropy: Option<bool>,
+    negentropy_max_events: Option<usize>,
     wot_seeds: Option<Vec<String>>,
     wot_damping: Option<f64>,
     wot_full_trust: Option<u64>,
@@ -423,6 +429,8 @@ impl Config {
                     .map(|t| t.to_string())
                     .collect()
             }),
+            negentropy: file.negentropy.unwrap_or(true),
+            negentropy_max_events: file.negentropy_max_events.unwrap_or(1_000_000),
             log: file.log.unwrap_or_else(|| DEFAULT_LOG.into()),
             tor: enabled.then_some(tor),
         })
@@ -496,6 +504,7 @@ mod tests {
         assert!(c.wot_seeds.is_empty());
         assert_eq!(c.indexed_tags, ["proxy", "client", "content-warning"]);
         assert!(c.tor.is_none());
+        assert!(c.negentropy);
     }
 
     #[test]

@@ -56,6 +56,8 @@ fn config() -> Config {
         search_kinds: vec![],
         search_commit_ms: 1000,
         nsfw_hashtags: vec![],
+        negentropy: true,
+        negentropy_max_events: 1000,
         wot_seeds: vec![],
         wot_damping: 0.85,
         wot_full_trust: 100_000,
@@ -575,4 +577,142 @@ async fn serves_the_onion_as_the_onion() {
     client.send(json!(["AUTH", auth])).await;
     assert_eq!(client.next().await, json!(["OK", auth.id, true, ""]));
     assert_eq!(client.publish(&ev).await, (true, String::new()));
+}
+
+/// NIP-77: a sync, from the client's side, of the events it has that
+/// match `filter`. What the client has that the relay doesn't, and what
+/// the relay has that the client doesn't, by id.
+async fn sync(client: &mut Client, filter: Value, mine: &[Event]) -> (Vec<String>, Vec<String>) {
+    use negentropy::{Id, Negentropy, NegentropyStorageVector};
+    let mut storage = NegentropyStorageVector::new();
+    for ev in mine {
+        let id = event::decode_hex(&ev.id).unwrap();
+        storage
+            .insert(ev.created_at, Id::from_byte_array(id))
+            .unwrap();
+    }
+    storage.seal().unwrap();
+    let mut neg = Negentropy::borrowed(&storage, 0).unwrap();
+    let msg = hex::encode(neg.initiate().unwrap());
+    client.send(json!(["NEG-OPEN", "s", filter, msg])).await;
+    let (mut have, mut need) = (vec![], vec![]);
+    loop {
+        let msg = client.next().await;
+        assert_eq!(msg[0], "NEG-MSG", "{msg}");
+        assert_eq!(msg[1], "s", "{msg}");
+        let msg = hex::decode(msg[2].as_str().unwrap()).unwrap();
+        match neg.reconcile_with_ids(&msg, &mut have, &mut need).unwrap() {
+            Some(next) => {
+                client
+                    .send(json!(["NEG-MSG", "s", hex::encode(next)]))
+                    .await
+            }
+            None => break,
+        }
+    }
+    client.send(json!(["NEG-CLOSE", "s"])).await;
+    let hex = |ids: Vec<Id>| {
+        let mut ids: Vec<String> = ids.iter().map(|id| hex::encode(id.as_bytes())).collect();
+        ids.sort();
+        ids
+    };
+    (hex(have), hex(need))
+}
+
+#[tokio::test]
+async fn syncs_with_negentropy() {
+    let relay = Relay::start().await;
+    let mut client = relay.connect().await;
+    // Enough for the ranges to be split, and fingerprinted, over rounds.
+    let notes: Vec<Event> = (0..300)
+        .map(|i| signed(1, 1000 + i / 3, 1, vec![], &i.to_string()))
+        .collect();
+    let (theirs, rest) = notes.split_at(100);
+    let (shared, mine) = rest.split_at(100);
+    for ev in theirs.iter().chain(shared) {
+        client.publish(ev).await;
+    }
+    // Not matching the filter.
+    client.publish(&signed(1, 1000, 7, vec![], "+")).await;
+    let ids = |events: &[Event]| {
+        let mut ids: Vec<String> = events.iter().map(|ev| ev.id.clone()).collect();
+        ids.sort();
+        ids
+    };
+    let mine_and_shared = [shared, mine].concat();
+
+    let (have, need) = sync(&mut client, json!({"kinds": [1]}), &mine_and_shared).await;
+    assert_eq!((have, need), (ids(mine), ids(theirs)));
+    // Within time bounds, and with a limit, as a REQ.
+    let (have, need) = sync(&mut client, json!({"kinds": [1], "since": 1050}), &[]).await;
+    assert_eq!((have, need), (vec![], ids(&notes[150..200])));
+    let (_, need) = sync(&mut client, json!({"kinds": [1], "limit": 29}), &[]).await;
+    assert_eq!(need, ids(&notes[171..200]));
+    let (_, need) = sync(&mut client, json!({"ids": [notes[0].id]}), &[]).await;
+    assert_eq!(need, [notes[0].id.clone()]);
+    client.quiet().await;
+
+    // Asked about a sync it doesn't have.
+    client.send(json!(["NEG-MSG", "x", "61"])).await;
+    let err = client.next().await;
+    assert_eq!(err[0], "NEG-ERR", "{err}");
+    assert!(err[2].as_str().unwrap().starts_with("closed:"), "{err}");
+    // A message of another protocol version is answered with its own.
+    client.send(json!(["NEG-OPEN", "v", {}, "62"])).await;
+    assert_eq!(client.next().await, json!(["NEG-MSG", "v", "61"]));
+    // A range of no mode there is.
+    client.send(json!(["NEG-OPEN", "v", {}, "61000005"])).await;
+    let err = client.next().await;
+    assert!(err[2].as_str().unwrap().starts_with("invalid:"), "{err}");
+    client
+        .send(json!(["NEG-OPEN", "v", {"search": "x"}, "61"]))
+        .await;
+    assert_eq!(client.next().await[0], "NEG-ERR");
+}
+
+#[tokio::test]
+async fn refuses_syncs_too_big_or_turned_off() {
+    let relay = Relay::start_with(Config {
+        negentropy_max_events: 2,
+        ..config()
+    })
+    .await;
+    let mut client = relay.connect().await;
+    for i in 0..3 {
+        client.publish(&note(1, &i.to_string())).await;
+    }
+    let msg = hex::encode([0x61]);
+    client
+        .send(json!(["NEG-OPEN", "s", {"kinds": [1]}, msg]))
+        .await;
+    let err = client.next().await;
+    assert_eq!(
+        err,
+        json!(["NEG-ERR", "s", "blocked: too many events to sync", 2])
+    );
+    client
+        .send(json!(["NEG-OPEN", "s", {"kinds": [1], "limit": 2}, msg]))
+        .await;
+    assert_eq!(client.next().await[0], "NEG-MSG");
+
+    let relay = Relay::start_with(Config {
+        negentropy: false,
+        ..config()
+    })
+    .await;
+    let (_, body) = get(relay.addr, "application/nostr+json").await;
+    let info: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        !info["supported_nips"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(77))
+    );
+    let mut client = relay.connect().await;
+    client.send(json!(["NEG-OPEN", "s", {}, msg])).await;
+    let err = client.next().await;
+    assert_eq!(
+        err,
+        json!(["NEG-ERR", "s", "blocked: negentropy is disabled"])
+    );
 }

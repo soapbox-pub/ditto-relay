@@ -1170,6 +1170,7 @@ dependencies = [
  "hex",
  "libc",
  "lmdb-master-sys",
+ "negentropy",
  "rand 0.10.3",
  "rustls",
  "safelog",
@@ -2557,6 +2558,12 @@ name = "murmurhash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
+
+[[package]]
+name = "negentropy"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81c353b400a5503efdcf398f11a83fb7aa84f59f5d76fc4bf5bbc1e4f5366caa"
 
 [[package]]
 name = "nom"

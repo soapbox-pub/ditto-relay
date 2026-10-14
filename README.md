@@ -8,10 +8,11 @@ and full-text search runs on [Tantivy](https://github.com/quickwit-oss/tantivy).
 **Up to 5× faster than strfry**, with a 35% smaller database.
 [See the benchmarks.](#benchmarks)
 
-- NIPs 1, 9, 11, 40, 42, 45, 50, 62, and 70
+- NIPs 1, 9, 11, 40, 42, 45, 50, 62, 70, and 77
 - NIP-50 search with `sort:hot`, `sort:top`, and other extensions, ranked by a web of
   trust seeded from pubkeys you choose
 - NIP-45 `COUNT`, with HyperLogLog sketches for large tags
+- NIP-77 negentropy syncing, with strfry or any other client that speaks it
 - NIP-85 trusted assertions and trending labels, signed by the relay's own key
 - strfry-compatible write policy plugins
 - Prometheus metrics
