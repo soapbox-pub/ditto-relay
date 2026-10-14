@@ -1317,8 +1317,61 @@ async fn accept(state: &AppState, id: &str, ev: Event) -> (bool, Cow<'static, st
 
 /// Answer a sync's message from the events it covers.
 fn reconcile(storage: Arc<NegentropyStorageVector>, msg: &[u8]) -> anyhow::Result<Reconciled> {
+    if !ids_fit(msg) {
+        return Err(negentropy::Error::ParseEndsPrematurely.into());
+    }
     let msg = Negentropy::borrowed(&*storage, NEG_FRAME_SIZE)?.reconcile(msg)?;
     Ok(Reconciled { storage, msg })
+}
+
+/// Whether every list of ids in a negentropy message has room for as many
+/// as it says. The `negentropy` crate reserves room for them before
+/// reading them, so a few bytes claiming billions would abort the relay.
+/// Parsed as the crate parses it, which fails where this gives up.
+fn ids_fit(msg: &[u8]) -> bool {
+    // The crate's varints: a truncated one is what it has so far.
+    fn varint(bytes: &mut &[u8]) -> u64 {
+        let mut n = 0u64;
+        while let [byte, rest @ ..] = *bytes {
+            *bytes = rest;
+            n = (n << 7) | u64::from(byte & 0x7f);
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        n
+    }
+    const VERSION: u8 = negentropy::PROTOCOL_VERSION as u8;
+    // Another version is answered without being parsed.
+    let [VERSION, rest @ ..] = msg else {
+        return true;
+    };
+    let mut rest = rest;
+    while !rest.is_empty() {
+        let _timestamp = varint(&mut rest);
+        let prefix = varint(&mut rest);
+        let Some(after) = usize::try_from(prefix).ok().and_then(|n| rest.get(n..)) else {
+            return true;
+        };
+        rest = after;
+        let skip = match varint(&mut rest) {
+            0 => 0,
+            1 => negentropy::FINGERPRINT_SIZE,
+            2 => {
+                let count = varint(&mut rest);
+                if count > (rest.len() / negentropy::ID_SIZE) as u64 {
+                    return false;
+                }
+                count as usize * negentropy::ID_SIZE
+            }
+            _ => return true,
+        };
+        let Some(after) = rest.get(skip..) else {
+            return true;
+        };
+        rest = after;
+    }
+    true
 }
 
 /// `["EVENT", sub_id, event]`, with the event already serialized.
@@ -1354,5 +1407,24 @@ mod tests {
         assert!(addressed_to(&to("ws://relay.onion"), &urls));
         assert!(!addressed_to(&to("wss://other.example.com"), &urls));
         assert!(!addressed_to(&signed(1, 100, VANISH, vec![], ""), &urls));
+    }
+
+    #[test]
+    fn checks_that_negentropy_ids_fit() {
+        let fits = |hex: &str| ids_fit(&hex::decode(hex).unwrap());
+        // A list of 2^34 ids with none there, then of one id that is.
+        assert!(!fits("61000002c080808000"));
+        assert!(fits(&format!("61000002{}{}", "01", "ab".repeat(32))));
+        assert!(!fits(&format!("61000002{}{}", "02", "ab".repeat(32))));
+        // After a skip, a fingerprint, and a bound with an id prefix.
+        let fingerprint = "cd".repeat(16);
+        let head = format!("6105000006020aab01{fingerprint}0000");
+        let id = "ab".repeat(32);
+        assert!(fits(&format!("{head}0201{id}")));
+        assert!(!fits(&format!("{head}0202{id}")));
+        // What the crate refuses or doesn't parse, it's left to.
+        assert!(fits("62000002c080808000"));
+        assert!(fits("61000005"));
+        assert!(fits(""));
     }
 }

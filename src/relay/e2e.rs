@@ -664,6 +664,13 @@ async fn syncs_with_negentropy() {
     client.send(json!(["NEG-OPEN", "v", {}, "61000005"])).await;
     let err = client.next().await;
     assert!(err[2].as_str().unwrap().starts_with("invalid:"), "{err}");
+    // A list of 2^34 ids, with none there, which the crate alone would
+    // reserve a terabyte for.
+    client
+        .send(json!(["NEG-OPEN", "v", {}, "61000002c080808000"]))
+        .await;
+    let err = client.next().await;
+    assert!(err[2].as_str().unwrap().starts_with("invalid:"), "{err}");
     client
         .send(json!(["NEG-OPEN", "v", {"search": "x"}, "61"]))
         .await;
