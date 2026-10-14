@@ -180,7 +180,7 @@ pub fn render(info: &Value, relay_url: &str) -> String {
     )
 }
 
-const REPOSITORY: &str = "https://gitworkshop.dev/soapbox.pub/ditto-relay";
+pub const REPOSITORY: &str = "https://gitworkshop.dev/soapbox.pub/ditto-relay";
 
 const STYLE: &str = r#"
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}

@@ -313,7 +313,7 @@ fn nip11(config: &Config, public_url: &str) -> Value {
         "name": config.name,
         "description": config.description,
         "supported_nips": nips,
-        "software": env!("CARGO_PKG_NAME"),
+        "software": landing::REPOSITORY,
         "version": env!("CARGO_PKG_VERSION"),
         "icon": landing::asset_url(public_url, "/icon.png"),
         "banner": landing::asset_url(public_url, "/banner.jpg"),
