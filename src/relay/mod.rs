@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::auth;
-use crate::config::Config;
+use crate::config::{Config, Image};
 use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
 use crate::landing;
@@ -313,10 +313,7 @@ fn nip11(config: &Config, public_url: &str) -> Value {
         "name": config.name,
         "description": config.description,
         "supported_nips": nips,
-        "software": landing::REPOSITORY,
         "version": env!("CARGO_PKG_VERSION"),
-        "icon": landing::asset_url(public_url, "/icon.png"),
-        "banner": landing::asset_url(public_url, "/banner.jpg"),
         "limitation": {
             "max_message_length": config.max_message_size,
             "max_subscriptions": config.max_subscriptions,
@@ -337,6 +334,19 @@ fn nip11(config: &Config, public_url: &str) -> Value {
     }
     if let Some(contact) = &config.contact {
         info["contact"] = contact.as_str().into();
+    }
+    if let Some(software) = &config.software {
+        info["software"] = software.as_str().into();
+    }
+    for (key, image, path) in [
+        ("icon", &config.icon, "/icon.png"),
+        ("banner", &config.banner, "/banner.jpg"),
+    ] {
+        match image {
+            Image::Builtin => info[key] = landing::asset_url(public_url, path).into(),
+            Image::Url(url) => info[key] = url.as_str().into(),
+            Image::None => {}
+        }
     }
     // The key its NIP-85 assertions are signed with.
     if let Some(keypair) = &config.keypair {

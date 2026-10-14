@@ -13,7 +13,7 @@ use secp256k1::Keypair;
 use serde::Deserialize;
 
 use crate::event::decode_hex;
-use crate::facets;
+use crate::{facets, landing};
 
 /// Where a system-wide relay's configuration is.
 pub const SYSTEM_PATH: &str = "/etc/ditto-relay/ditto-relay.toml";
@@ -52,6 +52,10 @@ pub struct Config {
     pub pubkey: Option<String>,
     /// How to reach the operator, for NIP-11.
     pub contact: Option<String>,
+    /// The URL of the relay software's homepage, for NIP-11.
+    pub software: Option<String>,
+    pub icon: Image,
+    pub banner: Image,
     /// The relay's own key, which signs the NIP-85 assertions it serves
     /// and the trends it labels. None turns them off.
     pub keypair: Option<Keypair>,
@@ -120,6 +124,35 @@ pub struct Config {
     pub tor: Option<Tor>,
 }
 
+/// An image NIP-11 links to, as the icon or the banner.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Image {
+    /// The relay's own, linked wherever the relay is reached.
+    Builtin,
+    Url(String),
+    None,
+}
+
+impl Image {
+    /// From the key `name`'s value: unset is the relay's own, and "" none.
+    fn from_file(value: Option<String>, name: &str) -> anyhow::Result<Self> {
+        match value {
+            None => Ok(Image::Builtin),
+            Some(url) if url.is_empty() => Ok(Image::None),
+            Some(url) => Ok(Image::Url(http_url(url, name)?)),
+        }
+    }
+}
+
+/// `url`, if it's an http or https URL, as the key `name` has to be.
+fn http_url(url: String, name: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        url.starts_with("http://") || url.starts_with("https://"),
+        "{name} must be an http or https URL"
+    );
+    Ok(url)
+}
+
 /// Serving the relay as a Tor onion service, with Tor built in: see
 /// [`crate::tor`].
 #[derive(Debug, Clone)]
@@ -153,6 +186,9 @@ struct File {
     description: Option<String>,
     pubkey: Option<String>,
     contact: Option<String>,
+    software: Option<String>,
+    icon: Option<String>,
+    banner: Option<String>,
     secret_key_file: Option<PathBuf>,
     trends_interval: Option<u64>,
     trends_expiration: Option<u32>,
@@ -305,14 +341,21 @@ impl Config {
             .url
             .context("url must be set, eg url = \"wss://relay.example.com/\"")?;
         // ws://host is served at http://host, and wss://host at https://host.
-        let public_url = file.public_url.unwrap_or_else(|| {
-            url.strip_prefix("ws")
-                .map_or(url.clone(), |rest| format!("http{rest}"))
-        });
-        anyhow::ensure!(
-            public_url.starts_with("http://") || public_url.starts_with("https://"),
-            "public_url must be an http or https URL"
-        );
+        let public_url = http_url(
+            file.public_url.unwrap_or_else(|| {
+                url.strip_prefix("ws")
+                    .map_or(url.clone(), |rest| format!("http{rest}"))
+            }),
+            "public_url",
+        )?;
+        // An empty one leaves it out.
+        let software = match file.software {
+            Some(software) if software.is_empty() => None,
+            Some(software) => Some(http_url(software, "software")?),
+            None => Some(landing::REPOSITORY.into()),
+        };
+        let icon = Image::from_file(file.icon, "icon")?;
+        let banner = Image::from_file(file.banner, "banner")?;
         let data_dir = match file.data_dir {
             Some(path) => resolve(path),
             None => env.default_data_dir()?,
@@ -392,6 +435,9 @@ impl Config {
             real_ip_header: file.real_ip_header,
             pubkey,
             contact: file.contact,
+            software,
+            icon,
+            banner,
             keypair,
             trends_interval: file.trends_interval.unwrap_or(900),
             // A week of sparklines, and a day to spare.
@@ -505,6 +551,28 @@ mod tests {
         assert_eq!(c.indexed_tags, ["proxy", "client", "content-warning"]);
         assert!(c.tor.is_none());
         assert!(c.negentropy);
+        assert_eq!(c.software.as_deref(), Some(landing::REPOSITORY));
+        assert_eq!((c.icon, c.banner), (Image::Builtin, Image::Builtin));
+    }
+
+    #[test]
+    fn images_and_software_can_be_replaced_or_left_out() {
+        let c = config(
+            "url = \"ws://x\"\nsoftware = \"https://s.example\"\n\
+             icon = \"https://i.example/i.png\"\nbanner = \"\"",
+        )
+        .unwrap();
+        assert_eq!(c.software.as_deref(), Some("https://s.example"));
+        assert_eq!(c.icon, Image::Url("https://i.example/i.png".into()));
+        assert_eq!(c.banner, Image::None);
+        assert!(
+            config("url = \"ws://x\"\nsoftware = \"\"")
+                .unwrap()
+                .software
+                .is_none()
+        );
+        assert!(config("url = \"ws://x\"\nsoftware = \"ditto-relay\"").is_err());
+        assert!(config("url = \"ws://x\"\nicon = \"javascript:x\"").is_err());
     }
 
     #[test]

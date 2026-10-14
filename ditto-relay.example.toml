@@ -44,6 +44,13 @@ url = "wss://relay.example.com/"
 # The operator's pubkey, in hex.
 # pubkey = "0461fcbecc4c3374439932d6b8f11269ccdb7cc973ad7a50ae362db135a474dd"
 # contact = "mailto:admin@example.com"
+# The relay software's homepage. "" leaves it out.
+# software = "https://gitworkshop.dev/soapbox.pub/ditto-relay"
+# URLs of the relay's icon, which should be square, and banner. Unset, the
+# relay's own are linked, from public_url (or the onion, over Tor). "" leaves
+# one out.
+# icon = "https://relay.example.com/icon.png"
+# banner = "https://relay.example.com/banner.jpg"
 
 ## The relay's key
 

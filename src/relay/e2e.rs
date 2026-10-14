@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::{AppState, onion_router, router};
-use crate::config::Config;
+use crate::config::{Config, Image};
 use crate::event::tests::signed;
 use crate::event::{self, Event};
 use crate::store;
@@ -36,6 +36,9 @@ fn config() -> Config {
         description: String::new(),
         pubkey: None,
         contact: None,
+        software: Some(crate::landing::REPOSITORY.into()),
+        icon: Image::Builtin,
+        banner: Image::Builtin,
         keypair: None,
         trends_interval: 0,
         trends_expiration: 0,
@@ -511,6 +514,29 @@ done
     );
     let ok = client.next().await;
     assert_eq!(ok, json!(["OK", ev.id, true, ""]));
+}
+
+#[tokio::test]
+async fn nip11_links_the_configured_images() {
+    let relay = Relay::start().await;
+    let (_, body) = get(relay.addr, "application/nostr+json").await;
+    let info: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["software"], crate::landing::REPOSITORY);
+    assert_eq!(info["banner"], "http://relay.test/banner.jpg");
+
+    let relay = Relay::start_with(Config {
+        software: None,
+        icon: Image::Url("https://img.example/i.png".into()),
+        banner: Image::None,
+        ..config()
+    })
+    .await;
+    let (_, body) = get(relay.addr, "application/nostr+json").await;
+    let info: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["icon"], "https://img.example/i.png");
+    assert!(info.get("banner").is_none() && info.get("software").is_none());
+    let (_, body) = get(relay.addr, "text/html").await;
+    assert!(body.contains("https://img.example/i.png"), "{body}");
 }
 
 /// An onion service's clients are told the onion, and may authenticate
