@@ -12,7 +12,8 @@ description: |
   A Nostr relay that runs on its own database: events are kept as compact
   binary records in LMDB, and full-text search runs on Tantivy. NIP-50 search
   with sort:hot and sort:top ranked by a web of trust, NIP-45 counts, NIP-85
-  assertions and trending labels, and strfry-compatible write policy plugins.
+  assertions and trending labels, NIP-77 negentropy syncing, and
+  strfry-compatible write policy plugins.
   One static binary.
 tags: [nostr, relay, lmdb, search]
 license: AGPL-3.0-or-later

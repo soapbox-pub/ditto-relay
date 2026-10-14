@@ -4,6 +4,21 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [2.2.0]
+
+- NIP-77 negentropy syncing, so strfry (`strfry sync`), `nak sync`, and other
+  clients and relays can find which events each side is missing without
+  sending them all. It's on by default; `negentropy = false` turns it off,
+  and `negentropy_max_events` (1,000,000, as strfry's `maxSyncEvents`) bounds
+  how many events one sync may cover. Syncs find their events as a REQ does,
+  honoring `since`, `until` and `limit`; search filters can't be synced.
+- The negentropy protocol is the relay's own, in `src/negentropy.rs`, ported
+  from the `negentropy` crate, which a message of a few bytes could make
+  abort the process.
+- Arti comes from the head of Soapbox's fork: the guard manager expands its
+  sample at most once a second, and the onion service waits at least 10
+  seconds before retrying a descriptor upload.
+
 ## [2.1.2]
 
 - Clients are pinged every 30 seconds rather than every 60, well under the
