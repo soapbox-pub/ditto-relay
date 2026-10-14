@@ -6,6 +6,10 @@
 # with "#" where their descriptions have "# ". A key the relay doesn't know is
 # refused. Relative paths are relative to this file.
 
+###############################################################################
+# General
+###############################################################################
+
 # The relay's own URL, which NIP-42 authentication and NIP-62 requests to
 # vanish name it by.
 url = "wss://relay.example.com/"
@@ -28,7 +32,9 @@ url = "wss://relay.example.com/"
 # when it has been unreachable for long.
 #log = "info,tantivy=warn,arti_client=warn,tor_=warn,tor_hsservice=error,tor_circmgr::hspool=error"
 
-## Storage
+###############################################################################
+# Storage
+###############################################################################
 
 # Holds the database, in db/, and the search index, in search/. Defaults to
 # /var/lib/ditto-relay as root, else ~/.local/share/ditto-relay.
@@ -42,7 +48,9 @@ url = "wss://relay.example.com/"
 # lose recent writes or corrupt the database.
 #lmdb_sync = true
 
-## NIP-11
+###############################################################################
+# NIP-11
+###############################################################################
 
 #name = "Ditto Relay"
 
@@ -62,7 +70,9 @@ url = "wss://relay.example.com/"
 #icon = "https://relay.example.com/icon.png"
 #banner = "https://relay.example.com/banner.jpg"
 
-## The relay's key
+###############################################################################
+# The relay's key
+###############################################################################
 
 # A file holding the relay's secret key in 64 lowercase hex. It signs the
 # NIP-85 assertions the relay serves and the trends it labels; unset turns
@@ -75,7 +85,9 @@ url = "wss://relay.example.com/"
 # How many seconds a trend label is kept.
 #trends_expiration = 691200
 
-## Limits
+###############################################################################
+# Limits
+###############################################################################
 
 #max_message_size = 4000000
 #max_subscriptions = 20
@@ -90,7 +102,9 @@ url = "wss://relay.example.com/"
 # Events with created_at further than this many seconds ahead are rejected.
 #max_future_seconds = 900
 
-## Indexing
+###############################################################################
+# Indexing
+###############################################################################
 
 # Tags with names longer than a letter to index, so filter by.
 #indexed_tags = ["proxy", "client", "content-warning"]
@@ -104,7 +118,9 @@ url = "wss://relay.example.com/"
 # The most versions of an address kept, current included.
 #history_max_versions = 20
 
-## Search (NIP-50)
+###############################################################################
+# Search (NIP-50)
+###############################################################################
 
 #search = true
 
@@ -118,7 +134,9 @@ url = "wss://relay.example.com/"
 # built-in list.
 #nsfw_hashtags = ["nsfw"]
 
-## Syncing (NIP-77)
+###############################################################################
+# Syncing (NIP-77)
+###############################################################################
 
 # Whether clients and other relays may sync with negentropy.
 #negentropy = true
@@ -126,7 +144,9 @@ url = "wss://relay.example.com/"
 # The most events one sync may cover. A filter matching more is refused.
 #negentropy_max_events = 1000000
 
-## Web of trust and ranking
+###############################################################################
+# Web of trust and ranking
+###############################################################################
 
 # Hex pubkeys the web of trust is rooted at. Defaults to pubkey's, if set;
 # [] turns it off.
@@ -151,7 +171,9 @@ url = "wss://relay.example.com/"
 # rescored.
 #rank_step = 0.05
 
-## Write policy
+###############################################################################
+# Write policy
+###############################################################################
 
 # A strfry write policy plugin's command, run with sh -c.
 #write_policy_plugin = "/usr/local/bin/my-plugin"
@@ -159,7 +181,9 @@ url = "wss://relay.example.com/"
 # How long the plugin may take to answer before it's restarted.
 #write_policy_timeout_seconds = 10
 
-## Tor
+###############################################################################
+# Tor
+###############################################################################
 
 # Serve the relay as a Tor onion service too, with Tor built in: there's
 # nothing else to install. The onion's address is logged at startup, and its
