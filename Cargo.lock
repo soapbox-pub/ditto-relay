@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "arti-client"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -532,7 +532,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "caret"
 version = "0.11.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 
 [[package]]
 name = "cc"
@@ -1028,7 +1028,7 @@ checksum = "36e10ac4bd47bf8d24a4852f001df23b7acbbca6e59d0adec0c2e2c4409dfe5b"
 dependencies = [
  "heck",
  "indexmap 2.14.2",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -1380,7 +1380,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "equix"
 version = "0.8.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "arrayvec",
  "hashx",
@@ -1553,7 +1553,7 @@ dependencies = [
 [[package]]
 name = "fs-mistrust"
 version = "0.16.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive_builder_fork_arti",
  "dirs",
@@ -1579,7 +1579,7 @@ dependencies = [
 [[package]]
 name = "fslock-guard"
 version = "0.9.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
@@ -1832,7 +1832,7 @@ dependencies = [
 [[package]]
 name = "hashx"
 version = "0.10.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "arrayvec",
  "blake2",
@@ -2742,7 +2742,7 @@ checksum = "269bca4c2591a28585d6bf10d9ed0332b7d76900a1b02bec41bdc3a2cdcda107"
 [[package]]
 name = "oneshot-fused-workaround"
 version = "0.8.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "futures",
 ]
@@ -3401,7 +3401,7 @@ dependencies = [
 [[package]]
 name = "retry-error"
 version = "0.14.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "humantime",
  "web-time",
@@ -3575,7 +3575,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "safelog"
 version = "0.10.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive_more",
  "educe",
@@ -3605,7 +3605,7 @@ dependencies = [
 [[package]]
 name = "saturating-time"
 version = "0.5.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "web-time-compat",
 ]
@@ -3967,7 +3967,7 @@ dependencies = [
 [[package]]
 name = "slotmap-careful"
 version = "0.9.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "paste",
  "serde",
@@ -4606,7 +4606,7 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 [[package]]
 name = "tor-async-utils"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "cfg-if",
  "derive-deftly",
@@ -4631,7 +4631,7 @@ dependencies = [
 [[package]]
 name = "tor-basic-utils"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive-deftly",
  "derive_more",
@@ -4656,7 +4656,7 @@ dependencies = [
 [[package]]
 name = "tor-bytes"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "bytes",
  "derive-deftly",
@@ -4673,7 +4673,7 @@ dependencies = [
 [[package]]
 name = "tor-cell"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "bitflags 2.13.2",
@@ -4703,7 +4703,7 @@ dependencies = [
 [[package]]
 name = "tor-cert"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "caret",
  "derive_builder_fork_arti",
@@ -4720,7 +4720,7 @@ dependencies = [
 [[package]]
 name = "tor-chanmgr"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -4762,7 +4762,7 @@ dependencies = [
 [[package]]
 name = "tor-checkable"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "humantime",
  "itertools 0.15.0",
@@ -4775,7 +4775,7 @@ dependencies = [
 [[package]]
 name = "tor-circmgr"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "async-trait",
@@ -4824,7 +4824,7 @@ dependencies = [
 [[package]]
 name = "tor-config"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "cfg-if",
@@ -4858,7 +4858,7 @@ dependencies = [
 [[package]]
 name = "tor-config-path"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "directories",
  "serde",
@@ -4871,7 +4871,7 @@ dependencies = [
 [[package]]
 name = "tor-consdiff"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive_more",
  "digest 0.10.7",
@@ -4887,7 +4887,7 @@ dependencies = [
 [[package]]
 name = "tor-dirclient"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "async-compression",
  "base64ct",
@@ -4914,7 +4914,7 @@ dependencies = [
 [[package]]
 name = "tor-dircommon"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "base64ct",
  "derive-deftly",
@@ -4934,7 +4934,7 @@ dependencies = [
 [[package]]
 name = "tor-dirmgr"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -4990,7 +4990,7 @@ dependencies = [
 [[package]]
 name = "tor-error"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive_more",
  "futures",
@@ -5007,7 +5007,7 @@ dependencies = [
 [[package]]
 name = "tor-general-addr"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive_more",
  "thiserror 2.0.21",
@@ -5017,7 +5017,7 @@ dependencies = [
 [[package]]
 name = "tor-guardmgr"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "base64ct",
@@ -5060,7 +5060,7 @@ dependencies = [
 [[package]]
 name = "tor-hsclient"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -5105,7 +5105,7 @@ dependencies = [
 [[package]]
 name = "tor-hscrypto"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "arrayvec",
  "blake2",
@@ -5140,7 +5140,7 @@ dependencies = [
 [[package]]
 name = "tor-hsservice"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "arrayvec",
@@ -5202,7 +5202,7 @@ dependencies = [
 [[package]]
 name = "tor-key-forge"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive-deftly",
  "derive_more",
@@ -5223,7 +5223,7 @@ dependencies = [
 [[package]]
 name = "tor-keymgr"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "arrayvec",
@@ -5264,7 +5264,7 @@ dependencies = [
 [[package]]
 name = "tor-linkspec"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "base64ct",
  "by_address",
@@ -5290,7 +5290,7 @@ dependencies = [
 [[package]]
 name = "tor-llcrypto"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "aes",
  "base64ct",
@@ -5332,7 +5332,7 @@ dependencies = [
 [[package]]
 name = "tor-log-ratelim"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "futures",
  "humantime",
@@ -5347,7 +5347,7 @@ dependencies = [
 [[package]]
 name = "tor-memquota"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "cfg-if",
  "derive-deftly",
@@ -5378,7 +5378,7 @@ dependencies = [
 [[package]]
 name = "tor-memquota-cost"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive-deftly",
  "itertools 0.15.0",
@@ -5389,7 +5389,7 @@ dependencies = [
 [[package]]
 name = "tor-netdir"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -5421,7 +5421,7 @@ dependencies = [
 [[package]]
 name = "tor-netdoc"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "base64ct",
@@ -5473,7 +5473,7 @@ dependencies = [
 [[package]]
 name = "tor-persist"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "derive-deftly",
@@ -5501,7 +5501,7 @@ dependencies = [
 [[package]]
 name = "tor-proto"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "aes",
  "amplify",
@@ -5569,7 +5569,7 @@ dependencies = [
 [[package]]
 name = "tor-protover"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "caret",
  "derive-deftly",
@@ -5583,7 +5583,7 @@ dependencies = [
 [[package]]
 name = "tor-relay-selection"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "rand 0.10.3",
  "serde",
@@ -5596,7 +5596,7 @@ dependencies = [
 [[package]]
 name = "tor-rtcompat"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "async-trait",
@@ -5632,7 +5632,7 @@ dependencies = [
 [[package]]
 name = "tor-rtmock"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "amplify",
  "assert_matches",
@@ -5661,7 +5661,7 @@ dependencies = [
 [[package]]
 name = "tor-socksproto"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "caret",
  "derive-deftly",
@@ -5676,7 +5676,7 @@ dependencies = [
 [[package]]
 name = "tor-units"
 version = "0.47.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "derive-deftly",
  "derive_more",
@@ -6086,7 +6086,7 @@ dependencies = [
 [[package]]
 name = "web-time-compat"
 version = "0.3.0"
-source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#e079ac197c7da16cd985f012927e2ed1996fff57"
+source = "git+https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git?branch=soapbox-v2.7.0#8ddedecd3a38b5c123c869807184fc29c2df4e80"
 dependencies = [
  "web-time",
 ]
