@@ -35,8 +35,8 @@ trap 'rm -rf "$stage"' EXIT
 # /var/lib/ditto-relay, which the ditto-relay user's default wouldn't be. url
 # is commented out, so the service refuses to start until it is set.
 sed 's|/usr/local/bin/ditto-relay|/usr/bin/ditto-relay|g' contrib/ditto-relay.service > "$stage/ditto-relay.service"
-sed -e 's|^url = \(.*\)$|# url = \1|' \
-    -e 's|^# data_dir = "/var/lib/ditto-relay"$|data_dir = "/var/lib/ditto-relay"|' \
+sed -e 's|^url = \(.*\)$|#url = \1|' \
+    -e 's|^#data_dir = "/var/lib/ditto-relay"$|data_dir = "/var/lib/ditto-relay"|' \
     ditto-relay.example.toml > "$stage/ditto-relay.toml"
 if ! grep -qx 'ExecStart=/usr/bin/ditto-relay --config /etc/ditto-relay/ditto-relay.toml' "$stage/ditto-relay.service" \
     || grep -q '^url' "$stage/ditto-relay.toml" \
