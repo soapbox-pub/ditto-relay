@@ -4,6 +4,25 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [2.3.0]
+
+- The relay makes its own key the first time it starts, in `secret.key` in
+  `data_dir` unless `secret_key_file` says otherwise, so NIP-85 assertions,
+  trending labels, and NIP-11's `self` work without setting anything up.
+  `ditto-relay check` says which key it would use, or that one would be made,
+  without making it. **A relay that had no `secret_key_file` now serves all
+  three**; `nip85 = false` turns the assertions off, and `trends_interval = 0`
+  the labels.
+- NIP-11's `software` is the relay's homepage,
+  `https://gitworkshop.dev/soapbox.pub/ditto-relay`, as the spec requires,
+  rather than its name. `software`, `icon` and `banner` can be set to other
+  URLs, or to `""` to leave them out.
+- The relay's page sends all three CORS headers NIP-11 requires, and answers
+  preflight `OPTIONS` requests, which got a 405.
+- The example config sets settings off from their descriptions: settings are
+  commented out with `#`, descriptions with `# `, and sections have banners.
+  Its `pubkey` is a placeholder rather than a real key.
+
 ## [2.2.0]
 
 - NIP-77 negentropy syncing, so strfry (`strfry sync`), `nak sync`, and other
