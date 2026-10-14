@@ -2,9 +2,10 @@
 # the first of ~/.config/ditto-relay/ditto-relay.toml and
 # /etc/ditto-relay/ditto-relay.toml.
 #
-# Only url is required; the rest are shown with their defaults, commented out
-# with "#" where their descriptions have "# ". A key the relay doesn't know is
-# refused. Relative paths are relative to this file.
+# Only url is required; the rest are shown with their defaults, or with an
+# example where one is unset by default, commented out with "#" where their
+# descriptions have "# ". A key the relay doesn't know is refused. Relative
+# paths are relative to this file.
 
 ###############################################################################
 # General
@@ -56,9 +57,12 @@ url = "wss://relay.example.com/"
 
 #description = ""
 
-# The operator's pubkey, in hex.
-#pubkey = "0461fcbecc4c3374439932d6b8f11269ccdb7cc973ad7a50ae362db135a474dd"
+# The operator's pubkey, in 64 lowercase hex, which the web of trust is also
+# rooted at unless wot_seeds says otherwise. Unset by default.
+#pubkey = "<your pubkey in hex>"
 
+# Another way to reach the operator, such as an email or a web page. Unset by
+# default.
 #contact = "mailto:admin@example.com"
 
 # The relay software's homepage. "" leaves it out.
@@ -175,7 +179,7 @@ url = "wss://relay.example.com/"
 # Write policy
 ###############################################################################
 
-# A strfry write policy plugin's command, run with sh -c.
+# A strfry write policy plugin's command, run with sh -c. Unset by default.
 #write_policy_plugin = "/usr/local/bin/my-plugin"
 
 # How long the plugin may take to answer before it's restarted.
