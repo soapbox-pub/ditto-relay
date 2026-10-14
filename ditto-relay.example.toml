@@ -78,10 +78,14 @@ url = "wss://relay.example.com/"
 # The relay's key
 ###############################################################################
 
-# A file holding the relay's secret key in 64 lowercase hex. It signs the
-# NIP-85 assertions the relay serves and the trends it labels; unset turns
-# them off.
-#secret_key_file = "secret.key"
+# A file holding the relay's secret key in 64 lowercase hex, which signs the
+# NIP-85 assertions the relay serves and the trends it labels, and is given as
+# "self" in NIP-11. Made, with a new key, if it doesn't exist: back it up to
+# keep the relay's identity. Defaults to secret.key in data_dir.
+#secret_key_file = "/var/lib/ditto-relay/secret.key"
+
+# Whether NIP-85 trusted assertions are served.
+#nip85 = true
 
 # How many seconds apart trends are labeled. 0 turns them off.
 #trends_interval = 900

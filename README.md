@@ -62,7 +62,8 @@ Configuration is a TOML file, read from the path `--config` names, or else the f
 of `~/.config/ditto-relay/ditto-relay.toml` and `/etc/ditto-relay/ditto-relay.toml`.
 [`ditto-relay.example.toml`](ditto-relay.example.toml) lists every setting with its
 default; only `url` is required. Data is stored in `data_dir`, by default
-`~/.local/share/ditto-relay` (`/var/lib/ditto-relay` as root). `ditto-relay check`
+`~/.local/share/ditto-relay` (`/var/lib/ditto-relay` as root), along with the relay's
+own key, `secret.key`, which is made the first time it starts. `ditto-relay check`
 says whether a configuration is valid, and what it would serve, without starting the
 relay or opening its database.
 

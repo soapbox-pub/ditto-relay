@@ -9,7 +9,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
-use secp256k1::Keypair;
 use serde::Deserialize;
 
 use crate::event::decode_hex;
@@ -56,9 +55,11 @@ pub struct Config {
     pub software: Option<String>,
     pub icon: Image,
     pub banner: Image,
-    /// The relay's own key, which signs the NIP-85 assertions it serves
-    /// and the trends it labels. None turns them off.
-    pub keypair: Option<Keypair>,
+    /// Where the relay's own key is kept, which signs the NIP-85 assertions
+    /// it serves and the trends it labels. Made if it's missing.
+    pub secret_key_file: PathBuf,
+    /// Whether NIP-85 assertions are served.
+    pub nip85: bool,
     /// How many seconds apart trends are labeled. 0 turns them off.
     pub trends_interval: u64,
     /// How many seconds a trend label is kept.
@@ -190,6 +191,7 @@ struct File {
     icon: Option<String>,
     banner: Option<String>,
     secret_key_file: Option<PathBuf>,
+    nip85: Option<bool>,
     trends_interval: Option<u64>,
     trends_expiration: Option<u32>,
     max_message_size: Option<usize>,
@@ -360,23 +362,9 @@ impl Config {
             Some(path) => resolve(path),
             None => env.default_data_dir()?,
         };
-        let keypair = match file.secret_key_file {
-            Some(path) => {
-                let path = resolve(path);
-                let key = std::fs::read_to_string(&path)
-                    .with_context(|| format!("couldn't read secret_key_file {}", path.display()))?;
-                Some(
-                    decode_hex(key.trim())
-                        .and_then(|key| Keypair::from_secret_bytes(key).ok())
-                        .with_context(|| {
-                            format!(
-                                "{} must hold a secret key in 64 lowercase hex",
-                                path.display()
-                            )
-                        })?,
-                )
-            }
-            None => None,
+        let secret_key_file = match file.secret_key_file {
+            Some(path) => resolve(path),
+            None => data_dir.join("secret.key"),
         };
         // Checked when it's off too, so turning it on can't be what finds a
         // mistake.
@@ -438,7 +426,8 @@ impl Config {
             software,
             icon,
             banner,
-            keypair,
+            secret_key_file,
+            nip85: file.nip85.unwrap_or(true),
             trends_interval: file.trends_interval.unwrap_or(900),
             // A week of sparklines, and a day to spare.
             trends_expiration: file.trends_expiration.unwrap_or(8 * 86_400),
@@ -546,7 +535,11 @@ mod tests {
             c.search_path,
             Path::new("/home/someone/.local/share/ditto-relay/search")
         );
-        assert!(c.keypair.is_none());
+        assert_eq!(
+            c.secret_key_file,
+            Path::new("/home/someone/.local/share/ditto-relay/secret.key")
+        );
+        assert!(c.nip85);
         assert!(c.wot_seeds.is_empty());
         assert_eq!(c.indexed_tags, ["proxy", "client", "content-warning"]);
         assert!(c.tor.is_none());
@@ -627,20 +620,15 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_secret_key_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = "0000000000000000000000000000000000000000000000000000000000000001";
-        std::fs::write(dir.path().join("secret.key"), format!("{key}\n")).unwrap();
-        std::fs::write(
-            dir.path().join("ditto-relay.toml"),
-            "url = \"ws://x\"\nsecret_key_file = \"secret.key\"",
-        )
-        .unwrap();
-        let c = Config::load(Some(&dir.path().join("ditto-relay.toml")), &env()).unwrap();
-        assert!(c.keypair.is_some());
-
-        std::fs::write(dir.path().join("secret.key"), "nope").unwrap();
-        assert!(Config::load(Some(&dir.path().join("ditto-relay.toml")), &env()).is_err());
+    fn the_secret_key_is_kept_with_the_data() {
+        let c = config("url = \"ws://x\"\ndata_dir = \"data\"").unwrap();
+        assert_eq!(
+            c.secret_key_file,
+            Path::new("/etc/ditto-relay/data/secret.key")
+        );
+        let c = config("url = \"ws://x\"\nsecret_key_file = \"k\"\nnip85 = false").unwrap();
+        assert_eq!(c.secret_key_file, Path::new("/etc/ditto-relay/k"));
+        assert!(!c.nip85);
     }
 
     #[test]

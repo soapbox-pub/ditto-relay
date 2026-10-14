@@ -16,7 +16,7 @@ use ditto_relay::search::SearchIndex;
 use ditto_relay::store::{History, IndexedTags, Store};
 use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
-use ditto_relay::{control, delete, facets, metrics, relay, trends};
+use ditto_relay::{control, delete, facets, key, metrics, relay, trends};
 
 const USAGE: &str = "usage: ditto-relay [--config <path>] \
                      [check | delete [--filter <json>] [--age <seconds>] [--dry-run]]";
@@ -91,6 +91,12 @@ fn store_settings(config: &Config) -> anyhow::Result<(IndexedTags, History, Opti
 fn check(config: &Config) -> anyhow::Result<()> {
     println!("url: {}", config.url);
     println!("database: {}", config.db_path.display());
+    let path = config.secret_key_file.display();
+    match key::read(&config.secret_key_file)? {
+        Some(keypair) => println!("key: {}, in {path}", key::pubkey(&keypair)),
+        None => println!("key: a new one to be made in {path}"),
+    }
+    println!("nip85: {}", if config.nip85 { "on" } else { "off" });
     match &config.tor {
         Some(tor) => match OnionKey::read(&tor.key_file)? {
             Some(key) => println!(
@@ -207,6 +213,8 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
 
     // Read, or made, before anything is served, so a key that's no good
     // stops the relay rather than leaving it without its onion.
+    let keypair = key::open(&config.secret_key_file)?;
+    tracing::info!("the relay's pubkey is {}", key::pubkey(&keypair));
     let onion = match &config.tor {
         Some(tor_config) => Some((tor_config.clone(), OnionKey::open(&tor_config.key_file)?)),
         None => None,
@@ -214,7 +222,7 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
     let onion_url = onion
         .as_ref()
         .map(|(tor_config, key)| tor::url(&key.address, tor_config.port));
-    let state = AppState::new(config, store, search, onion_url);
+    let state = AppState::new(config, keypair, store, search, onion_url);
     let socket = control::socket_path(&state.config.db_path);
     let control = control::serve(
         &socket,

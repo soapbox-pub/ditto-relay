@@ -15,6 +15,7 @@ use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use secp256k1::Keypair;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
@@ -26,7 +27,6 @@ use crate::auth;
 use crate::config::{Config, Image};
 use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
-use crate::landing;
 use crate::metrics::{Connected, METRICS};
 use crate::negentropy::{self, Item, Items, Negentropy};
 use crate::plugin::{self, Peer, Plugin, Verdict};
@@ -34,6 +34,7 @@ use crate::query::{self, Cancelled, Count, Results, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
+use crate::{key, landing};
 use monitors::{ConnId, Hub, Link, Live, Outbound};
 
 mod monitors;
@@ -41,6 +42,9 @@ mod monitors;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    /// The relay's own key, which signs the NIP-85 assertions it serves and
+    /// the trends it labels.
+    pub keypair: Keypair,
     pub store: Arc<Store>,
     pub writer: Writer,
     /// For NIP-50 search, if it's on.
@@ -79,8 +83,8 @@ struct Pages {
 
 impl Pages {
     /// For the relay at `url`, whose images are at `public_url`.
-    fn new(config: &Config, url: &str, public_url: &str) -> Self {
-        let info = nip11(config, public_url);
+    fn new(config: &Config, keypair: &Keypair, url: &str, public_url: &str) -> Self {
+        let info = nip11(config, keypair, public_url);
         Self {
             landing: landing::render(&info, url).into(),
             nip11: info.to_string().into(),
@@ -89,22 +93,24 @@ impl Pages {
 }
 
 impl AppState {
-    /// With `search`, the index and the channel to its indexer, and with
-    /// `onion`, the URL of the relay's onion service.
+    /// With the relay's own `keypair`, with `search`, the index and the
+    /// channel to its indexer, and with `onion`, the URL of the relay's
+    /// onion service.
     pub fn new(
         config: Config,
+        keypair: Keypair,
         store: Arc<Store>,
         search: Option<(Arc<SearchIndex>, std::sync::mpsc::Sender<Vec<u64>>)>,
         onion: Option<String>,
     ) -> Self {
         let (search, indexer) = search.unzip();
-        let clearnet = Pages::new(&config, &config.url, &config.public_url);
+        let clearnet = Pages::new(&config, &keypair, &config.url, &config.public_url);
         // Images on the onion come from the onion, not from clearnet.
         let onion_http = onion.as_ref().map(|url| url.replacen("ws", "http", 1));
         let onion_pages = onion
             .as_deref()
             .zip(onion_http.as_deref())
-            .map(|(url, http)| Arc::new(Pages::new(&config, url, http)));
+            .map(|(url, http)| Arc::new(Pages::new(&config, &keypair, url, http)));
         // Tor Browser only heeds the header over HTTPS.
         let advertise = config.tor.as_ref().is_some_and(|tor| tor.onion_location)
             && config.public_url.starts_with("https://");
@@ -133,6 +139,7 @@ impl AppState {
             onion: onion_pages,
             onion_location,
             config: Arc::new(config),
+            keypair,
             writer: Writer::spawn(store.clone(), indexer, stored),
             store,
             search,
@@ -303,8 +310,8 @@ fn client_ip(config: &Config, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     ip.unwrap_or(peer.ip())
 }
 
-/// For the relay whose images are at `public_url`.
-fn nip11(config: &Config, public_url: &str) -> Value {
+/// For the relay whose key is `keypair` and whose images are at `public_url`.
+fn nip11(config: &Config, keypair: &Keypair, public_url: &str) -> Value {
     let mut nips = vec![1, 9, 11, 40, 42, 45, 62, 70];
     if config.search {
         nips.push(50);
@@ -352,10 +359,8 @@ fn nip11(config: &Config, public_url: &str) -> Value {
             Image::None => {}
         }
     }
-    // The key its NIP-85 assertions are signed with.
-    if let Some(keypair) = &config.keypair {
-        info["self"] = hex::encode(keypair.x_only_public_key().0.to_byte_array()).into();
-    }
+    // The key its NIP-85 assertions and trends are signed with.
+    info["self"] = key::pubkey(keypair).into();
     info
 }
 
@@ -855,7 +860,7 @@ impl Connection {
                 query::run(
                     &store,
                     search.as_deref(),
-                    config.keypair.as_ref(),
+                    config.nip85.then_some(&state.keypair),
                     &filters,
                     config.default_limit,
                     config.max_limit,

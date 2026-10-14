@@ -231,12 +231,9 @@ pub fn labels(
         .collect())
 }
 
-/// Label trends now and every configured interval after, if the relay
-/// has a key to sign them with.
+/// Label trends now and every configured interval after, unless that's 0.
 pub fn spawn(state: AppState) {
-    let Some(keypair) = state.config.keypair else {
-        return;
-    };
+    let keypair = state.keypair;
     if state.config.trends_interval == 0 {
         return;
     }

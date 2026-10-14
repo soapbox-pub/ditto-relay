@@ -39,7 +39,8 @@ fn config() -> Config {
         software: Some(crate::landing::REPOSITORY.into()),
         icon: Image::Builtin,
         banner: Image::Builtin,
-        keypair: None,
+        secret_key_file: PathBuf::new(),
+        nip85: true,
         trends_interval: 0,
         trends_expiration: 0,
         max_message_size: 1 << 20,
@@ -98,7 +99,14 @@ impl Relay {
     /// on a port of its own, as it would be on Tor's streams.
     async fn start_onion(config: Config, onion: Option<&str>) -> Relay {
         let (dir, store) = store::tests::open();
-        let state = AppState::new(config, Arc::new(store), None, onion.map(String::from));
+        let keypair = secp256k1::Keypair::from_secret_bytes([1; 32]).unwrap();
+        let state = AppState::new(
+            config,
+            keypair,
+            Arc::new(store),
+            None,
+            onion.map(String::from),
+        );
         let onion = match onion {
             Some(_) => {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -518,6 +526,25 @@ done
     );
     let ok = client.next().await;
     assert_eq!(ok, json!(["OK", ev.id, true, ""]));
+}
+
+#[tokio::test]
+async fn nip85_can_be_turned_off() {
+    for nip85 in [true, false] {
+        let relay = Relay::start_with(Config { nip85, ..config() }).await;
+        let mut client = relay.connect().await;
+        let ev = note(2, "hello");
+        client.publish(&ev).await;
+        let relay_pubkey = crate::key::pubkey(&relay.state.keypair);
+        let filter = json!({"kinds": [30382], "authors": [relay_pubkey], "#d": [ev.pubkey]});
+        let found = client.req("a", &[filter]).await;
+        assert_eq!(found.len(), usize::from(nip85), "nip85 = {nip85}");
+
+        // The key is the relay's all the same.
+        let (_, body) = get(relay.addr, "application/nostr+json").await;
+        let info: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["self"], relay_pubkey);
+    }
 }
 
 #[tokio::test]

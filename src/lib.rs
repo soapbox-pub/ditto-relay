@@ -10,6 +10,7 @@ pub mod event;
 pub mod facets;
 pub mod filter;
 pub mod hll;
+pub mod key;
 pub mod landing;
 pub mod lmdb;
 pub mod metrics;
