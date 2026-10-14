@@ -135,10 +135,14 @@ impl Relay {
 /// What a GET of `/` at `addr` that accepts `accept` is answered with: its
 /// head, lowercased, and its body.
 async fn get(addr: SocketAddr, accept: &str) -> (String, String) {
+    request(addr, "GET", accept).await
+}
+
+async fn request(addr: SocketAddr, method: &str, accept: &str) -> (String, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let request =
-        format!("GET / HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nConnection: close\r\n\r\n");
+        format!("{method} / HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).await.unwrap();
@@ -519,10 +523,21 @@ done
 #[tokio::test]
 async fn nip11_links_the_configured_images() {
     let relay = Relay::start().await;
-    let (_, body) = get(relay.addr, "application/nostr+json").await;
+    let (head, body) = get(relay.addr, "application/nostr+json").await;
     let info: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(info["software"], crate::landing::REPOSITORY);
     assert_eq!(info["banner"], "http://relay.test/banner.jpg");
+    let (preflight, _) = request(relay.addr, "OPTIONS", "*/*").await;
+    for head in [head, preflight] {
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        for cors in [
+            "access-control-allow-origin: *",
+            "access-control-allow-headers: *",
+            "access-control-allow-methods: get, options",
+        ] {
+            assert!(head.contains(cors), "{head}");
+        }
+    }
 
     let relay = Relay::start_with(Config {
         software: None,

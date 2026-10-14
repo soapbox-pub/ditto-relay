@@ -182,7 +182,7 @@ pub fn router(state: AppState) -> Router {
         get(move || async move { ([(header::CONTENT_TYPE, content_type)], body) })
     };
     Router::new()
-        .route("/", get(root))
+        .route("/", get(root).options(|| async { CORS }))
         .route("/favicon.ico", asset("image/x-icon", landing::FAVICON))
         .route("/icon.png", asset("image/png", landing::ICON))
         .route("/banner.jpg", asset("image/jpeg", landing::BANNER))
@@ -218,6 +218,14 @@ impl<S: Send + Sync> FromRequestParts<S> for Via {
         Ok(Via::Socket(peer))
     }
 }
+
+/// What NIP-11 has the relay's page answer browsers on any origin with,
+/// and a preflight too.
+const CORS: [(header::HeaderName, &str); 3] = [
+    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+    (header::ACCESS_CONTROL_ALLOW_HEADERS, "*"),
+    (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"),
+];
 
 /// How much of a connection's read buffer is filled at a time. tungstenite
 /// zeroes all of it before every read, and messages are mostly a few hundred
@@ -259,20 +267,16 @@ async fn root(
         .is_some_and(|v| v.contains("application/nostr+json"));
     if wants_nip11 {
         return (
-            [
-                (header::CONTENT_TYPE, "application/nostr+json"),
-                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-            ],
+            CORS,
+            [(header::CONTENT_TYPE, "application/nostr+json")],
             pages.nip11.to_string(),
         )
             .into_response();
     }
 
     let mut response = (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-        ],
+        CORS,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         pages.landing.to_string(),
     )
         .into_response();
