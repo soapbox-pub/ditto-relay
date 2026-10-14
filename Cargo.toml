@@ -20,7 +20,6 @@ libc = "0.2.190"
 # Raw LMDB, wrapped in src/lmdb.rs. heed can't seek or count within a key's
 # sorted duplicates, which the indexes are built on.
 lmdb-master-sys = "0.2.6"
-negentropy = "0.5.1"
 # The TLS Arti speaks to Tor relays with, which leaves choosing its
 # cryptography to the application.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

@@ -13,6 +13,7 @@ pub mod hll;
 pub mod landing;
 pub mod lmdb;
 pub mod metrics;
+pub mod negentropy;
 pub mod nip85;
 pub mod plugin;
 pub mod query;

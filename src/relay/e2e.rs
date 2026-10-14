@@ -583,17 +583,14 @@ async fn serves_the_onion_as_the_onion() {
 /// match `filter`. What the client has that the relay doesn't, and what
 /// the relay has that the client doesn't, by id.
 async fn sync(client: &mut Client, filter: Value, mine: &[Event]) -> (Vec<String>, Vec<String>) {
-    use negentropy::{Id, Negentropy, NegentropyStorageVector};
-    let mut storage = NegentropyStorageVector::new();
-    for ev in mine {
-        let id = event::decode_hex(&ev.id).unwrap();
-        storage
-            .insert(ev.created_at, Id::from_byte_array(id))
-            .unwrap();
-    }
-    storage.seal().unwrap();
-    let mut neg = Negentropy::borrowed(&storage, 0).unwrap();
-    let msg = hex::encode(neg.initiate().unwrap());
+    use crate::negentropy::{Item, Items, Negentropy};
+    let items = mine.iter().map(|ev| Item {
+        timestamp: ev.created_at,
+        id: event::decode_hex(&ev.id).unwrap(),
+    });
+    let items = Items::new(items.collect());
+    let mut neg = Negentropy::new(&items, 0);
+    let msg = hex::encode(neg.initiate());
     client.send(json!(["NEG-OPEN", "s", filter, msg])).await;
     let (mut have, mut need) = (vec![], vec![]);
     loop {
@@ -611,8 +608,8 @@ async fn sync(client: &mut Client, filter: Value, mine: &[Event]) -> (Vec<String
         }
     }
     client.send(json!(["NEG-CLOSE", "s"])).await;
-    let hex = |ids: Vec<Id>| {
-        let mut ids: Vec<String> = ids.iter().map(|id| hex::encode(id.as_bytes())).collect();
+    let hex = |ids: Vec<[u8; 32]>| {
+        let mut ids: Vec<String> = ids.iter().map(hex::encode).collect();
         ids.sort();
         ids
     };
