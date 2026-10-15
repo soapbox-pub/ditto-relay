@@ -106,7 +106,6 @@
 //! forget, so one counts authors whose events have since gone too.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -166,10 +165,6 @@ const PREFETCH_CHUNK: usize = if cfg!(test) { 2 } else { 32 };
 
 /// The most threads [`Store::read_ahead`] reads on.
 const PREFETCH_THREADS: usize = 8;
-
-/// The threads [`Store::prefetch_removals`] reads on. The store is mostly
-/// on disk and the disks take many reads at once.
-const REMOVAL_PREFETCH_THREADS: usize = 32;
 
 /// LMDB's page size, as far as reading a record's every page goes.
 const PAGE: usize = 4096;
@@ -859,59 +854,6 @@ impl Store {
             }
         }
         rank::prefetch(self, txn, &view)
-    }
-
-    /// Read, in a read transaction, what [`remove`](Self::remove)ing a
-    /// stored event will, as [`prefetch`](Self::prefetch) does for
-    /// inserting one. The old versions a removal takes along, and the one
-    /// it makes current, aren't read ahead.
-    pub fn prefetch_removal(&self, txn: &Txn, seq: u64) -> Result<()> {
-        let Some(view) = self.stored(txn, seq)? else {
-            return Ok(());
-        };
-        let t = self.tables;
-        let at = stamp(view.created_at(), seq);
-        let seek = |db: Db, key: &[u8], entry: &[u8]| -> Result<()> {
-            txn.cursor(db)?.get_both_range(key, entry).map(drop)
-        };
-        txn.get(t.ids, view.id())?;
-        seek(t.created, CREATED, &at)?;
-        seek(t.authors, view.pubkey(), &kinded(&at, view.kind()))?;
-        for (db, key) in self.index_keys(&view) {
-            seek(db, &key, &at)?;
-        }
-        if let Some(address) = address_of(&view) {
-            self.replaceable_seq(txn, &address)?;
-            seek(t.history, &address, &at)?;
-        }
-        if let Some(expiration) = view.expiration() {
-            seek(t.expiring, EXPIRING, &stamp(expiration, seq))?;
-        }
-        rank::prefetch(self, txn, &view)
-    }
-
-    /// [`prefetch_removal`](Self::prefetch_removal) of each of `seqs`, on
-    /// several threads at once, each in a read transaction of its own.
-    pub fn prefetch_removals(&self, seqs: &[u64]) {
-        let threads = REMOVAL_PREFETCH_THREADS.min(seqs.len());
-        let Some(chunk) = seqs.len().checked_div(threads) else {
-            return;
-        };
-        std::thread::scope(|scope| {
-            for seqs in seqs.chunks(chunk + 1) {
-                scope.spawn(move || {
-                    let Ok(txn) = self.read() else {
-                        return;
-                    };
-                    for &seq in seqs {
-                        if let Err(err) = self.prefetch_removal(&txn, seq) {
-                            tracing::debug!("prefetching a removal failed: {err}");
-                            return;
-                        }
-                    }
-                });
-            }
-        });
     }
 
     /// Offer an encoded event to the store at `now`, applying replacement,
@@ -1872,21 +1814,11 @@ pub enum Deleting {
 /// writer's other work.
 struct Deletion {
     filter: Filter,
-    seqs: Arc<[u64]>,
+    seqs: Vec<u64>,
     /// How far through `seqs` it's got.
     next: usize,
     deleted: usize,
     progress: tokio::sync::mpsc::UnboundedSender<Deleting>,
-    /// `next`, for its [read-ahead](delete::read_ahead).
-    done: Arc<AtomicUsize>,
-    /// Stops its read-ahead.
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for Deletion {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
 }
 
 /// Remove the next chunk of `deletion`'s events, and `tell` what went.
@@ -1907,7 +1839,6 @@ fn delete_chunk(store: &Store, deletion: &mut Deletion, tell: &impl Fn(Written))
             tell((Vec::new(), removed));
             deletion.deleted += deleted;
             deletion.next = end;
-            deletion.done.store(end, Ordering::Relaxed);
             let done = end == deletion.seqs.len();
             let _ = deletion.progress.send(match done {
                 true => Deleting::Done(deletion.deleted),
@@ -2107,27 +2038,12 @@ impl Writer {
         seqs: Vec<u64>,
     ) -> tokio::sync::mpsc::UnboundedReceiver<Deleting> {
         let (progress, rx) = tokio::sync::mpsc::unbounded_channel();
-        let seqs: Arc<[u64]> = seqs.into();
-        let done = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let ahead = (self.store.clone(), seqs.clone(), done.clone(), stop.clone());
-        let spawned = std::thread::Builder::new()
-            .name("delete-read-ahead".into())
-            .spawn(move || {
-                let (store, seqs, done, stop) = ahead;
-                delete::read_ahead(&store, &seqs, &done, &stop);
-            });
-        if let Err(err) = spawned {
-            tracing::warn!("deleting without reading ahead: {err}");
-        }
         let deletion = Box::new(Deletion {
             filter,
             seqs,
             next: 0,
             deleted: 0,
             progress,
-            done,
-            stop,
         });
         if let Err(std::sync::mpsc::SendError(Request::Delete(deletion))) =
             self.tx.send(Request::Delete(deletion))

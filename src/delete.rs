@@ -19,9 +19,6 @@
 //! newest left current. Nothing is kept to refuse them if they're
 //! published again, and the relay's subscribers aren't told.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
-
 use anyhow::{Context, bail};
 use serde_json::Value;
 
@@ -33,9 +30,6 @@ use crate::store::{IndexedTags, Store};
 
 /// The most matches removed per write transaction.
 pub const CHUNK: usize = 1000;
-
-/// How many chunks past the one being removed [`read_ahead`] reads.
-const AHEAD: usize = 2;
 
 /// The filter to delete by: `json`, if given, and with `age`, only events
 /// at least that many seconds older than `now`. One of them is needed.
@@ -108,28 +102,6 @@ pub fn remove(
     Ok((deleted, removed))
 }
 
-/// Read ahead of a deletion going through `seqs` a [`CHUNK`] at a time, at
-/// most [`AHEAD`] chunks past the `done` it's through, until it's through
-/// them all or `stop`: so that removing them seldom waits on the disk, as
-/// [`Store::prefetch`] keeps writing from waiting.
-pub fn read_ahead(store: &Store, seqs: &[u64], done: &AtomicUsize, stop: &AtomicBool) {
-    for (i, chunk) in seqs.chunks(CHUNK).enumerate() {
-        while i * CHUNK > done.load(Ordering::Relaxed) + AHEAD * CHUNK {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        // Not if the deletion's got past it already.
-        if (i + 1) * CHUNK > done.load(Ordering::Relaxed) {
-            store.prefetch_removals(chunk);
-        }
-    }
-}
-
 /// Remove every stored event `filter` matches, from a store no running
 /// relay has open, and from its search index, if there's one, telling
 /// `progress` how many so far after each chunk. Returns how many.
@@ -139,27 +111,15 @@ pub fn delete(
     mut indexer: Option<&mut Indexer>,
     mut progress: impl FnMut(usize),
 ) -> anyhow::Result<usize> {
-    let seqs = matching(store, filter)?;
-    let (done, stop) = (AtomicUsize::new(0), AtomicBool::new(false));
-    let deleted = std::thread::scope(|scope| {
-        scope.spawn(|| read_ahead(store, &seqs, &done, &stop));
-        let mut deleted = 0;
-        let mut removing = || -> anyhow::Result<usize> {
-            for (i, chunk) in seqs.chunks(CHUNK).enumerate() {
-                let (n, removed) = remove(store, chunk, filter)?;
-                done.store(i * CHUNK + chunk.len(), Ordering::Relaxed);
-                if let Some(indexer) = indexer.as_deref_mut() {
-                    indexer.remove(&removed);
-                }
-                deleted += n;
-                progress(deleted);
-            }
-            Ok(deleted)
-        };
-        let result = removing();
-        stop.store(true, Ordering::Relaxed);
-        result
-    })?;
+    let mut deleted = 0;
+    for chunk in matching(store, filter)?.chunks(CHUNK) {
+        let (n, removed) = remove(store, chunk, filter)?;
+        if let Some(indexer) = indexer.as_deref_mut() {
+            indexer.remove(&removed);
+        }
+        deleted += n;
+        progress(deleted);
+    }
     if let Some(indexer) = indexer {
         indexer.commit()?;
     }
