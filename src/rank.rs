@@ -2120,12 +2120,21 @@ mod tests {
 
     fn ids(store: &Store, filter: Value) -> Vec<String> {
         let filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
-        crate::query::run(store, None, None, &[filter], 100, 500, &Default::default())
-            .unwrap()
-            .events
-            .iter()
-            .map(|json| serde_json::from_str::<Event>(json).unwrap().id)
-            .collect()
+        crate::query::run(
+            store,
+            None,
+            None,
+            &[filter],
+            100,
+            500,
+            |_| true,
+            &Default::default(),
+        )
+        .unwrap()
+        .events
+        .iter()
+        .map(|json| serde_json::from_str::<Event>(json).unwrap().id)
+        .collect()
     }
 
     fn of(events: &[&Event]) -> Vec<String> {

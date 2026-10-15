@@ -39,8 +39,8 @@ pub struct Config {
     /// makes writes several times faster, but a crash of the machine (not
     /// just the relay) can lose recent writes or corrupt the database.
     pub lmdb_sync: bool,
-    /// The relay's own URL, which NIP-42 authentication (to publish NIP-70
-    /// protected events) and NIP-62 requests to vanish name it by.
+    /// The relay's own URL, which NIP-42 authentication and NIP-62 requests
+    /// to vanish name it by.
     pub url: String,
     /// Where the relay is reached over HTTP(S), which its icon and banner
     /// are linked from.
@@ -83,6 +83,9 @@ pub struct Config {
     pub history_excluded_kinds: Vec<u16>,
     /// The most versions of an address kept, current included.
     pub history_max_versions: usize,
+    /// Kinds only parties to an event may read, once they've authenticated
+    /// (NIP-42): its author, or a pubkey it tags. None by default.
+    pub auth_kinds: Vec<u16>,
     /// Whether NIP-50 search is on.
     pub search: bool,
     pub search_path: PathBuf,
@@ -229,6 +232,7 @@ struct File {
     history: Option<bool>,
     history_excluded_kinds: Option<Vec<u16>>,
     history_max_versions: Option<usize>,
+    auth_kinds: Option<Vec<u16>>,
     search: Option<bool>,
     search_kinds: Option<Vec<u16>>,
     search_commit_ms: Option<u64>,
@@ -531,6 +535,7 @@ impl Config {
                 .history_excluded_kinds
                 .unwrap_or_else(|| vec![30382, 30383, 30384, 30385]),
             history_max_versions: file.history_max_versions.unwrap_or(20),
+            auth_kinds: file.auth_kinds.unwrap_or_default(),
             search: file.search.unwrap_or(true),
             search_path: data_dir.join("search"),
             search_kinds: file
@@ -640,6 +645,7 @@ mod tests {
         assert_eq!(c.indexed_tags, ["proxy", "client", "content-warning"]);
         assert!(c.tor.is_none());
         assert!(c.negentropy);
+        assert!(c.auth_kinds.is_empty());
         assert_eq!(c.software.as_deref(), Some(landing::REPOSITORY));
         assert_eq!((c.icon, c.banner), (Image::Builtin, Image::Builtin));
     }

@@ -552,6 +552,13 @@ impl SearchIndex {
                 .map(|&k| Term::from_field_u64(f.kind, k.into()));
             clauses.push((Occur::Must, any_of(terms.collect())));
         }
+        if !filter.hidden_kinds.is_empty() {
+            let terms = filter
+                .hidden_kinds
+                .iter()
+                .map(|&k| Term::from_field_u64(f.kind, k.into()));
+            clauses.push((Occur::MustNot, any_of(terms.collect())));
+        }
         // Conditions with an exact facet key are looked up, unscored; the
         // rest, and these too, are checked on each hit.
         for condition in &search.conditions {
@@ -1416,8 +1423,16 @@ mod tests {
 
         /// Run a search filter as a REQ would.
         fn search(&self, filter: serde_json::Value) -> Vec<String> {
+            self.search_hiding(filter, &[])
+        }
+
+        /// Run a search filter, with some kinds hidden if it names none.
+        fn search_hiding(&self, filter: serde_json::Value, hidden: &[u16]) -> Vec<String> {
             let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             assert!(filter.search.is_some());
+            if filter.kinds.is_none() {
+                filter.hidden_kinds = hidden.to_vec();
+            }
             self.index.restrict(&mut filter);
             crate::query::run(
                 &self.store,
@@ -1426,6 +1441,7 @@ mod tests {
                 &[filter],
                 100,
                 500,
+                |_| true,
                 &Default::default(),
             )
             .unwrap()
@@ -1622,9 +1638,15 @@ mod tests {
         let count = |filter: serde_json::Value| {
             let mut filter = Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
             f.index.restrict(&mut filter);
-            crate::query::count(&f.store, Some(&f.index), &[filter], &Default::default())
-                .unwrap()
-                .count
+            crate::query::count(
+                &f.store,
+                Some(&f.index),
+                &[filter],
+                |_| true,
+                &Default::default(),
+            )
+            .unwrap()
+            .count
         };
         // Indexed or not yet, but only the searchable kinds.
         assert_eq!(count(json!({"search": "hello"})), 3);
@@ -1905,7 +1927,7 @@ mod tests {
         assert!(excluding("supercalifragilisticexpi").is_empty());
         assert_eq!(excluding("supercalifragilisticky"), [long.id.as_str()]);
 
-        // Any kind, indexed or not yet.
+        // Any kind but hidden ones, indexed or not yet.
         let settings = signed(
             6,
             100,
@@ -1914,12 +1936,14 @@ mod tests {
             "",
         );
         put(&f.store, &settings);
-        let bicy = |f: &Fixture| f.search(autocomplete("bicy")).len();
-        assert_eq!(bicy(&f), 2);
+        let bicy = |f: &Fixture| f.search_hiding(autocomplete("bicy"), &[30078]);
+        assert_eq!(bicy(&f), [listing.id.as_str()]);
+        assert_eq!(f.search(autocomplete("bicy")).len(), 2);
         f.index_all();
-        assert_eq!(bicy(&f), 2);
+        assert_eq!(bicy(&f), [listing.id.as_str()]);
+        assert_eq!(f.search(autocomplete("bicy")).len(), 2);
         let both = json!({"search": "bicy autocomplete:true", "kinds": [30078, 30402]});
-        assert_eq!(f.search(both).len(), 2);
+        assert_eq!(f.search_hiding(both, &[30078]).len(), 2);
     }
 
     /// Random events and `sort:new` searches, plain and autocomplete, some

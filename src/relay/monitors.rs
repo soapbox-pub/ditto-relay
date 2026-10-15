@@ -22,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::Viewer;
 use crate::filter::Filter;
 use crate::metrics::METRICS;
 use crate::record::EventView;
@@ -96,6 +97,7 @@ enum Command {
         conn: ConnId,
         sub: Arc<str>,
         filters: Vec<Filter>,
+        viewer: Option<Viewer>,
         installed: oneshot::Sender<()>,
     },
     Unsubscribe(ConnId, String),
@@ -144,19 +146,23 @@ impl Hub {
         let _ = self.shard(conn).send(Command::Disconnect(conn)).await;
     }
 
-    /// Open a subscription, replacing any of the same id. The receiver
-    /// fires once it's live: every event published after that reaches it.
+    /// Open a subscription, replacing any of the same id, for a connection
+    /// that may see only what `viewer` lets it, if there's one. The
+    /// receiver fires once it's live: every event published after that
+    /// reaches it.
     pub async fn subscribe(
         &self,
         conn: ConnId,
         sub: Arc<str>,
         filters: Vec<Filter>,
+        viewer: Option<Viewer>,
     ) -> oneshot::Receiver<()> {
         let (installed, done) = oneshot::channel();
         let command = Command::Subscribe {
             conn,
             sub,
             filters,
+            viewer,
             installed,
         };
         let _ = self.shard(conn).send(command).await;
@@ -205,6 +211,7 @@ struct Installed {
     conn: ConnId,
     sub: Arc<str>,
     filter: Filter,
+    viewer: Option<Viewer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -276,9 +283,10 @@ impl Monitors {
                 conn,
                 sub,
                 filters,
+                viewer,
                 installed,
             } => {
-                self.subscribe(conn, sub, filters);
+                self.subscribe(conn, sub, filters, viewer);
                 let _ = installed.send(());
             }
             Command::Unsubscribe(conn, sub) => self.unsubscribe(conn, &sub),
@@ -305,7 +313,13 @@ impl Monitors {
     }
 
     /// Open a subscription, replacing any of the same id.
-    fn subscribe(&mut self, conn: ConnId, sub: Arc<str>, filters: Vec<Filter>) {
+    fn subscribe(
+        &mut self,
+        conn: ConnId,
+        sub: Arc<str>,
+        filters: Vec<Filter>,
+        viewer: Option<Viewer>,
+    ) {
         self.unsubscribe(conn, &sub);
         if !self.conns.contains_key(&conn) {
             return;
@@ -333,6 +347,7 @@ impl Monitors {
                 conn,
                 sub: sub.clone(),
                 filter,
+                viewer: viewer.clone(),
             };
             self.filters.insert(key, installed);
             keys.push(key);
@@ -406,7 +421,10 @@ impl Monitors {
             let Some(installed) = self.filters.get(&key) else {
                 continue;
             };
-            if sent.contains(&installed.sub_key) || !installed.filter.matches(event) {
+            if sent.contains(&installed.sub_key)
+                || !installed.filter.matches(event)
+                || installed.viewer.as_ref().is_some_and(|v| !v.may_see(event))
+            {
                 continue;
             }
             let Some(connection) = self.conns.get(&installed.conn) else {
@@ -472,16 +490,16 @@ mod tests {
         let note = signed(1, 100, 1, tags, "");
         let author = &note.pubkey;
         let other = "ab".repeat(32);
-        monitors.subscribe(1, "everything".into(), filters(&[json!({})]));
+        monitors.subscribe(1, "everything".into(), filters(&[json!({})]), None);
         let twice = [json!({"#t": ["a", "b"]}), json!({"authors": [author]})];
-        monitors.subscribe(1, "twice".into(), filters(&twice));
+        monitors.subscribe(1, "twice".into(), filters(&twice), None);
         let kinds = [json!({"kinds": [1], "since": 50})];
-        monitors.subscribe(1, "kinds".into(), filters(&kinds));
+        monitors.subscribe(1, "kinds".into(), filters(&kinds), None);
         let titled = [json!({"#title": ["Hi"], "#t": ["a", "c", "d"]})];
-        monitors.subscribe(1, "titled".into(), filters(&titled));
+        monitors.subscribe(1, "titled".into(), filters(&titled), None);
         let others = [json!({"kinds": [7]}), json!({"ids": [other]})];
-        monitors.subscribe(1, "other".into(), filters(&others));
-        monitors.subscribe(1, "never".into(), filters(&[json!({"authors": []})]));
+        monitors.subscribe(1, "other".into(), filters(&others), None);
+        monitors.subscribe(1, "never".into(), filters(&[json!({"authors": []})]), None);
 
         assert_eq!(deliver(&monitors, &note), 4);
         let mut subs = received(&mut rx);
@@ -491,7 +509,7 @@ mod tests {
         // Closing and replacing take effect.
         monitors.unsubscribe(1, "everything");
         let later = [json!({"kinds": [1], "since": 500})];
-        monitors.subscribe(1, "kinds".into(), filters(&later));
+        monitors.subscribe(1, "kinds".into(), filters(&later), None);
         monitors.unsubscribe(1, "titled");
         assert_eq!(deliver(&monitors, &note), 1);
         assert_eq!(received(&mut rx), ["twice"]);
@@ -509,7 +527,7 @@ mod tests {
         let (link, mut rx, _) = Link::new(16);
         monitors.connect(1, link);
         let search = [json!({"kinds": [1], "search": "hello"})];
-        monitors.subscribe(1, "s".into(), filters(&search));
+        monitors.subscribe(1, "s".into(), filters(&search), None);
         assert_eq!(deliver(&monitors, &signed(1, 100, 1, vec![], "goodbye")), 0);
         assert_eq!(deliver(&monitors, &signed(1, 100, 1, vec![], "Hello!")), 1);
         assert_eq!(received(&mut rx), ["s"]);
@@ -523,7 +541,10 @@ mod tests {
             let (link, rx, _) = Link::new(16);
             hub.connect(conn, link).await;
             let kinds = filters(&[json!({"kinds": [1]})]);
-            hub.subscribe(conn, "s".into(), kinds).await.await.unwrap();
+            hub.subscribe(conn, "s".into(), kinds, None)
+                .await
+                .await
+                .unwrap();
             receivers.push(rx);
         }
         hub.unsubscribe(3, "s").await;
@@ -546,7 +567,7 @@ mod tests {
         }
         // Once the shards have caught up, nothing else came.
         for conn in 1..=3 {
-            hub.subscribe(conn, "sync".into(), vec![])
+            hub.subscribe(conn, "sync".into(), vec![], None)
                 .await
                 .await
                 .unwrap();
@@ -559,7 +580,7 @@ mod tests {
         let mut monitors = Monitors::default();
         let (link, _rx, overflow) = Link::new(1);
         monitors.connect(1, link);
-        monitors.subscribe(1, "s".into(), filters(&[json!({})]));
+        monitors.subscribe(1, "s".into(), filters(&[json!({})]), None);
         deliver(&monitors, &signed(1, 1, 1, vec![], ""));
         assert!(!overflow.is_cancelled());
         deliver(&monitors, &signed(1, 2, 1, vec![], ""));

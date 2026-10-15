@@ -14,6 +14,13 @@ it is tagged.
   everything else is redirected to HTTPS. `ditto-relay check` says when the
   certificate expires. The systemd unit grants `CAP_NET_BIND_SERVICE` for the
   two ports.
+- Kinds can be kept to the parties to an event again, with `auth_kinds`: only
+  its author and the pubkeys it tags may read it, once they've authenticated
+  with NIP-42. Filters naming no kinds don't see them, and events asked for by
+  id are checked one by one. `auth_kinds` is empty by default, so reads stay
+  open to everyone.
+  A connection is challenged to authenticate only once it's refused something
+  for want of it.
 
 ## [2.3.0]
 

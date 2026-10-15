@@ -99,8 +99,10 @@ pub struct Results {
 /// Run a REQ's filters. Each one's limit defaults to `default_limit` and is
 /// capped at `max_limit`. Search filters find nothing without `search`.
 /// With the relay's `keypair`, the [NIP-85](crate::nip85) assertions they
-/// ask it for are made and follow what's stored. Fails with [`Cancelled`]
-/// once `cancel` is.
+/// ask it for are made and follow what's stored. Fails with [`Restricted`]
+/// if an event found isn't `visible`, and with [`Cancelled`] once `cancel`
+/// is.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     store: &Store,
     search: Option<&SearchIndex>,
@@ -108,6 +110,7 @@ pub fn run(
     filters: &[Filter],
     default_limit: u64,
     max_limit: u64,
+    visible: impl Fn(&EventView) -> bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Results> {
     let txn = store.read()?;
@@ -135,6 +138,9 @@ pub fn run(
         let filter = &*window;
         let left = limit - found.len().min(limit);
         for (seq, view) in found {
+            if !visible(&view) {
+                return Err(Restricted.into());
+            }
             if seen.insert(seq) {
                 events.push(view.to_json());
             }
@@ -347,13 +353,16 @@ pub fn every_match(store: &Store, txn: &Txn, filter: &Filter) -> Result<Vec<u64>
 /// The `created_at` and id of every unexpired event a filter matches, for
 /// a NIP-77 sync, with a limit the newest that many. Like
 /// [`every_match`], examines as many records as it takes, but fails with
-/// [`TooExpensive`] past `max` index entries or matches, and with
-/// [`Cancelled`] once `cancel` is. A search's text isn't looked up.
+/// [`TooExpensive`] past `max` index entries or matches, with
+/// [`Restricted`] if an event looked up by id isn't `visible` (others are
+/// hidden already), and with [`Cancelled`] once `cancel` is. A search's
+/// text isn't looked up.
 pub fn every_id(
     store: &Store,
     txn: &Txn,
     filter: &Filter,
     max: usize,
+    visible: impl Fn(&EventView) -> bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Vec<(u32, [u8; 32])>> {
     if filter.never {
@@ -366,6 +375,9 @@ pub fn every_id(
                 && let Some(view) = store.load(txn, seq)?
                 && filter.matches(&view)
             {
+                if !visible(&view) {
+                    return Err(Restricted.into());
+                }
                 found.push((view.created_at(), *id));
             }
         }
@@ -526,8 +538,9 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
         });
     }
     let mut candidates = Vec::new();
-    // A search is never pinned down by an index.
+    // A search is never pinned down by an index, nor are hidden kinds.
     let no_tags = filter.tags.is_empty() && filter.search.is_none();
+    let no_hidden = filter.hidden_kinds.is_empty();
 
     if let (Some(authors), Some(kinds)) = (&filter.authors, &filter.kinds)
         && (kinds.len() == 1 || authors.len() * kinds.len() <= MAX_AUTHOR_KINDS)
@@ -553,7 +566,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
         candidates.push(Plan {
             db: t.authors,
             keys,
-            exact: no_tags,
+            exact: no_tags && no_hidden,
             disjoint: true,
             kinds: filter.kinds.clone(),
         });
@@ -633,7 +646,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
         Plan {
             db: t.created,
             keys: vec![CREATED.to_vec()],
-            exact: filter.search.is_none(),
+            exact: filter.search.is_none() && no_hidden,
             disjoint: true,
             kinds: None,
         },
@@ -795,16 +808,30 @@ impl std::fmt::Display for TooExpensive {
 
 impl std::error::Error for TooExpensive {}
 
+/// An event found that the connection may not see.
+#[derive(Debug)]
+pub struct Restricted;
+
+impl std::fmt::Display for Restricted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("found an event the connection may not see")
+    }
+}
+
+impl std::error::Error for Restricted {}
+
 /// Count the events matching any of a COUNT's filters. Fails with
-/// [`TooExpensive`] when that's too much work, and with [`Cancelled`] once
-/// `cancel` is.
+/// [`TooExpensive`] when that's too much work, with [`Restricted`] if an
+/// event looked up by id isn't `visible` (others are hidden already), and
+/// with [`Cancelled`] once `cancel` is.
 pub fn count(
     store: &Store,
     search: Option<&SearchIndex>,
     filters: &[Filter],
+    visible: impl Fn(&EventView) -> bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Count> {
-    let count = count_unless_cancelled(store, search, filters, cancel)?;
+    let count = count_unless_cancelled(store, search, filters, &visible, cancel)?;
     match cancel.is_cancelled() {
         true => Err(Cancelled.into()),
         false => Ok(count),
@@ -815,17 +842,18 @@ fn count_unless_cancelled(
     store: &Store,
     search: Option<&SearchIndex>,
     filters: &[Filter],
+    visible: &impl Fn(&EventView) -> bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Count> {
     let txn = store.read()?;
     if filters.iter().any(Filter::distinct_author) {
-        return count_authors(store, &txn, search, filters, cancel);
+        return count_authors(store, &txn, search, filters, visible, cancel);
     }
     let [filter] = filters else {
         // Events matching two filters count once.
         let mut seqs = HashSet::new();
         for filter in filters.iter().filter(|f| !f.never) {
-            collect(store, &txn, search, filter, cancel, &mut seqs)?;
+            collect(store, &txn, search, filter, visible, cancel, &mut seqs)?;
         }
         return Ok(Count {
             count: seqs.len() as u64,
@@ -850,7 +878,7 @@ fn count_unless_cancelled(
     };
     let Some(plan) = plan.filter(|plan| plan.exact) else {
         let mut seqs = HashSet::new();
-        collect(store, &txn, search, filter, cancel, &mut seqs)?;
+        collect(store, &txn, search, filter, visible, cancel, &mut seqs)?;
         let hll = match &filter.first_tag {
             Some(value) => Some(sketch(store, &txn, value, &seqs)?),
             None => None,
@@ -953,6 +981,7 @@ fn collect(
     txn: &Txn,
     search: Option<&SearchIndex>,
     filter: &Filter,
+    visible: &impl Fn(&EventView) -> bool,
     cancel: &CancellationToken,
     out: &mut HashSet<u64>,
 ) -> anyhow::Result<()> {
@@ -962,6 +991,9 @@ fn collect(
                 && let Some(view) = store.load(txn, seq)?
                 && filter.matches(&view)
             {
+                if !visible(&view) {
+                    return Err(Restricted.into());
+                }
                 out.insert(seq);
             }
         }
@@ -1011,11 +1043,13 @@ fn count_authors(
     txn: &Txn,
     search: Option<&SearchIndex>,
     filters: &[Filter],
+    visible: &impl Fn(&EventView) -> bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Count> {
     let mut seqs = HashSet::new();
     for filter in filters.iter().filter(|f| !f.never) {
-        collect(store, txn, search, &filter.every_event(), cancel, &mut seqs)?;
+        let every = filter.every_event();
+        collect(store, txn, search, &every, visible, cancel, &mut seqs)?;
     }
     if seqs.len() > MAX_AUTHORED {
         return Err(TooExpensive.into());
@@ -1090,6 +1124,7 @@ mod tests {
             filters,
             max_limit,
             max_limit,
+            |_| true,
             &Default::default(),
         )
         .unwrap();
@@ -1210,6 +1245,7 @@ mod tests {
     }
 
     /// Random events and filters, checked against matching every event.
+    /// Some filters naming no kinds have kind 4 hidden.
     #[test]
     fn agrees_with_brute_force() {
         let (_dir, store) = open();
@@ -1310,12 +1346,18 @@ mod tests {
             }
             let limit = rng.random_range(1..40);
             filter.insert("limit".into(), json!(limit));
-            (Value::Object(filter), limit)
+            (Value::Object(filter), limit, rng.random_bool(0.5))
         };
-        let parse = |filter: &Value| Filter::parse(filter, &test_tags(), MAX_VALUES).unwrap();
+        let parse = |filter: &Value, hide: bool| {
+            let mut parsed = Filter::parse(filter, &test_tags(), MAX_VALUES).unwrap();
+            if hide && parsed.kinds.is_none() {
+                parsed.hidden_kinds = vec![4];
+            }
+            parsed
+        };
         let records: Vec<Vec<u8>> = all.iter().map(crate::record::encode).collect();
-        let matching = |filter: &Value| -> Vec<&Event> {
-            let parsed = parse(filter);
+        let matching = |filter: &Value, hide: bool| -> Vec<&Event> {
+            let parsed = parse(filter, hide);
             all.iter()
                 .zip(&records)
                 .filter(|(_, record)| parsed.matches(&EventView::new(record).unwrap()))
@@ -1324,15 +1366,16 @@ mod tests {
         };
 
         for _ in 0..300 {
-            let (filter, limit) = random_filter(&mut rng);
-            let mut expected = matching(&filter);
+            let (filter, limit, hide) = random_filter(&mut rng);
+            let mut expected = matching(&filter, hide);
 
             // Counted, with every match's author sketched.
-            let parsed = parse(&filter);
+            let parsed = parse(&filter, hide);
             let counted = count(
                 &store,
                 None,
                 std::slice::from_ref(&parsed),
+                |_| true,
                 &Default::default(),
             )
             .unwrap();
@@ -1351,14 +1394,14 @@ mod tests {
             assert_eq!(counted, want, "{filter}");
 
             // Two filters count their union.
-            let (other, _) = random_filter(&mut rng);
+            let (other, _, hide_other) = random_filter(&mut rng);
             let union: HashSet<&str> = expected
                 .iter()
-                .chain(&matching(&other))
+                .chain(&matching(&other, hide_other))
                 .map(|e| e.id.as_str())
                 .collect();
-            let filters = [parsed.clone(), parse(&other)];
-            let counted = count(&store, None, &filters, &Default::default()).unwrap();
+            let filters = [parsed.clone(), parse(&other, hide_other)];
+            let counted = count(&store, None, &filters, |_| true, &Default::default()).unwrap();
             assert_eq!(counted.count, union.len() as u64, "{filter} {other}");
 
             // Asked for distinct authors, a count is of the authors.
@@ -1366,14 +1409,15 @@ mod tests {
             let search = distinct.get("search").and_then(Value::as_str).unwrap_or("");
             distinct["search"] = json!(format!("{search} distinct:author"));
             let authors: HashSet<&str> = expected.iter().map(|e| e.pubkey.as_str()).collect();
-            let counted = count_of(&store, distinct.clone());
+            let filters = [parse(&distinct, hide)];
+            let counted = count(&store, None, &filters, |_| true, &Default::default()).unwrap();
             assert_eq!(counted.count, authors.len() as u64, "{distinct}");
             assert_eq!(counted.hll, want.hll, "{distinct}");
-            let filters = [parse(&distinct), parse(&other)];
-            let counted = count(&store, None, &filters, &Default::default()).unwrap();
+            let filters = [parse(&distinct, hide), parse(&other, hide_other)];
+            let counted = count(&store, None, &filters, |_| true, &Default::default()).unwrap();
             let authors: HashSet<&str> = expected
                 .iter()
-                .chain(&matching(&other))
+                .chain(&matching(&other, hide_other))
                 .map(|e| e.pubkey.as_str())
                 .collect();
             assert_eq!(counted.count, authors.len() as u64, "{distinct} {other}");
@@ -1390,7 +1434,7 @@ mod tests {
                 let txn = store.read().unwrap();
                 let cancel = Default::default();
                 let synced = |filter: &Filter| -> HashSet<String> {
-                    every_id(&store, &txn, filter, 1000, &cancel)
+                    every_id(&store, &txn, filter, 1000, |_| true, &cancel)
                         .unwrap()
                         .iter()
                         .map(|(_, id)| hex::encode(id))
@@ -1443,6 +1487,7 @@ mod tests {
             store,
             None,
             &[Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap()],
+            |_| true,
             &Default::default(),
         )
         .unwrap()
@@ -1584,9 +1629,9 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let filters = std::slice::from_ref(&filter);
-        let ran = run(&store, None, None, filters, 500, 500, &cancel);
+        let ran = run(&store, None, None, filters, 500, 500, |_| true, &cancel);
         assert!(ran.err().unwrap().is::<Cancelled>());
-        let counted = count(&store, None, filters, &cancel);
+        let counted = count(&store, None, filters, |_| true, &cancel);
         assert!(counted.err().unwrap().is::<Cancelled>());
         // Stopped scanning a page in.
         let txn = store.read().unwrap();
@@ -1615,6 +1660,39 @@ mod tests {
         store.expire(&mut txn, now, 100).unwrap();
         txn.commit().unwrap();
         assert_eq!(count_of(&store, json!({"kinds": [1]})).count, 1);
+    }
+
+    #[test]
+    fn refuses_events_found_that_are_not_visible() {
+        let (_dir, store) = open();
+        let dm = signed(1, 100, 4, vec![], "");
+        let note = signed(1, 200, 1, vec![], "");
+        put(&store, &dm);
+        put(&store, &note);
+        let visible = |view: &EventView| view.kind() != 4;
+        let parse = |filter| Filter::parse(&filter, &test_tags(), MAX_VALUES).unwrap();
+        let cancel = CancellationToken::new();
+        let txn = store.read().unwrap();
+
+        let filters = [parse(json!({"ids": [dm.id, note.id]}))];
+        let err = run(&store, None, None, &filters, 100, 100, visible, &cancel);
+        assert!(err.err().unwrap().is::<Restricted>());
+        let err = count(&store, None, &filters, visible, &cancel);
+        assert!(err.err().unwrap().is::<Restricted>());
+        let err = every_id(&store, &txn, &filters[0], 100, visible, &cancel);
+        assert!(err.err().unwrap().is::<Restricted>());
+
+        let filters = [parse(json!({"ids": [note.id]}))];
+        let ran = run(&store, None, None, &filters, 100, 100, visible, &cancel);
+        assert_eq!(ran.unwrap().events.len(), 1);
+        assert_eq!(
+            count(&store, None, &filters, visible, &cancel)
+                .unwrap()
+                .count,
+            1
+        );
+        let synced = every_id(&store, &txn, &filters[0], 100, visible, &cancel);
+        assert_eq!(synced.unwrap().len(), 1);
     }
 
     #[test]

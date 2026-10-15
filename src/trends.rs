@@ -426,8 +426,17 @@ mod tests {
     /// The events a filter finds.
     fn query(store: &Store, filter: Value) -> Vec<Event> {
         let filter = Filter::parse(&filter, &store.indexed_tags, MAX_VALUES).unwrap();
-        let results =
-            crate::query::run(store, None, None, &[filter], 100, 500, &Default::default()).unwrap();
+        let results = crate::query::run(
+            store,
+            None,
+            None,
+            &[filter],
+            100,
+            500,
+            |_| true,
+            &Default::default(),
+        )
+        .unwrap();
         results
             .events
             .iter()

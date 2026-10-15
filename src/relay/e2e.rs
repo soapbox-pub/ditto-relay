@@ -55,6 +55,7 @@ fn config() -> Config {
         history: true,
         history_excluded_kinds: vec![],
         history_max_versions: 20,
+        auth_kinds: vec![],
         search: false,
         search_path: PathBuf::new(),
         search_kinds: vec![],
@@ -343,6 +344,111 @@ async fn sends_new_events_to_subscriptions() {
         .publish(&signed(1, event::now().into(), 7, vec![], "+"))
         .await;
     reader.quiet().await;
+}
+
+/// The pubkey `seed` signs as, in hex.
+fn pubkey(seed: u8) -> String {
+    signed(seed, 0, 1, vec![], "").pubkey
+}
+
+#[tokio::test]
+async fn reads_are_open_without_auth_kinds() {
+    let relay = Relay::start().await;
+    let mut client = relay.connect().await;
+    let dm = signed(1, event::now().into(), 4, vec![vec!["p", &pubkey(2)]], "");
+    client.publish(&dm).await;
+    assert_eq!(
+        client.req("dms", &[json!({"kinds": [4]})]).await,
+        [dm.id.as_str()]
+    );
+    assert_eq!(client.req("all", &[json!({})]).await, [dm.id.as_str()]);
+}
+
+#[tokio::test]
+async fn keeps_auth_kinds_to_their_parties() {
+    let relay = Relay::start_with(Config {
+        auth_kinds: vec![4],
+        ..config()
+    })
+    .await;
+    let mut writer = relay.connect().await;
+    let mut reader = relay.connect().await;
+    let now = u64::from(event::now());
+    let dm = signed(1, now - 10, 4, vec![vec!["p", &pubkey(2)]], "");
+    let ev = note(1, "public");
+    writer.publish(&dm).await;
+    writer.publish(&ev).await;
+
+    // Hidden from filters that don't name kinds, live too.
+    assert_eq!(reader.req("all", &[json!({})]).await, [ev.id.as_str()]);
+    let later = signed(1, now - 5, 4, vec![vec!["p", &pubkey(2)]], "");
+    writer.publish(&later).await;
+    reader.quiet().await;
+    reader.send(json!(["CLOSE", "all"])).await;
+
+    // Named, they need their parties authenticated: the first refusal
+    // comes with a challenge.
+    reader
+        .send(json!(["REQ", "dms", {"kinds": [4], "#p": [pubkey(2)]}]))
+        .await;
+    let challenge = reader.next().await;
+    assert_eq!(challenge[0], "AUTH", "{challenge}");
+    let closed = reader.next().await;
+    assert_eq!(closed[0], "CLOSED", "{closed}");
+    assert!(
+        closed[2].as_str().unwrap().starts_with("auth-required:"),
+        "{closed}"
+    );
+    // Looked up by id, and counted or synced.
+    reader.send(json!(["REQ", "id", {"ids": [dm.id]}])).await;
+    let closed = reader.next().await;
+    assert_eq!(closed[0], "CLOSED", "{closed}");
+    reader.send(json!(["COUNT", "c", {"ids": [dm.id]}])).await;
+    assert_eq!(reader.next().await[0], "CLOSED");
+    reader
+        .send(json!(["NEG-OPEN", "s", {"kinds": [4]}, "61"]))
+        .await;
+    let err = reader.next().await;
+    assert_eq!(err[0], "NEG-ERR", "{err}");
+    assert!(
+        err[2].as_str().unwrap().starts_with("auth-required:"),
+        "{err}"
+    );
+    assert_eq!(
+        reader.req("note", &[json!({"ids": [ev.id]})]).await,
+        [ev.id.as_str()]
+    );
+
+    let auth = signed(
+        2,
+        event::now().into(),
+        crate::auth::AUTH,
+        vec![
+            vec!["challenge", challenge[1].as_str().unwrap()],
+            vec!["relay", "ws://relay.test"],
+        ],
+        "",
+    );
+    reader.send(json!(["AUTH", auth])).await;
+    assert_eq!(reader.next().await, json!(["OK", auth.id, true, ""]));
+    let dms = reader
+        .req("dms", &[json!({"kinds": [4], "#p": [pubkey(2)]})])
+        .await;
+    assert_eq!(dms, [later.id.as_str(), dm.id.as_str()]);
+    assert_eq!(
+        reader.req("id", &[json!({"ids": [dm.id]})]).await,
+        [dm.id.as_str()]
+    );
+    // Others' still aren't.
+    let other = signed(1, event::now().into(), 4, vec![vec!["p", &pubkey(3)]], "");
+    writer.publish(&other).await;
+    reader.send(json!(["REQ", "id", {"ids": [other.id]}])).await;
+    let closed = reader.next().await;
+    assert_eq!(closed[0], "CLOSED", "{closed}");
+    assert!(
+        closed[2].as_str().unwrap().starts_with("restricted:"),
+        "{closed}"
+    );
 }
 
 #[tokio::test]

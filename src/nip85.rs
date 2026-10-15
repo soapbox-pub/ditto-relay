@@ -228,6 +228,7 @@ mod tests {
             &[filter],
             100,
             500,
+            |_| true,
             &Default::default(),
         )
         .unwrap();
@@ -495,6 +496,7 @@ mod tests {
             &filters,
             100,
             500,
+            |_| true,
             &Default::default(),
         )
         .unwrap();

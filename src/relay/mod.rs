@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,14 +23,14 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::auth;
+use crate::auth::{self, Access, Authed, Refusal, Viewer};
 use crate::config::{Config, Image};
 use crate::event::{self, Event, KindClass};
 use crate::filter::Filter;
 use crate::metrics::{Connected, METRICS};
 use crate::negentropy::{self, Item, Items, Negentropy};
 use crate::plugin::{self, Peer, Plugin, Verdict};
-use crate::query::{self, Cancelled, Count, Results, TooExpensive};
+use crate::query::{self, Cancelled, Count, Restricted, Results, TooExpensive};
 use crate::record::{self, EventView};
 use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
@@ -42,6 +42,8 @@ mod monitors;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    /// Who may read what.
+    access: Arc<Access>,
     /// The relay's own key, which signs the NIP-85 assertions it serves and
     /// the trends it labels.
     pub keypair: Keypair,
@@ -138,6 +140,7 @@ impl AppState {
             clearnet: Arc::new(clearnet),
             onion: onion_pages,
             onion_location,
+            access: Arc::new(Access::new(&config)),
             config: Arc::new(config),
             keypair,
             writer: Writer::spawn(store.clone(), indexer, stored),
@@ -519,10 +522,10 @@ struct Connection {
     sink: SplitSink<WebSocket, Message>,
     peer: Peer,
     /// What this connection signs to authenticate (NIP-42), once it's
-    /// been asked to: only to publish a NIP-70 protected event.
+    /// been asked to: when it's refused something for want of it.
     challenge: Option<String>,
     /// The pubkeys the connection has authenticated as.
-    authed: HashSet<[u8; 32]>,
+    authed: Authed,
 }
 
 /// The connection should be torn down.
@@ -558,7 +561,7 @@ impl Connection {
             sink,
             peer,
             challenge: None,
-            authed: HashSet::new(),
+            authed: Authed::new(),
         };
 
         loop {
@@ -655,6 +658,24 @@ impl Connection {
 
     async fn closed(&mut self, sub_id: &str, msg: &str) -> Result<(), Disconnect> {
         self.send(&("CLOSED", sub_id, msg)).await
+    }
+
+    /// Challenge the connection to authenticate, if it hasn't been yet and
+    /// `msg` refuses it something for want of that.
+    async fn challenge_for(&mut self, msg: &str) -> Result<(), Disconnect> {
+        if msg.starts_with("auth-required:") && self.challenge.is_none() {
+            let challenge = auth::challenge();
+            self.send(&("AUTH", &challenge)).await?;
+            self.challenge = Some(challenge);
+        }
+        Ok(())
+    }
+
+    /// Refuse a REQ or COUNT.
+    async fn refuse(&mut self, id: &str, refusal: Refusal) -> Result<(), Disconnect> {
+        let msg = refusal.message(&self.authed);
+        self.challenge_for(msg).await?;
+        self.closed(id, msg).await
     }
 
     async fn on_message(
@@ -764,11 +785,7 @@ impl Connection {
             METRICS.events_shadow_rejected.inc();
             return self.ok(&id, true, &msg).await;
         }
-        if msg.starts_with("auth-required:") && self.challenge.is_none() {
-            let challenge = auth::challenge();
-            self.send(&("AUTH", &challenge)).await?;
-            self.challenge = Some(challenge);
-        }
+        self.challenge_for(&msg).await?;
         let counter = match (accepted, msg.split_once(':').map(|(prefix, _)| prefix)) {
             (_, Some("duplicate")) => &METRICS.events_duplicate,
             (true, _) => &METRICS.events_accepted,
@@ -823,6 +840,10 @@ impl Connection {
                 return self.closed(sub_id, &msg).await;
             }
         };
+        if let Err(refusal) = self.may_run(&filters) {
+            self.end(sub_id).await;
+            return self.refuse(sub_id, refusal).await;
+        }
         if !self.subs.contains_key(sub_id) && self.subs.len() >= config.max_subscriptions {
             return self.closed(sub_id, "error: too many subscriptions").await;
         }
@@ -843,10 +864,11 @@ impl Connection {
                 cancel: cancel.clone(),
             },
         );
+        let viewer = self.viewer();
         let installed = self
             .state
             .hub
-            .subscribe(self.id, name.clone(), filters.clone())
+            .subscribe(self.id, name.clone(), filters.clone(), viewer.clone())
             .await;
         let state = self.state.clone();
         queries.spawn(async move {
@@ -864,6 +886,7 @@ impl Connection {
                     &filters,
                     config.default_limit,
                     config.max_limit,
+                    visible(viewer),
                     &stop,
                 )
             })
@@ -891,6 +914,10 @@ impl Connection {
         };
         let results = match results {
             Ok(results) => results,
+            Err(err) if err.is::<Restricted>() => {
+                self.end(&name).await;
+                return self.refuse(&name, Refusal::Results).await;
+            }
             Err(err) => {
                 tracing::error!("query failed: {err:#}");
                 METRICS.errors_query.inc();
@@ -922,7 +949,8 @@ impl Connection {
         .await
     }
 
-    /// A REQ's or COUNT's filters, or why they're refused.
+    /// A REQ's, COUNT's, or sync's filters, with the kinds the connection
+    /// may not read hidden, or why they're refused.
     fn filters(&self, args: &[Value]) -> Result<Vec<Filter>, String> {
         let indexed = &self.state.store.indexed_tags;
         let max_values = self.state.config.max_filter_values;
@@ -932,6 +960,11 @@ impl Connection {
             .collect::<Result<Vec<_>, _>>()?;
         if filters.len() > self.state.config.max_filters {
             return Err("invalid: too many filters".into());
+        }
+        // Before a search is restricted to the kinds indexed, so that it
+        // isn't to hidden ones.
+        for filter in &mut filters {
+            self.state.access.hide(filter);
         }
         // Only text needs the search index: extensions are looked up in
         // the LMDB.
@@ -945,6 +978,18 @@ impl Connection {
             }
         }
         Ok(filters)
+    }
+
+    /// Whether the connection may run some filters.
+    fn may_run(&self, filters: &[Filter]) -> Result<(), Refusal> {
+        filters
+            .iter()
+            .try_for_each(|filter| self.state.access.check(filter, &self.authed))
+    }
+
+    /// Which events the connection may see, unless it may see them all.
+    fn viewer(&self) -> Option<Viewer> {
+        self.state.access.viewer(&self.authed)
     }
 
     /// NIP-42: `["AUTH", event]`.
@@ -990,15 +1035,19 @@ impl Connection {
             Ok(filters) => filters,
             Err(msg) => return self.closed(id, &msg).await,
         };
+        if let Err(refusal) = self.may_run(&filters) {
+            return self.refuse(id, refusal).await;
+        }
 
-        let (state, id) = (self.state.clone(), id.to_string());
+        let (state, id, viewer) = (self.state.clone(), id.to_string(), self.viewer());
         let cancel = self.cancel.clone();
         queries.spawn(async move {
             let (store, search) = (state.store.clone(), state.search.clone());
             let start = Instant::now();
             let stop = cancel.clone();
             let count = run_query(&state, &cancel, move || {
-                query::count(&store, search.as_deref(), &filters, &stop).map(Box::new)
+                query::count(&store, search.as_deref(), &filters, visible(viewer), &stop)
+                    .map(Box::new)
             })
             .await;
             METRICS.counts.since(start);
@@ -1020,6 +1069,7 @@ impl Connection {
                 }
                 self.send(&("COUNT", id, body)).await
             }
+            Err(err) if err.is::<Restricted>() => self.refuse(id, Refusal::Results).await,
             Err(err) if err.is::<TooExpensive>() => {
                 METRICS.counts_refused.inc();
                 self.closed(id, "unsupported: too expensive to count").await
@@ -1066,6 +1116,11 @@ impl Connection {
             }
             Err(msg) => return self.neg_err(id, &msg).await,
         };
+        if let Err(refusal) = self.may_run(std::slice::from_ref(&filter)) {
+            let msg = refusal.message(&self.authed);
+            self.challenge_for(msg).await?;
+            return self.neg_err(id, msg).await;
+        }
         let Some(msg) = args
             .get(2)
             .and_then(Value::as_str)
@@ -1089,15 +1144,15 @@ impl Connection {
                 cancel: cancel.clone(),
             },
         );
-        let state = self.state.clone();
+        let (state, viewer) = (self.state.clone(), self.viewer());
         queries.spawn(async move {
             let store = state.store.clone();
             let start = Instant::now();
             let stop = cancel.clone();
             let reconciled = run_query(&state, &cancel, move || {
                 let txn = store.read()?;
-                let found =
-                    query::every_id(&store, &txn, &filter, config.negentropy_max_events, &stop)?;
+                let max = config.negentropy_max_events;
+                let found = query::every_id(&store, &txn, &filter, max, visible(viewer), &stop)?;
                 drop(txn);
                 let items = found.into_iter().map(|(created_at, id)| Item {
                     timestamp: created_at.into(),
@@ -1174,6 +1229,11 @@ impl Connection {
             Err(err) => err,
         };
         self.syncs.remove(&*name);
+        if err.is::<Restricted>() {
+            let msg = Refusal::Results.message(&self.authed);
+            self.challenge_for(msg).await?;
+            return self.neg_err(&name, msg).await;
+        }
         if err.is::<TooExpensive>() {
             let max = self.state.config.negentropy_max_events;
             let msg = "blocked: too many events to sync";
@@ -1258,12 +1318,7 @@ async fn verify(state: &AppState, ev: Event) -> Result<Option<Event>, Cow<'stati
 }
 
 /// What the write policy plugin makes of an event, if there is one.
-async fn ask_plugin(
-    state: &AppState,
-    peer: Peer,
-    authed: &HashSet<[u8; 32]>,
-    ev: &Event,
-) -> Verdict {
+async fn ask_plugin(state: &AppState, peer: Peer, authed: &Authed, ev: &Event) -> Verdict {
     let Some(plugin) = &state.plugin else {
         return Verdict::Accept;
     };
@@ -1337,6 +1392,12 @@ async fn accept(state: &AppState, id: &str, ev: Event) -> (bool, Cow<'static, st
 fn reconcile(storage: Arc<Items>, msg: &[u8]) -> anyhow::Result<Reconciled> {
     let msg = Negentropy::new(&storage, NEG_FRAME_SIZE).reconcile(msg)?;
     Ok(Reconciled { storage, msg })
+}
+
+/// Whether a query may return an event, for a connection that may see only
+/// what `viewer` lets it, if there's one.
+fn visible(viewer: Option<Viewer>) -> impl Fn(&EventView) -> bool {
+    move |event| viewer.as_ref().is_none_or(|viewer| viewer.may_see(event))
 }
 
 /// `["EVENT", sub_id, event]`, with the event already serialized.

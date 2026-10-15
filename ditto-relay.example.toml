@@ -113,6 +113,18 @@ url = "wss://relay.example.com/"
 #max_future_seconds = 900
 
 ###############################################################################
+# Access (NIP-42)
+###############################################################################
+
+# Kinds only the parties to an event may read, once they've authenticated: its
+# author, and the pubkeys it tags. A filter naming one of them has to name only
+# authenticated pubkeys as its authors or #p, a filter naming no kinds doesn't
+# see them, and events asked for by id are checked one by one. None by default:
+# reads are open to everyone, since authenticating to read ties a client's IP
+# to its pubkey. For DMs, app data, and gift wraps: [4, 78, 1059, 30078].
+#auth_kinds = []
+
+###############################################################################
 # Indexing
 ###############################################################################
 
