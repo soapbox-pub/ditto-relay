@@ -19,9 +19,13 @@
 //! newest left current. Nothing is kept to refuse them if they're
 //! published again, and the relay's subscribers aren't told.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
 use anyhow::{Context, bail};
 use serde_json::Value;
 
+use crate::event::KindClass;
 use crate::filter::Filter;
 use crate::query;
 use crate::search::Indexer;
@@ -29,6 +33,9 @@ use crate::store::{IndexedTags, Store};
 
 /// The most matches removed per write transaction.
 pub const CHUNK: usize = 1000;
+
+/// How many chunks past the one being removed [`read_ahead`] reads.
+const AHEAD: usize = 2;
 
 /// The filter to delete by: `json`, if given, and with `age`, only events
 /// at least that many seconds older than `now`. One of them is needed.
@@ -65,11 +72,20 @@ pub fn matching(store: &Store, filter: &Filter) -> anyhow::Result<Vec<u64>> {
     Ok(query::every_match(store, &*store.read()?, filter)?)
 }
 
-/// How many events deleting by `filter` would remove, as of now.
+/// How many events deleting by `filter` would remove, as of now. Only
+/// matches that may have old versions to take along are read: those of
+/// kinds without them, as the index says, count once each.
 pub fn count(store: &Store, filter: &Filter) -> anyhow::Result<usize> {
     let txn = store.read()?;
-    let seqs = query::every_match(store, &txn, filter)?;
-    Ok(store.count_matching(&txn, &seqs, filter)?)
+    let mut alone = 0;
+    let mut versioned = Vec::new();
+    for (seq, kind) in query::every_match_kinded(store, &txn, filter)? {
+        match kind.map(KindClass::of) {
+            Some(KindClass::Regular | KindClass::Ephemeral) => alone += 1,
+            _ => versioned.push(seq),
+        }
+    }
+    Ok(alone + store.count_matching(&txn, &versioned, filter)?)
 }
 
 /// Remove those of `seqs` that `filter` matches, in one transaction.
@@ -92,6 +108,28 @@ pub fn remove(
     Ok((deleted, removed))
 }
 
+/// Read ahead of a deletion going through `seqs` a [`CHUNK`] at a time, at
+/// most [`AHEAD`] chunks past the `done` it's through, until it's through
+/// them all or `stop`: so that removing them seldom waits on the disk, as
+/// [`Store::prefetch`] keeps writing from waiting.
+pub fn read_ahead(store: &Store, seqs: &[u64], done: &AtomicUsize, stop: &AtomicBool) {
+    for (i, chunk) in seqs.chunks(CHUNK).enumerate() {
+        while i * CHUNK > done.load(Ordering::Relaxed) + AHEAD * CHUNK {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // Not if the deletion's got past it already.
+        if (i + 1) * CHUNK > done.load(Ordering::Relaxed) {
+            store.prefetch_removals(chunk);
+        }
+    }
+}
+
 /// Remove every stored event `filter` matches, from a store no running
 /// relay has open, and from its search index, if there's one, telling
 /// `progress` how many so far after each chunk. Returns how many.
@@ -101,15 +139,27 @@ pub fn delete(
     mut indexer: Option<&mut Indexer>,
     mut progress: impl FnMut(usize),
 ) -> anyhow::Result<usize> {
-    let mut deleted = 0;
-    for chunk in matching(store, filter)?.chunks(CHUNK) {
-        let (n, removed) = remove(store, chunk, filter)?;
-        if let Some(indexer) = indexer.as_deref_mut() {
-            indexer.remove(&removed);
-        }
-        deleted += n;
-        progress(deleted);
-    }
+    let seqs = matching(store, filter)?;
+    let (done, stop) = (AtomicUsize::new(0), AtomicBool::new(false));
+    let deleted = std::thread::scope(|scope| {
+        scope.spawn(|| read_ahead(store, &seqs, &done, &stop));
+        let mut deleted = 0;
+        let mut removing = || -> anyhow::Result<usize> {
+            for (i, chunk) in seqs.chunks(CHUNK).enumerate() {
+                let (n, removed) = remove(store, chunk, filter)?;
+                done.store(i * CHUNK + chunk.len(), Ordering::Relaxed);
+                if let Some(indexer) = indexer.as_deref_mut() {
+                    indexer.remove(&removed);
+                }
+                deleted += n;
+                progress(deleted);
+            }
+            Ok(deleted)
+        };
+        let result = removing();
+        stop.store(true, Ordering::Relaxed);
+        result
+    })?;
     if let Some(indexer) = indexer {
         indexer.commit()?;
     }
@@ -217,6 +267,25 @@ mod tests {
         assert_eq!(delete(&store, &all, None, |_| {}).unwrap(), 2);
         assert!(!has(&store, &v4));
         assert_eq!(found(&store, json!({"kinds": [0]})), 0);
+    }
+
+    #[test]
+    fn deletes_by_an_extension() {
+        let (_dir, store) = open();
+        let note = signed(1, 100, 1, vec![vec!["proxy", "at://a", "atproto"]], "a");
+        let other = signed(2, 200, 1, vec![vec!["proxy", "ap://b", "activitypub"]], "b");
+        let v1 = signed(3, 100, 0, vec![vec!["proxy", "at://p1", "atproto"]], "v1");
+        let v2 = signed(3, 200, 0, vec![vec!["proxy", "at://p2", "atproto"]], "v2");
+        for event in [&note, &other, &v1, &v2] {
+            put(&store, event);
+        }
+        // The note counted from the index alone, the profile with its
+        // history.
+        let filter = parse(json!({"search": "protocol:atproto"}));
+        assert_eq!(count(&store, &filter).unwrap(), 3);
+        assert_eq!(delete(&store, &filter, None, |_| {}).unwrap(), 3);
+        assert!(!has(&store, &note) && has(&store, &other));
+        assert!(!has(&store, &v1) && !has(&store, &v2));
     }
 
     #[test]

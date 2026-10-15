@@ -301,17 +301,30 @@ pub fn newest<'t>(
 /// found as a query finds them: by id, or by a filter shaped like their
 /// address.
 pub fn every_match(store: &Store, txn: &Txn, filter: &Filter) -> Result<Vec<u64>> {
+    Ok(every_match_kinded(store, txn, filter)?
+        .into_iter()
+        .map(|(seq, _)| seq)
+        .collect())
+}
+
+/// [`every_match`], with each match's kind when it's known without reading
+/// the event: from the index it was found in, or the event, if read.
+pub fn every_match_kinded(
+    store: &Store,
+    txn: &Txn,
+    filter: &Filter,
+) -> Result<Vec<(u64, Option<u16>)>> {
     if filter.never {
         return Ok(Vec::new());
     }
-    let mut found: Vec<(u32, u64)> = Vec::new();
+    let mut found: Vec<(u32, u64, Option<u16>)> = Vec::new();
     if let Some(ids) = &filter.ids {
         for id in ids {
             if let Some(seq) = store.seq_of(txn, id)?
                 && let Some(view) = store.stored(txn, seq)?
                 && filter.matches(&view)
             {
-                found.push((view.created_at(), seq));
+                found.push((view.created_at(), seq, Some(view.kind())));
             }
         }
     } else {
@@ -319,22 +332,22 @@ pub fn every_match(store: &Store, txn: &Txn, filter: &Filter) -> Result<Vec<u64>
         for key in &plan.keys {
             each_stamp(txn, plan.db, key, filter.since, filter.until, |entry| {
                 if plan.wants(entry) {
-                    found.push((stamp_created_at(entry), stamp_seq(entry)));
+                    let kind = indexed_kind(store, &plan, key, entry);
+                    found.push((stamp_created_at(entry), stamp_seq(entry), kind));
                 }
                 true
             })?;
         }
         // The same event can be filed under two keys.
-        found.sort_unstable_by_key(|&(_, seq)| seq);
-        found.dedup_by_key(|&mut (_, seq)| seq);
+        found.sort_unstable_by_key(|&(_, seq, _)| seq);
+        found.dedup_by_key(|&mut (_, seq, _)| seq);
         if !plan.exact {
             let mut kept = Vec::with_capacity(found.len());
-            for (created_at, seq) in found {
-                if store
-                    .stored(txn, seq)?
-                    .is_some_and(|view| filter.matches(&view))
+            for (created_at, seq, _) in found {
+                if let Some(view) = store.stored(txn, seq)?
+                    && filter.matches(&view)
                 {
-                    kept.push((created_at, seq));
+                    kept.push((created_at, seq, Some(view.kind())));
                 }
             }
             found = kept;
@@ -344,10 +357,27 @@ pub fn every_match(store: &Store, txn: &Txn, filter: &Filter) -> Result<Vec<u64>
         found.sort_unstable_by(|a, b| b.cmp(a));
         found.truncate(limit.try_into().unwrap_or(usize::MAX));
     }
-    let mut seqs: Vec<u64> = found.into_iter().map(|(_, seq)| seq).collect();
+    let mut seqs: Vec<(u64, Option<u16>)> = found
+        .into_iter()
+        .map(|(_, seq, kind)| (seq, kind))
+        .collect();
     seqs.sort_unstable();
-    seqs.dedup();
+    seqs.dedup_by_key(|&mut (seq, _)| seq);
     Ok(seqs)
+}
+
+/// The kind of the event an entry under `key` in a plan's index is for,
+/// if the index says.
+fn indexed_kind(store: &Store, plan: &Plan, key: &[u8], entry: &[u8]) -> Option<u16> {
+    let t = store.tables;
+    if plan.db == t.authors {
+        entry_kind(entry)
+    } else if [t.tags, t.facets, t.kinds, t.author_kinds].contains(&plan.db) {
+        // Each keyed with the kind last.
+        Some(tag_key_kind(key))
+    } else {
+        None
+    }
 }
 
 /// The `created_at` and id of every unexpired event a filter matches, for
@@ -538,7 +568,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
         });
     }
     let mut candidates = Vec::new();
-    // A search is never pinned down by an index, nor are hidden kinds.
+    // A search is never pinned down by these indexes, nor are hidden kinds.
     let no_tags = filter.tags.is_empty() && filter.search.is_none();
     let no_hidden = filter.hidden_kinds.is_empty();
 
@@ -598,7 +628,14 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
         });
     }
     // A search's extensions, those that can be looked up. Each event has
-    // one value of each facet, so one key per kind.
+    // one value of each facet, so one key per kind. Every event filed
+    // where one is looked up meets it, and the kinds are picked by key, so
+    // a search of that one extension and nothing else is exact.
+    let one_condition = filter.authors.is_none()
+        && filter.tags.is_empty()
+        && filter.search.as_ref().is_some_and(|search| {
+            search.terms.is_empty() && search.excluded.is_empty() && search.conditions.len() == 1
+        });
     for condition in filter.search.iter().flat_map(|s| &s.conditions) {
         let Some((start, prefix)) = condition.lookup(&store.indexed_tags) else {
             continue;
@@ -617,7 +654,7 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
         candidates.push(Plan {
             db: t.facets,
             keys,
-            exact: false,
+            exact: one_condition,
             disjoint: true,
             kinds: None,
         });
@@ -1200,7 +1237,13 @@ mod tests {
         assert_eq!(p.db, store.tables.tags);
         let p = plan_for(json!({"search": "media:true", "kinds": [1]}));
         assert!(p.db == store.tables.facets && p.keys.is_empty());
-        assert!(!p.exact);
+        // One extension and nothing else to check is exact.
+        assert!(p.exact);
+        assert!(plan_for(json!({"search": "tag:t"})).exact);
+        let p = plan_for(json!({"search": "tag:t x"}));
+        assert!(p.db == store.tables.facets && !p.exact);
+        let p = plan_for(json!({"search": "tag:t media:true"}));
+        assert!(p.db == store.tables.facets && !p.exact);
         assert_eq!(
             plan_for(json!({"search": "-media:true"})).db,
             store.tables.created
