@@ -47,7 +47,8 @@ Set `url` in `/etc/ditto-relay/ditto-relay.toml`, then:
 sudo systemctl enable --now ditto-relay
 ```
 
-The relay listens on `127.0.0.1:13131`; put a reverse proxy with TLS in front of it.
+The relay listens on `127.0.0.1:13131`; put a reverse proxy with TLS in front of it,
+or let it serve [HTTPS](#https) itself.
 [`CHANGELOG.md`](CHANGELOG.md) says what changed in each release.
 
 ## Running from source
@@ -66,6 +67,27 @@ default; only `url` is required. Data is stored in `data_dir`, by default
 own key, `secret.key`, which is made the first time it starts. `ditto-relay check`
 says whether a configuration is valid, and what it would serve, without starting the
 relay or opening its database.
+
+## HTTPS
+
+```toml
+url = "wss://relay.example.com/"
+
+[tls]
+enabled = true
+```
+
+With TLS turned on, the relay serves `wss://` and HTTPS on port 443 with nothing in
+front of it. It gets a certificate for `public_url`'s domain (`url`'s, unless set)
+from Let's Encrypt, and renews it in the background, with a third of its lifetime
+left, without restarting. Port 80 redirects to HTTPS. The domain's DNS has to point at
+the server, and both ports must be open to the internet: Let's Encrypt validates
+over 443 (TLS-ALPN-01), or failing that over 80 (HTTP-01). Binding them needs root or
+`CAP_NET_BIND_SERVICE`, which the systemd unit grants. Turning TLS on agrees to
+[Let's Encrypt's terms](https://letsencrypt.org/repository/). The certificate and the
+ACME account are kept in `data_dir/tls`, so a restart serves the certificate at once.
+A failed attempt is retried after a minute, then two, and so on up to an hour, and
+`ditto-relay check` says when the certificate expires.
 
 ## Deleting events
 

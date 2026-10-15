@@ -73,6 +73,7 @@ fn config() -> Config {
         write_policy_timeout_seconds: 10,
         real_ip_header: None,
         log: String::new(),
+        tls: None,
         tor: None,
     }
 }
@@ -254,6 +255,33 @@ async fn stores_and_finds_events() {
         client.req("b", &[json!({"kinds": [7]})]).await,
         Vec::<String>::new()
     );
+}
+
+#[tokio::test]
+async fn serves_wss() {
+    use crate::tls::tests::{connect, issue, listener, trusting};
+    use axum::serve::ListenerExt;
+    let (_dir, store) = store::tests::open();
+    let keypair = secp256k1::Keypair::from_secret_bytes([1; 32]).unwrap();
+    let state = AppState::new(config(), keypair, Arc::new(store), None, None);
+    let issued = issue(None);
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let listener = listener(&issued, tcp).tap_io(|_| {});
+    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let stream = connect(addr, trusting(&issued.ca, &[b"http/1.1"])).await;
+    let (mut ws, _) = tokio_tungstenite::client_async("wss://localhost/", stream)
+        .await
+        .unwrap();
+    let ev = note(1, "hello");
+    ws.send(Message::text(json!(["EVENT", ev]).to_string()))
+        .await
+        .unwrap();
+    let ok = tokio::time::timeout(WAIT, ws.next()).await.unwrap();
+    let ok: Value = serde_json::from_str(&ok.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(ok, json!(["OK", ev.id, true, ""]));
 }
 
 #[tokio::test]

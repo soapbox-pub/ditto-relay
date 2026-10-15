@@ -7,6 +7,8 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1.0.104"
+# The certificate served with [tls] on, swapped in as it's renewed.
+arc-swap = "1"
 # Tor, built in, for serving the relay as an onion service. Pinned exactly,
 # Arti and its crates together: the relay uses APIs Arti still marks
 # experimental, which change between its releases.
@@ -16,12 +18,16 @@ base64 = "0.23.1"
 futures-util = "0.3.34"
 getrandom = "0.4"
 hex = "0.4.3"
+# Certificates from Let's Encrypt, or any ACME CA, for [tls].
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 libc = "0.2.190"
 # Raw LMDB, wrapped in src/lmdb.rs. heed can't seek or count within a key's
 # sorted duplicates, which the indexes are built on.
 lmdb-master-sys = "0.2.6"
-# The TLS Arti speaks to Tor relays with, which leaves choosing its
-# cryptography to the application.
+# The certificate a TLS-ALPN-01 challenge is answered with.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+# The TLS clients connect with when [tls] is on, and Arti speaks to Tor
+# relays with, which leaves choosing its cryptography to the application.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 safelog = "0.10"
 secp256k1 = { version = "0.33.1", features = ["global-context"] }
@@ -32,6 +38,7 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 tantivy = "0.26"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "process", "io-util", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "1"
 tor-cell = "=0.47.0"
@@ -45,8 +52,11 @@ tor-proto = "=0.47.0"
 tor-rtcompat = "=0.47.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2"
 vader-parity = "0.1.0"
 whatlang = "0.18.0"
+# When a certificate is due for renewal.
+x509-parser = "0.18"
 
 # Soapbox's fork of Arti, a branch per release it patches: relay selection
 # compares family members as plain bytes, where upstream's constant-time
@@ -110,6 +120,8 @@ web-time-compat          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfse
 [dev-dependencies]
 rand = "0.10.3"
 tempfile = "3.27.0"
+# Certificates' validity, for rcgen.
+time = "0.3"
 tokio-tungstenite = "0.29.0"
 
 # A smaller, faster binary, from a build that takes several minutes every time.

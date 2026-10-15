@@ -121,6 +121,9 @@ pub struct Config {
     pub real_ip_header: Option<String>,
     /// What to log, as `tracing_subscriber`'s `EnvFilter` directives.
     pub log: String,
+    /// Serving HTTPS itself, with a certificate it gets over ACME. None
+    /// leaves TLS to a reverse proxy.
+    pub tls: Option<Tls>,
     /// Serving the relay as a Tor onion service too. None turns it off.
     pub tor: Option<Tor>,
 }
@@ -153,6 +156,26 @@ fn http_url(url: String, name: &str) -> anyhow::Result<String> {
     );
     Ok(url)
 }
+
+/// Serving HTTPS on `bind`, with a certificate for `public_url`'s domain
+/// from an ACME CA: see [`crate::tls`].
+#[derive(Debug, Clone)]
+pub struct Tls {
+    /// The domain the certificate is for.
+    pub domain: String,
+    /// Where the ACME account and the certificate are kept.
+    pub dir: PathBuf,
+    /// An address the CA may write to about the certificate.
+    pub email: Option<String>,
+    /// The URL of the CA's ACME directory.
+    pub directory: String,
+    /// Where plain HTTP is redirected to HTTPS, and HTTP-01 challenges are
+    /// answered. None turns it off, leaving only TLS-ALPN-01.
+    pub http_bind: Option<String>,
+}
+
+/// Let's Encrypt's ACME directory.
+pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 /// Serving the relay as a Tor onion service, with Tor built in: see
 /// [`crate::tor`].
@@ -223,7 +246,19 @@ struct File {
     write_policy_timeout_seconds: Option<u64>,
     real_ip_header: Option<String>,
     log: Option<String>,
+    tls: Option<TlsFile>,
     tor: Option<TorFile>,
+}
+
+/// The `[tls]` table as written.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsFile {
+    enabled: Option<bool>,
+    dir: Option<PathBuf>,
+    email: Option<String>,
+    directory: Option<String>,
+    http_bind: Option<String>,
 }
 
 /// The `[tor]` table as written. `arti` and `service` are Arti's own
@@ -387,8 +422,52 @@ impl Config {
             port: tor_port,
             onion_location: tor.onion_location.unwrap_or(true),
         };
+        // Checked when it's off too, as [tor] is, but for the domain, which
+        // only matters with it on.
+        let tls = file.tls.unwrap_or_default();
+        let directory = tls.directory.unwrap_or_else(|| LETS_ENCRYPT.into());
+        anyhow::ensure!(
+            url::Url::parse(&directory)
+                .is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some()),
+            "tls.directory must be the https URL of an ACME directory, eg {LETS_ENCRYPT}"
+        );
+        if let Some(email) = &tls.email {
+            anyhow::ensure!(
+                email.contains('@') && !email.contains(char::is_whitespace),
+                "tls.email must be an email address"
+            );
+        }
+        let tls = match tls.enabled.unwrap_or(false) {
+            false => None,
+            true => Some(Tls {
+                domain: tls_domain(&public_url)?,
+                dir: match tls.dir {
+                    Some(dir) => resolve(dir),
+                    None => data_dir.join("tls"),
+                },
+                email: tls.email,
+                directory,
+                // An empty one turns it off.
+                http_bind: match tls.http_bind {
+                    Some(bind) => Some(bind).filter(|bind| !bind.is_empty()),
+                    None => Some("[::]:80".into()),
+                },
+            }),
+        };
+        // Facing the internet, with TLS: `[::]` takes IPv4 as well on Linux
+        // unless the host has turned that off.
+        let bind = file.bind.unwrap_or_else(|| match tls {
+            Some(_) => "[::]:443".into(),
+            None => "127.0.0.1:13131".into(),
+        });
+        if let Some(http_bind) = tls.as_ref().and_then(|tls| tls.http_bind.as_ref()) {
+            anyhow::ensure!(
+                *http_bind != bind,
+                "tls.http_bind and bind can't be the same address"
+            );
+        }
         Ok(Self {
-            bind: file.bind.unwrap_or_else(|| "127.0.0.1:13131".into()),
+            bind,
             // An empty one turns them off.
             metrics_bind: match file.metrics_bind {
                 Some(bind) => Some(bind).filter(|bind| !bind.is_empty()),
@@ -467,9 +546,26 @@ impl Config {
             negentropy: file.negentropy.unwrap_or(true),
             negentropy_max_events: file.negentropy_max_events.unwrap_or(1_000_000),
             log: file.log.unwrap_or_else(|| DEFAULT_LOG.into()),
+            tls,
             tor: enabled.then_some(tor),
         })
     }
+}
+
+/// The domain `public_url` names, which a certificate can be had for if
+/// it's https on the default port, and a name rather than an address.
+fn tls_domain(public_url: &str) -> anyhow::Result<String> {
+    let url = url::Url::parse(public_url).ok();
+    url.as_ref()
+        .filter(|url| url.scheme() == "https" && url.port().is_none())
+        .and_then(|url| url.domain())
+        .filter(|domain| domain.contains('.'))
+        .map(String::from)
+        .with_context(|| {
+            format!(
+                "[tls] needs public_url, or url, to be https:// (wss://) on the default port at a domain name, which the certificate is for, not {public_url}"
+            )
+        })
 }
 
 fn not_found(env: &Environment) -> anyhow::Error {
@@ -592,6 +688,54 @@ mod tests {
         assert_eq!(tor.dir, Path::new("/etc/ditto-relay/tor"));
         assert_eq!(tor.key_file, Path::new("/k"));
         assert!(config("url = \"ws://x\"\n[tor]\nenabled = true\nonion = true").is_err());
+    }
+
+    #[test]
+    fn tls_is_off_until_enabled() {
+        let c = config("url = \"wss://relay.example.com/\"\n[tls]\nemail = \"a@b.c\"").unwrap();
+        assert!(c.tls.is_none());
+        assert_eq!(c.bind, "127.0.0.1:13131");
+        // Checked all the same.
+        assert!(config("url = \"ws://x\"\n[tls]\ndirectory = \"http://ca.example\"").is_err());
+        assert!(config("url = \"ws://x\"\n[tls]\nemail = \"nope\"").is_err());
+
+        let c = config("url = \"wss://Relay.Example.com/\"\n[tls]\nenabled = true").unwrap();
+        let tls = c.tls.unwrap();
+        assert_eq!(tls.domain, "relay.example.com");
+        assert_eq!(
+            tls.dir,
+            Path::new("/home/someone/.local/share/ditto-relay/tls")
+        );
+        assert_eq!(tls.directory, LETS_ENCRYPT);
+        assert_eq!(tls.http_bind.as_deref(), Some("[::]:80"));
+        assert_eq!(c.bind, "[::]:443");
+
+        let c = config(
+            "url = \"ws://x\"\npublic_url = \"https://relay.example.com/\"\nbind = \"[::]:8443\"\n\
+             [tls]\nenabled = true\ndir = \"certs\"\nhttp_bind = \"\"",
+        )
+        .unwrap();
+        let tls = c.tls.unwrap();
+        assert_eq!(tls.dir, Path::new("/etc/ditto-relay/certs"));
+        assert!(tls.http_bind.is_none());
+        assert_eq!(c.bind, "[::]:8443");
+
+        // The certificate is for a domain, which clients reach over HTTPS.
+        for url in [
+            "ws://relay.example.com/",
+            "wss://relay.example.com:8443/",
+            "wss://203.0.113.1/",
+            "wss://localhost/",
+        ] {
+            assert!(
+                config(&format!("url = \"{url}\"\n[tls]\nenabled = true")).is_err(),
+                "{url}"
+            );
+        }
+        assert!(
+            config("url = \"wss://relay.example.com/\"\nbind = \"[::]:80\"\n[tls]\nenabled = true")
+                .is_err()
+        );
     }
 
     #[test]

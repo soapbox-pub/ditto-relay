@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use axum::serve::ListenerExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tracing_subscriber::EnvFilter;
 
 use ditto_relay::config::{Config, Environment};
@@ -14,6 +14,7 @@ use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
 use ditto_relay::store::{History, IndexedTags, Store};
+use ditto_relay::tls::{self, Tls};
 use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
 use ditto_relay::{control, delete, facets, key, metrics, relay, trends};
@@ -97,6 +98,25 @@ fn check(config: &Config) -> anyhow::Result<()> {
         None => println!("key: a new one to be made in {path}"),
     }
     println!("nip85: {}", if config.nip85 { "on" } else { "off" });
+    match &config.tls {
+        Some(tls_config) => match tls::stored(tls_config) {
+            Ok(Some(certificate)) => println!(
+                "tls: {}, with a certificate that expires in {} days, in {}",
+                tls_config.domain,
+                certificate.days_left(),
+                tls_config.dir.display()
+            ),
+            Ok(None) => println!(
+                "tls: {}, with a certificate to be got from {}",
+                tls_config.domain, tls_config.directory
+            ),
+            Err(error) => println!(
+                "tls: {}, with a new certificate to be got, since {error:#}",
+                tls_config.domain
+            ),
+        },
+        None => println!("tls: off"),
+    }
     match &config.tor {
         Some(tor) => match OnionKey::read(&tor.key_file)? {
             Some(key) => println!(
@@ -184,20 +204,29 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
         None
     };
 
-    let listener = TcpListener::bind(&config.bind).await?;
-    tracing::info!("listening on ws://{}", listener.local_addr()?);
-    // A REQ's events and its EOSE go out as they're ready: Nagle's
-    // algorithm would hold the last back until the client acknowledged
-    // the rest, which with delayed ACKs is some 40 ms.
-    let listener = listener.tap_io(|tcp| {
-        if let Err(err) = tcp.set_nodelay(true) {
-            tracing::debug!("couldn't set TCP_NODELAY: {err}");
+    let listener = bind(&config.bind).await?;
+    // With [tls], its certificate is loaded, and port 80 bound, before
+    // anything is served.
+    let tls = match &config.tls {
+        Some(tls_config) => {
+            let tls = Tls::open(tls_config)?;
+            let redirect = match &tls_config.http_bind {
+                Some(http_bind) => Some(bind(http_bind).await?),
+                None => None,
+            };
+            Some((tls, redirect))
         }
-    });
+        None => None,
+    };
+    let scheme = if tls.is_some() { "wss" } else { "ws" };
+    tracing::info!("listening on {scheme}://{}", listener.local_addr()?);
+    if let Some((_, Some(redirect))) = &tls {
+        tracing::info!("redirecting http://{} to HTTPS", redirect.local_addr()?);
+    }
 
     let metrics = match &config.metrics_bind {
-        Some(bind) => {
-            let listener = TcpListener::bind(bind).await?;
+        Some(metrics_bind) => {
+            let listener = bind(metrics_bind).await?;
             tracing::info!(
                 "serving metrics on http://{}/metrics",
                 listener.local_addr()?
@@ -244,13 +273,34 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
         tracing::info!("shutting down");
         shutdown.cancel();
     });
-    let app = relay::router(state.clone());
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
-    .await?;
+    let app = relay::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+    let shutdown = state.shutdown.clone().cancelled_owned();
+    match tls {
+        Some((tls, redirect)) => {
+            if let Some(redirect) = redirect {
+                let app = tls.redirect_router();
+                let shutdown = state.shutdown.clone().cancelled_owned();
+                tokio::spawn(async move {
+                    let serve = axum::serve(redirect, app).with_graceful_shutdown(shutdown);
+                    if let Err(error) = serve.await {
+                        tracing::error!("serving the redirect to HTTPS failed: {error}");
+                    }
+                });
+            }
+            let listener = tls
+                .listener(listener)?
+                .tap_io(|tls| nodelay(tls.get_ref().0));
+            tls.start(state.shutdown.clone());
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await?;
+        }
+        None => {
+            axum::serve(listener.tap_io(|tcp| nodelay(tcp)), app)
+                .with_graceful_shutdown(shutdown)
+                .await?
+        }
+    }
     state.shut_down().await;
     control.abort();
     let _ = std::fs::remove_file(&socket);
@@ -263,6 +313,28 @@ async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
     tracing::info!("shut down");
 
     Ok(())
+}
+
+/// Listen on `address`.
+async fn bind(address: &str) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(address).await.map_err(|error| {
+        let hint = match error.kind() {
+            std::io::ErrorKind::PermissionDenied => {
+                ": ports below 1024 need root, or CAP_NET_BIND_SERVICE (AmbientCapabilities=CAP_NET_BIND_SERVICE under systemd)"
+            }
+            _ => "",
+        };
+        anyhow::Error::new(error).context(format!("couldn't listen on {address}{hint}"))
+    })
+}
+
+/// A REQ's events and its EOSE go out as they're ready: Nagle's algorithm
+/// would hold the last back until the client acknowledged the rest, which
+/// with delayed ACKs is some 40 ms.
+fn nodelay(tcp: &TcpStream) {
+    if let Err(err) = tcp.set_nodelay(true) {
+        tracing::debug!("couldn't set TCP_NODELAY: {err}");
+    }
 }
 
 /// The command line.

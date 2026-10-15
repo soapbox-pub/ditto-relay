@@ -31,5 +31,6 @@ Ditto Relay is installed. Set url in /etc/ditto-relay/ditto-relay.toml, then:
 
     sudo systemctl enable --now ditto-relay
 
-It listens on 127.0.0.1:13131; put a reverse proxy with TLS in front of it.
+It listens on 127.0.0.1:13131; put a reverse proxy with TLS in front of it, or
+turn on [tls] for it to serve HTTPS itself, with a certificate from Let's Encrypt.
 MSG

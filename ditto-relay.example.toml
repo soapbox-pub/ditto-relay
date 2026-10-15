@@ -19,6 +19,8 @@ url = "wss://relay.example.com/"
 # from. Defaults to url with ws:// made http:// and wss:// made https://.
 #public_url = "https://relay.example.com/"
 
+# Where clients are served. Defaults to 127.0.0.1:13131, for a reverse proxy to
+# forward to, or with [tls] on to [::]:443.
 #bind = "127.0.0.1:13131"
 
 # Where to serve Prometheus metrics, apart from clients. "" turns them off.
@@ -188,6 +190,36 @@ url = "wss://relay.example.com/"
 
 # How long the plugin may take to answer before it's restarted.
 #write_policy_timeout_seconds = 10
+
+###############################################################################
+# HTTPS
+###############################################################################
+
+# Serve HTTPS (wss://) on bind with no reverse proxy in front, with a
+# certificate from Let's Encrypt for public_url's domain, renewed on its own.
+# Needs DNS for the domain pointing here, ports 443 and 80 open to the
+# internet, and root or CAP_NET_BIND_SERVICE, which the systemd unit gives.
+# Turning it on agrees to the CA's terms of service. Leave real_ip_header unset
+# with it: there's no proxy to set the header, so clients could. This table,
+# like [tor]'s, has to come after every setting that isn't in one.
+#[tls]
+#enabled = false
+
+# An address the CA may write to about the certificate. Unset by default.
+#email = "admin@example.com"
+
+# The CA's ACME directory. Try a new setup against Let's Encrypt's staging CA,
+# https://acme-staging-v02.api.letsencrypt.org/directory, which has no rate
+# limits to run into but isn't trusted by clients.
+#directory = "https://acme-v02.api.letsencrypt.org/directory"
+
+# Where plain HTTP is redirected to HTTPS, and the CA's HTTP-01 challenges are
+# answered when its TLS-ALPN-01 ones, on bind, can't be. "" turns it off.
+#http_bind = "[::]:80"
+
+# Holds the ACME account and the certificate, both with private keys. Defaults
+# to tls/ in data_dir.
+#dir = "/var/lib/ditto-relay/tls"
 
 ###############################################################################
 # Tor

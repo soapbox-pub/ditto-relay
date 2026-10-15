@@ -4,6 +4,17 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [Unreleased]
+
+- HTTPS without a reverse proxy. With `[tls] enabled = true`, the relay serves
+  `wss://` on `[::]:443` itself, with a certificate for `public_url`'s domain
+  from Let's Encrypt (or any ACME CA, by `directory`). It renews the
+  certificate with a third of its lifetime left and swaps it in without a
+  restart. The CA validates over TLS-ALPN-01 on 443, or HTTP-01 on 80, where
+  everything else is redirected to HTTPS. `ditto-relay check` says when the
+  certificate expires. The systemd unit grants `CAP_NET_BIND_SERVICE` for the
+  two ports.
+
 ## [2.3.0]
 
 - The relay makes its own key the first time it starts, in `secret.key` in
