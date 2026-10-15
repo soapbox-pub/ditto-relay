@@ -914,50 +914,6 @@ impl Store {
         });
     }
 
-    /// Read the pages each environment's next commits will reuse, up to
-    /// `max` of each, on several threads at once, leaving out those in
-    /// `read` and adding the rest to it. Removing much dirties many pages,
-    /// which a commit writes to pages it reuses from anywhere in the file:
-    /// on ZFS, each would otherwise be read first, one at a time (see
-    /// [`Env::read_pages`](crate::lmdb::Env::read_pages)).
-    pub fn read_reusable(&self, max: usize, read: &mut std::collections::HashSet<(usize, u64)>) {
-        let mut wanted = Vec::new();
-        {
-            let Ok(txn) = self.read() else {
-                return;
-            };
-            for env in 0..self.env.envs() {
-                match self.env.reusable_pages(&txn, env, max) {
-                    Ok(pages) => wanted.extend(
-                        pages
-                            .into_iter()
-                            .map(|page| (env, page))
-                            .filter(|page| read.insert(*page)),
-                    ),
-                    Err(err) => tracing::debug!("reading the free list failed: {err}"),
-                }
-            }
-        }
-        let threads = REMOVAL_PREFETCH_THREADS.min(wanted.len());
-        let Some(chunk) = wanted.len().checked_div(threads) else {
-            return;
-        };
-        std::thread::scope(|scope| {
-            for part in wanted.chunks(chunk + 1) {
-                scope.spawn(move || {
-                    for env in 0..self.env.envs() {
-                        let pages: Vec<u64> = part
-                            .iter()
-                            .filter(|(e, _)| *e == env)
-                            .map(|&(_, page)| page)
-                            .collect();
-                        self.env.read_pages(env, &pages);
-                    }
-                });
-            }
-        });
-    }
-
     /// Offer an encoded event to the store at `now`, applying replacement,
     /// and note in `removed` any event it replaces. The caller has checked
     /// it's valid.

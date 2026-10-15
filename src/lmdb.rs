@@ -348,74 +348,6 @@ impl Env {
         }
     }
 
-    /// How many environments there are.
-    pub fn envs(&self) -> usize {
-        self.ptrs.len()
-    }
-
-    /// Up to `max` of the pages of environment `env` that, as of `txn`, a
-    /// commit will reuse first: those its free list has held longest, the
-    /// lowest first within each of its records, as a writer takes them.
-    pub fn reusable_pages(&self, txn: &Txn, env: usize, max: usize) -> Result<Vec<u64>> {
-        let mut pages = Vec::new();
-        let mut ptr = ptr::null_mut();
-        // The free list is table 0. SAFETY: a live transaction; the cursor
-        // is closed on drop, before it ends.
-        check(unsafe { ffi::mdb_cursor_open(txn.ptrs[env], 0, &mut ptr) })?;
-        let mut cursor = Cursor {
-            ptr,
-            _txn: PhantomData,
-        };
-        let mut entry = cursor.first()?;
-        while let Some((_, record)) = entry
-            && pages.len() < max
-        {
-            // A count, then the pages, highest first, each a size_t.
-            let ids: Vec<u64> = record
-                .as_chunks::<{ size_of::<usize>() }>()
-                .0
-                .iter()
-                .map(|&id| usize::from_ne_bytes(id) as u64)
-                .collect();
-            if let Some((&n, listed)) = ids.split_first() {
-                let listed = &listed[..(n as usize).min(listed.len())];
-                pages.extend(listed.iter().rev().take(max - pages.len()));
-            }
-            entry = cursor.next()?;
-        }
-        Ok(pages)
-    }
-
-    /// Read environment `env`'s `pages` from its file, not its map, so the
-    /// filesystem has them cached: on ZFS, writing a page whose record
-    /// isn't cached reads it first, synchronously. Only a hint, so failing
-    /// is no error.
-    pub fn read_pages(&self, env: usize, pages: &[u64]) {
-        let ptr = self.ptrs[env];
-        // SAFETY: plain data, filled in by LMDB from an open env.
-        let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
-        let mut fd = -1;
-        if check(unsafe { ffi::mdb_env_stat(ptr, &mut stat) }).is_err()
-            || check(unsafe { ffi::mdb_env_get_fd(ptr, &mut fd) }).is_err()
-        {
-            return;
-        }
-        let size = stat.ms_psize as usize;
-        let mut buf = vec![0u8; size];
-        for &page in pages {
-            // SAFETY: reads into a buffer of its length from a file LMDB
-            // holds open; nothing is written to the file or the map.
-            unsafe {
-                libc::pread(
-                    fd,
-                    buf.as_mut_ptr().cast(),
-                    size,
-                    (page * size as u64) as libc::off_t,
-                );
-            }
-        }
-    }
-
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         Ok(RoTxn(self.begin(ffi::MDB_RDONLY)?))
     }
@@ -726,53 +658,6 @@ mod tests {
             env.read_txn().unwrap().get(db, b"a").unwrap(),
             Some(&b"2"[..])
         );
-    }
-
-    /// The free list's pages, the oldest record's first, and they're the
-    /// ones the next commit writes to.
-    #[test]
-    fn finds_the_pages_commits_reuse() {
-        let (_dir, env) = open();
-        let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
-        let mut txn = env.write_txn().unwrap();
-        for i in 0..2000u32 {
-            txn.put(db, &i.to_be_bytes(), &[0; 100]).unwrap();
-        }
-        txn.commit().unwrap();
-        let mut txn = env.write_txn().unwrap();
-        for i in 0..2000u32 {
-            txn.del(db, &i.to_be_bytes(), None).unwrap();
-        }
-        txn.commit().unwrap();
-        // Another commit, so the first's pages are free of every reader.
-        let mut txn = env.write_txn().unwrap();
-        txn.put(db, b"x", b"1").unwrap();
-        txn.commit().unwrap();
-
-        let pages = env
-            .reusable_pages(&env.read_txn().unwrap(), 0, 1000)
-            .unwrap();
-        assert!(pages.len() > 50, "{} pages", pages.len());
-        assert_eq!(
-            env.reusable_pages(&env.read_txn().unwrap(), 0, 10).unwrap(),
-            pages[..10]
-        );
-        let last = env.usage(0).unwrap().used / 4096;
-        assert!(pages.iter().all(|&page| page > 1 && page < last));
-        env.read_pages(0, &pages);
-
-        // What the next commit writes isn't past the end of the file.
-        let mut txn = env.write_txn().unwrap();
-        for i in 0..10u32 {
-            txn.put(db, &i.to_be_bytes(), &[1; 100]).unwrap();
-        }
-        txn.commit().unwrap();
-        assert_eq!(env.usage(0).unwrap().used / 4096, last);
-        // It wrote to the first of them.
-        let after = env
-            .reusable_pages(&env.read_txn().unwrap(), 0, usize::MAX)
-            .unwrap();
-        assert!(!after.contains(&pages[0]) && after.contains(pages.last().unwrap()));
     }
 
     /// A transaction spans every environment: committed together, and

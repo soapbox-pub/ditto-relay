@@ -19,7 +19,6 @@
 //! newest left current. Nothing is kept to refuse them if they're
 //! published again, and the relay's subscribers aren't told.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -37,15 +36,6 @@ pub const CHUNK: usize = 1000;
 
 /// How many chunks past the one being removed [`read_ahead`] reads.
 const AHEAD: usize = 2;
-
-/// How many of the pages each environment's commits will reuse next
-/// [`read_ahead`] keeps read: a chunk's commit writes some 9,000 when
-/// most of the store is on disk.
-const REUSABLE_AHEAD: usize = 40_000;
-
-/// How many reusable pages [`read_ahead`] remembers having read before it
-/// forgets them all, and may read some again.
-const MAX_REMEMBERED_PAGES: usize = 4_000_000;
 
 /// The filter to delete by: `json`, if given, and with `age`, only events
 /// at least that many seconds older than `now`. One of them is needed.
@@ -121,28 +111,14 @@ pub fn remove(
 /// Read ahead of a deletion going through `seqs` a [`CHUNK`] at a time, at
 /// most [`AHEAD`] chunks past the `done` it's through, until it's through
 /// them all or `stop`: so that removing them seldom waits on the disk, as
-/// [`Store::prefetch`] keeps writing from waiting. The pages its commits
-/// will write to are read too, as they come up.
+/// [`Store::prefetch`] keeps writing from waiting.
 pub fn read_ahead(store: &Store, seqs: &[u64], done: &AtomicUsize, stop: &AtomicBool) {
-    let mut reusable = HashSet::new();
-    let read_reusable = |reusable: &mut HashSet<_>| {
-        if reusable.len() > MAX_REMEMBERED_PAGES {
-            reusable.clear();
-        }
-        store.read_reusable(REUSABLE_AHEAD, reusable);
-    };
     for (i, chunk) in seqs.chunks(CHUNK).enumerate() {
-        let mut waited = 0;
         while i * CHUNK > done.load(Ordering::Relaxed) + AHEAD * CHUNK {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
-            waited += 1;
-            // The free list moves on as commits use it.
-            if waited % 10 == 0 {
-                read_reusable(&mut reusable);
-            }
         }
         if stop.load(Ordering::Relaxed) {
             return;
@@ -151,7 +127,6 @@ pub fn read_ahead(store: &Store, seqs: &[u64], done: &AtomicUsize, stop: &Atomic
         if (i + 1) * CHUNK > done.load(Ordering::Relaxed) {
             store.prefetch_removals(chunk);
         }
-        read_reusable(&mut reusable);
     }
 }
 
