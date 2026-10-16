@@ -13,22 +13,33 @@
 //! ranges ahead of the one that copies, only to bring their pages into
 //! memory, so that the disk has many reads to do at once. The copy itself
 //! is a single cursor per table, appended to the new file in order: what the
-//! threads do changes how fast it goes, never what it writes.
+//! threads do changes how fast it goes, never what it writes. A key with
+//! too many values to read one page at a time, as the author of millions of
+//! events has, is split into pieces of its values for the threads to read.
 //!
 //! Only the main environment is copied: `bodies` is written in order, its
 //! freed pages filled by the records that come after them, so it stays
 //! packed.
 
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 
-use crate::lmdb::{Db, DbFlags, Env, Txn};
+use crate::lmdb::{Cursor, Db, DbFlags, Env, Txn};
 
 /// The most ranges a table is split into.
 const MAX_RANGES: usize = 1 << 16;
+
+/// How many values a key has at least for its values to be read ahead in
+/// [pieces](Piece).
+const BIG_KEY: usize = if cfg!(test) { 500 } else { 1 << 16 };
+
+/// How many pieces a big key's values are read ahead in, at most.
+const PIECES: usize = 256;
 
 /// How many ranges ahead of the copy each thread may read.
 const AHEAD_PER_THREAD: usize = 4;
@@ -72,6 +83,15 @@ pub struct Copied {
 /// A run of one table's keys: from `start`, to before `end` or to the last.
 struct Range {
     table: usize,
+    start: Vec<u8>,
+    end: Option<Vec<u8>>,
+}
+
+/// Some of a big key's values, to be read ahead: from `start`, to `end` or
+/// to the last.
+struct Piece {
+    table: usize,
+    key: Vec<u8>,
     start: Vec<u8>,
     end: Option<Vec<u8>>,
 }
@@ -162,10 +182,20 @@ pub fn copy(
     let copying = AtomicUsize::new(0);
     let next = AtomicUsize::new(0);
     let done = AtomicBool::new(false);
-    let ahead = threads * AHEAD_PER_THREAD;
+    let pieces = Mutex::new(VecDeque::new());
+    let reader = Reader {
+        env: &source,
+        tables: &tables,
+        ranges: &ranges,
+        copying: &copying,
+        next: &next,
+        ahead: threads * AHEAD_PER_THREAD,
+        pieces: &pieces,
+        done: &done,
+    };
     std::thread::scope(|scope| -> anyhow::Result<()> {
         for _ in 0..threads {
-            scope.spawn(|| read_ahead(&source, &tables, &ranges, &copying, &next, ahead, &done));
+            scope.spawn(|| reader.run());
         }
         let copied = (|| -> anyhow::Result<()> {
             let (mut entries, mut bytes, mut uncommitted) = (0u64, 0u64, 0u64);
@@ -175,7 +205,7 @@ pub fn copy(
                 copying.store(n, Ordering::Relaxed);
                 let table = &tables[range.table];
                 let mut appender = txn.appender(dests[range.table])?;
-                walk(&reading, table, range, |item| {
+                walk(&reading, table, range, None, |item| {
                     match item {
                         Item::Entry(key, value) => {
                             appender.append(key, value)?;
@@ -193,6 +223,17 @@ pub fn copy(
                             uncommitted += values.len() as u64;
                         }
                     }
+                    // From within a range, as one key can take minutes.
+                    if said.elapsed() >= Duration::from_secs(1) {
+                        progress(&Progress {
+                            table: &table.name,
+                            entries,
+                            total,
+                            bytes: bytes + uncommitted,
+                            elapsed: start.elapsed(),
+                        });
+                        said = Instant::now();
+                    }
                     Ok(())
                 })
                 .with_context(|| format!("Could not copy the table {}", table.name))?;
@@ -201,16 +242,6 @@ pub fn copy(
                     txn.commit()?;
                     txn = dest.write_txn()?;
                     bytes += std::mem::take(&mut uncommitted);
-                }
-                if said.elapsed() >= Duration::from_secs(1) {
-                    progress(&Progress {
-                        table: &table.name,
-                        entries,
-                        total,
-                        bytes: bytes + uncommitted,
-                        elapsed: start.elapsed(),
-                    });
-                    said = Instant::now();
                 }
             }
             txn.commit()?;
@@ -423,11 +454,17 @@ fn midpoint(a: &[u8], b: &[u8], integer: bool) -> Vec<u8> {
     half
 }
 
-/// Walk `range` of `table`, in order, handing `visit` what's there.
+/// Told of a big key, its first value and its last, by [`walk`].
+type BigKey<'a> = &'a mut dyn FnMut(&[u8], &[u8], &[u8]);
+
+/// Walk `range` of `table`, in order, handing `visit` what's there. With
+/// `big`, a key with [`BIG_KEY`] values or more is handed to it instead,
+/// with its first and last values, and its values aren't walked.
 fn walk<'t>(
     txn: &'t Txn,
     table: &Table,
     range: &Range,
+    mut big: Option<BigKey>,
     mut visit: impl FnMut(Item<'t>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut cursor = txn.cursor(table.db)?;
@@ -444,6 +481,14 @@ fn walk<'t>(
             continue;
         }
         let size = value.len();
+        if let Some(big) = &mut big
+            && cursor.count()? >= BIG_KEY
+        {
+            let last = cursor.last_dup()?.map_or(value, |(_, last)| last);
+            big(key, value, last);
+            entry = cursor.next_nodup()?;
+            continue;
+        }
         // At the key's first value, so its first page is its first values.
         let page = cursor.get_multiple()?;
         if page.is_empty() {
@@ -471,51 +516,137 @@ fn walk<'t>(
     Ok(())
 }
 
-/// Read ranges ahead of the one being copied, no more than `ahead` of it,
-/// so their pages are in memory when it gets to them, until `done`.
-fn read_ahead(
-    env: &Env,
-    tables: &[Table],
-    ranges: &[Range],
-    copying: &AtomicUsize,
-    next: &AtomicUsize,
+/// The threads that read ahead of the copy.
+struct Reader<'a> {
+    env: &'a Env,
+    tables: &'a [Table],
+    ranges: &'a [Range],
+    /// The range being copied.
+    copying: &'a AtomicUsize,
+    /// The next range for a thread to read.
+    next: &'a AtomicUsize,
+    /// How many ranges ahead of the copy a thread may read.
     ahead: usize,
-    done: &AtomicBool,
-) {
-    let Ok(txn) = env.read_txn() else {
-        return;
-    };
-    loop {
-        let n = next.fetch_add(1, Ordering::Relaxed);
-        let Some(range) = ranges.get(n) else {
+    /// Pieces of big keys, in order, read before any more ranges.
+    pieces: &'a Mutex<VecDeque<Piece>>,
+    done: &'a AtomicBool,
+}
+
+impl Reader<'_> {
+    /// Read ranges, and pieces of big keys in them, ahead of the one being
+    /// copied, so their pages are in memory when it gets to them, until
+    /// it's done.
+    fn run(&self) {
+        let Ok(txn) = self.env.read_txn() else {
             return;
         };
-        while n > copying.load(Ordering::Relaxed) + ahead {
-            if done.load(Ordering::Relaxed) {
-                return;
+        while !self.done.load(Ordering::Relaxed) {
+            let piece = self.pieces.lock().expect("unpoisoned").pop_front();
+            if let Some(piece) = piece {
+                if let Err(err) = read_piece(&txn, &self.tables[piece.table], &piece) {
+                    tracing::debug!("reading ahead failed: {err:#}");
+                }
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        if done.load(Ordering::Relaxed) {
-            return;
-        }
-        // Copied already, or being copied: reading it now is no help.
-        if n <= copying.load(Ordering::Relaxed) {
-            continue;
-        }
-        let read = walk(&txn, &tables[range.table], range, |item| {
-            let bytes = match item {
-                Item::Entry(_, value) => value,
-                Item::Dups { values, .. } => values,
+            let n = self.next.load(Ordering::Relaxed);
+            let copying = self.copying.load(Ordering::Relaxed);
+            // None left, or far enough ahead: big keys' pieces may come.
+            if n >= self.ranges.len() || n > copying + self.ahead {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if self
+                .next
+                .compare_exchange(n, n + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            // Copied already: reading it now is no help.
+            if n < copying {
+                continue;
+            }
+            let range = &self.ranges[n];
+            let table = &self.tables[range.table];
+            let mut big = |key: &[u8], first: &[u8], last: &[u8]| {
+                let bounds = spread(first, last);
+                let mut pieces = self.pieces.lock().expect("unpoisoned");
+                for (n, start) in bounds.iter().enumerate() {
+                    pieces.push_back(Piece {
+                        table: range.table,
+                        key: key.to_vec(),
+                        start: start.clone(),
+                        end: bounds.get(n + 1).cloned(),
+                    });
+                }
             };
-            // A byte a page, as values may span several.
-            std::hint::black_box(bytes.iter().step_by(4096).fold(0u8, |a, &b| a ^ b));
-            Ok(())
-        });
-        if let Err(err) = read {
-            tracing::debug!("reading ahead failed: {err:#}");
+            let read = walk(&txn, table, range, Some(&mut big), |item| {
+                let bytes = match item {
+                    Item::Entry(_, value) => value,
+                    Item::Dups { values, .. } => values,
+                };
+                touch(bytes);
+                Ok(())
+            });
+            if let Err(err) = read {
+                tracing::debug!("reading ahead failed: {err:#}");
+            }
         }
     }
+}
+
+/// Read a byte of each page of `bytes`, as values may span several.
+fn touch(bytes: &[u8]) {
+    std::hint::black_box(bytes.iter().step_by(4096).fold(0u8, |a, &b| a ^ b));
+}
+
+/// Where the [pieces](Piece) of a key whose values run from `first` to
+/// `last` begin: `first`, then values about evenly spread up to `last`.
+fn spread(first: &[u8], last: &[u8]) -> Vec<Vec<u8>> {
+    let mut bounds = vec![first.to_vec(), last.to_vec()];
+    // Each round doubles the pieces, bounds.len() - 1, at most.
+    while 2 * (bounds.len() - 1) <= PIECES {
+        let mut split = Vec::with_capacity(bounds.len() * 2);
+        for pair in bounds.windows(2) {
+            split.push(pair[0].clone());
+            let mut middle = midpoint(&pair[0], &pair[1], false);
+            // The size values are; still not before the first.
+            middle.truncate(first.len());
+            if middle > pair[0] && middle < pair[1] {
+                split.push(middle);
+            }
+        }
+        split.push(bounds[bounds.len() - 1].clone());
+        if split.len() == bounds.len() {
+            break;
+        }
+        bounds = split;
+    }
+    bounds.pop();
+    bounds
+}
+
+/// Read `piece` of a big key's values, returning how many it read.
+fn read_piece(txn: &Txn, table: &Table, piece: &Piece) -> anyhow::Result<usize> {
+    let mut cursor: Cursor = txn.cursor(table.db)?;
+    if cursor.get_both_range(&piece.key, &piece.start)?.is_none() {
+        return Ok(0);
+    }
+    let size = piece.start.len();
+    let mut read = 0;
+    let mut page = Some(cursor.get_multiple()?);
+    while let Some(values) = page {
+        touch(values);
+        read += values.len() / size;
+        let past = values.len().checked_sub(size).map(|last| &values[last..]);
+        if let (Some(end), Some(last)) = (&piece.end, past)
+            && last >= &end[..]
+        {
+            break;
+        }
+        page = cursor.next_multiple()?;
+    }
+    Ok(read)
 }
 
 #[cfg(test)]
@@ -670,6 +801,53 @@ mod tests {
                 bounds.len()
             );
         }
+    }
+
+    /// A big key's pieces cover its values, from the first to the last.
+    #[test]
+    fn reads_a_big_key_in_pieces() {
+        let first = 5u64.to_be_bytes();
+        let last = 1_000_000u64.to_be_bytes();
+        let bounds = spread(&first, &last);
+        assert!(bounds.len() > PIECES / 2 && bounds.len() <= PIECES);
+        assert_eq!(bounds[0], first);
+        assert!(bounds.windows(2).all(|w| w[0] < w[1] && w[1].len() == 8));
+        assert!(bounds.last().unwrap() < &last.to_vec());
+        assert_eq!(spread(&first, &6u64.to_be_bytes()), [first.to_vec()]);
+
+        let dir = tempfile::tempdir().unwrap();
+        fill(dir.path());
+        let env = Env::open_read_only(dir.path(), 1 << 28, 8, 16).unwrap();
+        let (name, db, flags) = env
+            .tables()
+            .unwrap()
+            .into_iter()
+            .find(|(name, ..)| name == "dups")
+            .unwrap();
+        let table = Table { name, db, flags };
+        let txn = env.read_txn().unwrap();
+        let mut cursor = txn.cursor(db).unwrap();
+        let (_, first) = cursor.set(b"big").unwrap().unwrap();
+        let count = cursor.count().unwrap();
+        assert!(count >= BIG_KEY, "{count}");
+        let last = cursor.last_dup().unwrap().unwrap().1;
+        let bounds = spread(first, last);
+        assert!(bounds.len() > 4);
+        let read: usize = bounds
+            .iter()
+            .enumerate()
+            .map(|(n, start)| {
+                let piece = Piece {
+                    table: 0,
+                    key: b"big".to_vec(),
+                    start: start.clone(),
+                    end: bounds.get(n + 1).cloned(),
+                };
+                read_piece(&txn, &table, &piece).unwrap()
+            })
+            .sum();
+        // Whole pages, so some twice.
+        assert!(read >= count, "{read} {count}");
     }
 
     #[test]
