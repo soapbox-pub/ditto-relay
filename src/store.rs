@@ -40,7 +40,9 @@
 //! in memory, and records are appended a commit at a time, in one write.
 //! See [`crate::lmdb`] for how the two are kept consistent; [`Store::open`]
 //! drops records a crash left behind, under sequence numbers never
-//! committed, and a record removed meanwhile is read as gone.
+//! committed, and a record removed meanwhile is read as gone. After a crash
+//! of the machine, the store is put back at its last
+//! [checkpoint](crate::checkpoint), made every few seconds as it's written.
 //!
 //! `ids` is keyed by the whole id, so that whether an event is here doesn't
 //! need its record read. `created` files every stamp under
@@ -115,6 +117,7 @@ use anyhow::{Context, anyhow, bail};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+use crate::checkpoint::{self, Recovered};
 use crate::delete;
 use crate::deletions;
 use crate::event::KindClass;
@@ -122,7 +125,7 @@ use crate::event::decode_hex;
 use crate::facets;
 use crate::filter::Filter;
 use crate::hll::{self, Registers};
-use crate::lmdb::{Db, DbFlags, Env, Opening, Result, RoTxn, RwTxn, Txn, Usage};
+use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
 use crate::metrics::METRICS;
 use crate::rank::{self, Rank};
 use crate::record::{self, Element, EventView, Header, tag_value};
@@ -409,36 +412,11 @@ impl Tables {
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         })
     }
-
-    fn all(self) -> Vec<Db> {
-        vec![
-            self.events,
-            self.ids,
-            self.created,
-            self.kinds,
-            self.authors,
-            self.author_kinds,
-            self.tags,
-            self.hll,
-            self.facets,
-            self.wot,
-            self.wot_queue,
-            self.engagement,
-            self.scores,
-            self.ranked,
-            self.applied,
-            self.rank_queue,
-            self.zaps,
-            self.replaceable,
-            self.history,
-            self.expiring,
-            self.meta,
-        ]
-    }
 }
 
 pub struct Store {
-    env: Env,
+    /// Shared with the thread that makes a checkpoint durable.
+    env: Arc<Env>,
     pub tables: Tables,
     pub indexed_tags: IndexedTags,
     history: History,
@@ -452,13 +430,29 @@ pub struct Store {
     /// The sequence number from which deletions are missing from the
     /// filter, until it's [caught up](Self::catch_up_deletions).
     deletions_from: u64,
+    /// The database's directory, where its checkpoint is kept.
+    dir: PathBuf,
+    /// The id of the boot of the machine the store was opened in.
+    boot_id: Option<String>,
+    checkpoints: Mutex<Checkpoints>,
+}
+
+/// When the store's [checkpoints](crate::checkpoint) are made.
+struct Checkpoints {
+    /// When the last was begun.
+    last: Instant,
+    /// The one being made durable, if any.
+    finishing: Option<JoinHandle<()>>,
 }
 
 impl Store {
+    /// Open the store at `dir`, creating it if need be. If the machine has
+    /// crashed since it was last open, it's put back as it was at its last
+    /// [checkpoint](crate::checkpoint) first. A checkpoint of it as it is
+    /// is made before anything's written.
     pub fn open(
         dir: &Path,
         map_size: usize,
-        opening: Opening,
         indexed_tags: IndexedTags,
         history: History,
         wot: Option<Wot>,
@@ -467,8 +461,6 @@ impl Store {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("Could not create the database directory {}", dir.display())
         })?;
-        let mut env = Env::open(dir, map_size, opening, 32, 1024)
-            .with_context(|| format!("Could not open the database at {}", dir.display()))?;
         let bodies = dir.join(BODIES_DIR);
         std::fs::create_dir_all(&bodies).with_context(|| {
             format!(
@@ -476,9 +468,32 @@ impl Store {
                 bodies.display()
             )
         })?;
+        let boot_id = checkpoint::boot_id();
+        let files = checkpoint::files(dir, &[&bodies]);
+        let recovering = || format!("Could not restore the database at {}", dir.display());
+        match checkpoint::recover(dir, &files, boot_id.as_deref()).with_context(recovering)? {
+            Recovered::Nothing | Recovered::SameBoot => {}
+            Recovered::Restored(txnids) => tracing::warn!(
+                "the machine went down since the database was last open: put it back as it was at its last checkpoint, commits {txnids:?}, losing what was written after"
+            ),
+            Recovered::Ignored(why) => {
+                tracing::warn!("not restoring the database's checkpoint, as {why}")
+            }
+        }
+        let mut env = Env::open(dir, map_size, 32, 1024)
+            .with_context(|| format!("Could not open the database at {}", dir.display()))?;
         let bodies = env
-            .attach(&bodies, map_size, opening, 1, 1024)
+            .attach(&bodies, map_size, 1, 1024)
             .with_context(|| format!("Could not open the database at {}", bodies.display()))?;
+        // Before anything's written: until it's durable, LMDB may write
+        // over the last checkpoint's pages.
+        let metas = checkpoint::begin(&env)?;
+        checkpoint::finish(&env, dir, &files, boot_id.as_deref(), &metas).with_context(|| {
+            format!(
+                "Could not save the database's checkpoint in {}",
+                dir.display()
+            )
+        })?;
         let tables = Tables::open(&env, bodies)?;
         // Where an older `ditto-relay delete`, which wrote the store itself,
         // left what it removed for the search indexer to delete.
@@ -499,7 +514,7 @@ impl Store {
             )
         })?;
         let store = Store {
-            env,
+            env: Arc::new(env),
             bodies,
             tables,
             indexed_tags,
@@ -509,6 +524,12 @@ impl Store {
             deletions,
             deletions_path,
             deletions_from: covered.unwrap_or(1),
+            dir: dir.to_path_buf(),
+            boot_id,
+            checkpoints: Mutex::new(Checkpoints {
+                last: Instant::now(),
+                finishing: None,
+            }),
         };
         let next = store.drop_uncommitted()?;
         store.name()?;
@@ -535,13 +556,13 @@ impl Store {
         rank: Rank,
     ) -> anyhow::Result<Store> {
         let opening = || format!("Could not open the database at {}", dir.display());
-        let mut env = Env::open_read_only(dir, map_size, false, 32, 1024).with_context(opening)?;
+        let mut env = Env::open_read_only(dir, map_size, 32, 1024).with_context(opening)?;
         let bodies = env
-            .attach(&dir.join(BODIES_DIR), map_size, Opening::SYNC, 1, 1024)
+            .attach(&dir.join(BODIES_DIR), map_size, 1, 1024)
             .with_context(opening)?;
         let tables = Tables::open(&env, bodies).with_context(opening)?;
         Ok(Store {
-            env,
+            env: Arc::new(env),
             bodies,
             tables,
             indexed_tags,
@@ -552,32 +573,76 @@ impl Store {
             deletions: deletions::Filter::new(DELETION_FILTER_BITS),
             deletions_path: dir.join(DELETION_FILTER_FILE),
             deletions_from: 1,
+            dir: dir.to_path_buf(),
+            boot_id: None,
+            checkpoints: Mutex::new(Checkpoints {
+                last: Instant::now(),
+                finishing: None,
+            }),
         })
     }
 
-    /// Check that the store at `dir`, or with `previous` the commit before
-    /// its latest, can be read: see [`Env::check`]. Pages a crash left
-    /// unwritten may be read as anything, and LMDB trusts what it reads,
-    /// so this can crash rather than fail, and is best run in a process of
-    /// its own. A store not yet made is fine.
-    pub fn check_readable(dir: &Path, map_size: usize, previous: bool) -> Result<()> {
-        if !dir.join("data.mdb").exists() {
-            return Ok(());
+    /// The data files of the store's environments.
+    fn files(&self) -> Vec<PathBuf> {
+        checkpoint::files(&self.dir, &[&self.dir.join(BODIES_DIR)])
+    }
+
+    /// Begin a [checkpoint](crate::checkpoint) of the latest commit if one's
+    /// due and the last is durable, and make it durable on a thread of its
+    /// own. Called before each write transaction begins, between commits.
+    fn checkpoint_if_due(&self) {
+        let mut checkpoints = self.checkpoints.lock().expect("unpoisoned");
+        if checkpoints.last.elapsed() < checkpoint::INTERVAL
+            || checkpoints
+                .finishing
+                .as_ref()
+                .is_some_and(|f| !f.is_finished())
+        {
+            return;
         }
-        let mut env = Env::open_read_only(dir, map_size, previous, 32, 1024)?;
-        let opening = Opening {
-            sync: true,
-            previous,
+        checkpoints.last = Instant::now();
+        let metas = match checkpoint::begin(&self.env) {
+            Ok(metas) => metas,
+            Err(err) => {
+                tracing::error!("beginning a checkpoint failed: {err:#}");
+                return;
+            }
         };
-        let bodies = env.attach(&dir.join(BODIES_DIR), map_size, opening, 1, 1024)?;
-        let tables = match Tables::open(&env, bodies) {
-            Ok(tables) => tables.all(),
-            // Made by an older relay, without every table: LMDB's own are
-            // still checked.
-            Err(err) if err.is_not_found() => Vec::new(),
-            Err(err) => return Err(err),
-        };
-        env.check(&tables)
+        let (env, dir, files, boot_id) = (
+            self.env.clone(),
+            self.dir.clone(),
+            self.files(),
+            self.boot_id.clone(),
+        );
+        checkpoints.finishing = Some(std::thread::spawn(move || {
+            let start = Instant::now();
+            match checkpoint::finish(&env, &dir, &files, boot_id.as_deref(), &metas) {
+                Ok(()) if start.elapsed() > checkpoint::INTERVAL => tracing::warn!(
+                    "a checkpoint took {:.1?}, longer than the time between them",
+                    start.elapsed()
+                ),
+                Ok(()) => tracing::debug!("checkpointed in {:.1?}", start.elapsed()),
+                Err(err) => tracing::error!("a checkpoint failed: {err:#}"),
+            }
+        }));
+    }
+
+    /// Make a checkpoint of the latest commit, durably, before returning,
+    /// as before stopping, so a crash of the machine after loses nothing.
+    pub fn checkpoint(&self) -> anyhow::Result<()> {
+        let mut checkpoints = self.checkpoints.lock().expect("unpoisoned");
+        if let Some(finishing) = checkpoints.finishing.take() {
+            let _ = finishing.join();
+        }
+        checkpoints.last = Instant::now();
+        let metas = checkpoint::begin(&self.env)?;
+        checkpoint::finish(
+            &self.env,
+            &self.dir,
+            &self.files(),
+            self.boot_id.as_deref(),
+            &metas,
+        )
     }
 
     /// Remove the records a crash left in `bodies` under sequence numbers
@@ -712,6 +777,7 @@ impl Store {
     }
 
     pub fn write(&self) -> Result<RwTxn<'_>> {
+        self.checkpoint_if_due();
         self.env.write_txn()
     }
 
@@ -764,8 +830,8 @@ impl Store {
             .map_or(1, |v| u64::from_be_bytes(v.try_into().unwrap_or_default())))
     }
 
-    /// Never give out a sequence number below `next`. Without sync, a crash
-    /// of the machine can lose the latest commits while what's kept beside
+    /// Never give out a sequence number below `next`. A crash of the
+    /// machine loses the commits since the last checkpoint while what's kept beside
     /// the store, like the search index, knows of the events they stored:
     /// their sequence numbers mustn't be given to others.
     pub fn skip_to(&self, next: u64) -> Result<()> {
@@ -2135,6 +2201,10 @@ impl Writer {
                     Ok(covered) => save_deletions(&store, covered),
                     Err(err) => tracing::error!("reading the next seq failed: {err}"),
                 }
+                // So a crash of the machine after it stops loses nothing.
+                if let Err(err) = store.checkpoint() {
+                    tracing::error!("the last checkpoint failed: {err:#}");
+                }
             })
             .expect("failed to spawn writer thread");
 
@@ -2158,7 +2228,7 @@ impl Writer {
     }
 
     /// Remove those of `seqs` that `filter` matches, as `ditto-relay delete`
-    /// asks, a chunk per transaction, paced as [`Deletion`] says, between
+    /// asks, a chunk per transaction, paced by how long each takes, between
     /// the writer's other work, and tell the search indexer what went.
     /// Dropping what's returned abandons what's left.
     pub fn delete(
@@ -2257,7 +2327,7 @@ pub mod tests {
 
     /// A store keeping every kind's history.
     pub fn open() -> (tempfile::TempDir, Store) {
-        open_with(1 << 26, History::new(true, vec![], 20))
+        open_with(1 << 30, History::new(true, vec![], 20))
     }
 
     fn open_with(map_size: usize, history: History) -> (tempfile::TempDir, Store) {
@@ -2268,36 +2338,11 @@ pub mod tests {
 
     /// The store in `dir`, as [`open`] opens it.
     pub fn open_in(dir: &Path) -> Store {
-        open_in_with(dir, 1 << 26, History::new(true, vec![], 20))
+        open_in_with(dir, 1 << 30, History::new(true, vec![], 20))
     }
 
     fn open_in_with(dir: &Path, map_size: usize, history: History) -> Store {
-        Store::open(
-            dir,
-            map_size,
-            Opening::SYNC,
-            test_tags(),
-            history,
-            None,
-            Rank::default(),
-        )
-        .unwrap()
-    }
-
-    /// A sound store can be read, its latest commit and the one before,
-    /// and so can one not yet made. A corrupt one is in [`crate::lmdb`]'s
-    /// tests.
-    #[test]
-    fn checks_whether_a_store_can_be_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let gone = dir.path().join("gone");
-        assert!(Store::check_readable(&gone, 1 << 26, false).is_ok());
-        let store = open_in(dir.path());
-        put(&store, &signed(1, 100, 1, vec![], "hi"));
-        // LMDB must not have an environment open twice in a process.
-        drop(store);
-        assert!(Store::check_readable(dir.path(), 1 << 26, false).is_ok());
-        assert!(Store::check_readable(dir.path(), 1 << 26, true).is_ok());
+        Store::open(dir, map_size, test_tags(), history, None, Rank::default()).unwrap()
     }
 
     pub fn put(store: &Store, event: &Event) -> Outcome {
@@ -2677,7 +2722,6 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
-            Opening::SYNC,
             test_tags(),
             history,
             None,
@@ -2697,7 +2741,6 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
-            Opening::SYNC,
             test_tags(),
             history,
             None,
@@ -2951,7 +2994,6 @@ pub mod tests {
             Store::open(
                 dir.path(),
                 1 << 26,
-                Opening::SYNC,
                 test_tags(),
                 history,
                 None,
@@ -3026,7 +3068,6 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
-            Opening::SYNC,
             test_tags(),
             history,
             None,

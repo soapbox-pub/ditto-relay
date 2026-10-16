@@ -34,14 +34,6 @@ pub struct Config {
     pub db_path: PathBuf,
     /// LMDB map size in bytes. This is virtual address space, not disk usage.
     pub map_size: usize,
-    /// Whether each write is on disk before it's answered. Without, the
-    /// kernel writes commits to disk when it likes, which makes writes
-    /// several times faster, but a crash of the machine (not just the
-    /// relay) loses the latest. On a filesystem that keeps writes in
-    /// order, as ZFS does, what's left is sound; on others it can be
-    /// corrupt, and the relay then opens the commit before the latest if
-    /// that one's sound.
-    pub lmdb_sync: bool,
     /// The relay's own URL, which NIP-42 authentication and NIP-62 requests
     /// to vanish name it by.
     pub url: String,
@@ -209,7 +201,11 @@ struct File {
     metrics_bind: Option<String>,
     data_dir: Option<PathBuf>,
     map_size: Option<usize>,
-    lmdb_sync: Option<bool>,
+    /// No longer used: the store is never flushed a commit at a time, and
+    /// survives a crash of the machine by its checkpoints. Accepted, so a
+    /// file that still sets it loads.
+    #[serde(rename = "lmdb_sync")]
+    _lmdb_sync: Option<serde::de::IgnoredAny>,
     url: Option<String>,
     public_url: Option<String>,
     name: Option<String>,
@@ -482,7 +478,6 @@ impl Config {
             },
             db_path: data_dir.join("db"),
             map_size: file.map_size.unwrap_or(1 << 40),
-            lmdb_sync: file.lmdb_sync.unwrap_or(true),
             url,
             public_url,
             name: file.name.unwrap_or_else(|| "Ditto Relay".into()),
@@ -651,6 +646,14 @@ mod tests {
         assert!(c.auth_kinds.is_empty());
         assert_eq!(c.software.as_deref(), Some(landing::REPOSITORY));
         assert_eq!((c.icon, c.banner), (Image::Builtin, Image::Builtin));
+    }
+
+    /// `lmdb_sync`, gone, is still accepted from older configs.
+    #[test]
+    fn loads_an_old_lmdb_sync() {
+        for sync in ["true", "false"] {
+            assert!(config(&format!("url = \"wss://x/\"\nlmdb_sync = {sync}")).is_ok());
+        }
     }
 
     #[test]

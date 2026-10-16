@@ -46,15 +46,6 @@ url = "wss://relay.example.com/"
 # LMDB map size in bytes: virtual address space, not disk usage.
 #map_size = 1099511627776
 
-# Whether each write is on disk before it's answered. Turned off, writes are
-# several times faster, but a crash of the machine (not just the relay) loses
-# the last few seconds of them. On a filesystem that keeps writes in order, as
-# ZFS does, the database is sound after a crash all the same; on others, such
-# as ext4, it can be corrupt. On ZFS, `zfs set sync=disabled` on the database's
-# dataset has the same effect with this left on, and keeps the search index in
-# step with the database too.
-#lmdb_sync = true
-
 ###############################################################################
 # NIP-11
 ###############################################################################
