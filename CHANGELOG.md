@@ -21,6 +21,12 @@ it is tagged.
   open to everyone.
   A connection is challenged to authenticate only once it's refused something
   for want of it.
+- `ditto-relay compact` rewrites the database's indexes into a new file,
+  holding only what's live, packed in order, with the relay stopped. The old
+  file is kept beside it until it's removed. After a big delete, LMDB's file
+  stays as big as ever, with what's left scattered through it; packed, far
+  more of it stays in memory. It reads on 32 threads, ahead of the copy, as
+  `mdb_copy -c` waits on the disk for one page at a time.
 - Writes are much faster: commits are no longer flushed to disk one at a
   time, and `lmdb_sync` is gone (a config that sets it still loads). The
   database survives a crash of the machine, on any filesystem, by

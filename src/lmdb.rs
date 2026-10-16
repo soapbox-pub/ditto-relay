@@ -127,6 +127,21 @@ impl DbFlags {
         }
         bits
     }
+
+    /// The flags of a table LMDB says has `bits`, if it's one of the kinds
+    /// this module makes.
+    fn from_bits(bits: u32) -> Result<DbFlags> {
+        let flags = DbFlags {
+            dup_sort: bits & ffi::MDB_DUPSORT != 0,
+            dup_fixed: bits & ffi::MDB_DUPFIXED != 0,
+            integer_key: bits & ffi::MDB_INTEGERKEY != 0,
+        };
+        let known = ffi::MDB_DUPSORT | ffi::MDB_DUPFIXED | ffi::MDB_INTEGERKEY;
+        if bits & !known != 0 || flags.dup_sort != flags.dup_fixed {
+            return Err(Error(ffi::MDB_INCOMPATIBLE));
+        }
+        Ok(flags)
+    }
 }
 
 /// A table within one of an [`Env`]'s environments.
@@ -379,6 +394,38 @@ impl Env {
         Ok(Some(entries))
     }
 
+    /// Every table in the first environment, opened, with its flags, in
+    /// the order of their names. Like [`create_db`](Self::create_db), call
+    /// it before any other transaction.
+    pub fn tables(&self) -> Result<Vec<(String, Db, DbFlags)>> {
+        let txn = self.begin(ffi::MDB_RDONLY)?;
+        let ptr = txn.ptrs[0];
+        let mut main = 0;
+        // SAFETY: a live transaction; a null name is the table of tables.
+        check(unsafe { ffi::mdb_dbi_open(ptr, ptr::null(), 0, &mut main) })?;
+        let mut names = Vec::new();
+        let mut cursor = txn.cursor(Db { dbi: main, env: 0 })?;
+        let mut entry = cursor.first()?;
+        while let Some((name, _)) = entry {
+            names.push(String::from_utf8(name.to_vec()).map_err(|_| Error(ffi::MDB_INCOMPATIBLE))?);
+            entry = cursor.next()?;
+        }
+        drop(cursor);
+        let mut tables = Vec::new();
+        for name in names {
+            let c_name = CString::new(name.as_str()).map_err(|_| Error(ffi::MDB_INCOMPATIBLE))?;
+            let (mut dbi, mut bits) = (0, 0);
+            // SAFETY: a live transaction and a NUL-terminated name. An
+            // existing table's flags are its own, whatever's passed.
+            check(unsafe { ffi::mdb_dbi_open(ptr, c_name.as_ptr(), 0, &mut dbi) })?;
+            check(unsafe { ffi::mdb_dbi_flags(ptr, dbi, &mut bits) })?;
+            tables.push((name, Db { dbi, env: 0 }, DbFlags::from_bits(bits)?));
+        }
+        // Committed, so the handles outlive it.
+        RwTxn(txn).commit()?;
+        Ok(tables)
+    }
+
     /// Write a compacted copy of the environment `env` into the directory
     /// `path`.
     #[cfg(test)]
@@ -505,6 +552,13 @@ impl Txn<'_> {
         })
     }
 
+    /// How `a` and `b` compare as `db`'s keys.
+    pub fn cmp(&self, db: Db, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        let (a, b) = (val(a), val(b));
+        // SAFETY: a live transaction; LMDB only reads the two values.
+        unsafe { ffi::mdb_cmp(self.of(db), db.dbi, &a, &b) }.cmp(&0)
+    }
+
     /// How many entries `db` holds, counting each duplicate.
     pub fn len(&self, db: Db) -> Result<usize> {
         // SAFETY: MDB_stat is plain data, filled in by LMDB.
@@ -576,6 +630,18 @@ impl RwTxn<'_> {
             ffi::MDB_KEYEXIST => Ok(false),
             code => check(code).map(|()| true),
         }
+    }
+
+    /// A cursor that appends to `db`, for writing a table in order.
+    pub fn appender(&mut self, db: Db) -> Result<Appender<'_>> {
+        let mut ptr = ptr::null_mut();
+        // SAFETY: a live write transaction, borrowed mutably while the
+        // cursor lives; it's closed on drop.
+        check(unsafe { ffi::mdb_cursor_open(self.0.of(db), db.dbi, &mut ptr) })?;
+        Ok(Appender {
+            ptr,
+            _txn: PhantomData,
+        })
     }
 
     /// Remove a key and all its values, or with `value`, just that one value
@@ -653,9 +719,18 @@ impl<'t> Cursor<'t> {
         self.op(None, None, ffi::MDB_FIRST)
     }
 
+    /// The last entry, the last value of the last key.
+    pub fn last(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_LAST)
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Entry<'t>>> {
         self.op(None, None, ffi::MDB_NEXT)
+    }
+
+    pub fn prev(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_PREV)
     }
 
     /// The last value of the current key.
@@ -714,6 +789,65 @@ impl<'t> Cursor<'t> {
 }
 
 impl Drop for Cursor<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the cursor's transaction is still alive (it's borrowed).
+        unsafe { ffi::mdb_cursor_close(self.ptr) }
+    }
+}
+
+/// A cursor writing a table in order, from [`RwTxn::appender`]. LMDB fills
+/// each page before starting the next, rather than splitting them in half.
+/// Anything out of order is refused with `MDB_KEYEXIST`.
+pub struct Appender<'t> {
+    ptr: *mut ffi::MDB_cursor,
+    _txn: PhantomData<&'t mut ()>,
+}
+
+impl Appender<'_> {
+    /// Store `value` under `key`, which must sort after every key in the
+    /// table.
+    pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let (mut k, mut v) = (val(key), val(value));
+        // SAFETY: a live cursor of a live write transaction.
+        check(unsafe { ffi::mdb_cursor_put(self.ptr, &mut k, &mut v, ffi::MDB_APPEND) })
+    }
+
+    /// In a `DUP_FIXED` table, store `values`, packed, each `size` bytes and
+    /// in order, under `key`, after its other values. With `new`, `key` must
+    /// sort after every key in the table; else it must be the last.
+    pub fn append_dups(&mut self, key: &[u8], values: &[u8], size: usize, new: bool) -> Result<()> {
+        if size == 0 || values.is_empty() || !values.len().is_multiple_of(size) {
+            return Err(Error(libc::EINVAL));
+        }
+        let count = values.len() / size;
+        let mut k = val(key);
+        // MDB_MULTIPLE: the first the size and where, the second how many.
+        let mut data = [
+            ffi::MDB_val {
+                mv_size: size,
+                mv_data: values.as_ptr() as *mut _,
+            },
+            ffi::MDB_val {
+                mv_size: count,
+                mv_data: ptr::null_mut(),
+            },
+        ];
+        let mut flags = ffi::MDB_MULTIPLE | ffi::MDB_APPENDDUP;
+        if new {
+            flags |= ffi::MDB_APPEND;
+        }
+        // SAFETY: a live cursor of a live write transaction; LMDB reads
+        // `count` values of `size` bytes from `values`, and writes into
+        // `data[1]` how many it stored.
+        check(unsafe { ffi::mdb_cursor_put(self.ptr, &mut k, data.as_mut_ptr(), flags) })?;
+        match data[1].mv_size == count {
+            true => Ok(()),
+            false => Err(Error(ffi::MDB_PROBLEM)),
+        }
+    }
+}
+
+impl Drop for Appender<'_> {
     fn drop(&mut self) {
         // SAFETY: the cursor's transaction is still alive (it's borrowed).
         unsafe { ffi::mdb_cursor_close(self.ptr) }

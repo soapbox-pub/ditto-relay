@@ -17,10 +17,14 @@ use ditto_relay::store::{History, IndexedTags, Store};
 use ditto_relay::tls::{self, Tls};
 use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
-use ditto_relay::{control, delete, facets, key, metrics, relay, trends};
+use ditto_relay::{compact, control, delete, facets, key, metrics, relay, trends};
 
 const USAGE: &str = "usage: ditto-relay [--config <path>] \
-                     [check | delete [--filter <json>] [--age <seconds>] [--dry-run]]";
+                     [check | delete [--filter <json>] [--age <seconds>] [--dry-run] \
+                     | compact [--from <dir> --into <dir>] [--threads <n>]]";
+
+/// How many threads `compact` reads ahead on, unless told.
+const COMPACT_THREADS: usize = 32;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -47,6 +51,11 @@ async fn main() -> anyhow::Result<()> {
             age,
             dry_run,
         } => delete(&config, filter.as_deref(), age, dry_run),
+        Command::Compact {
+            from,
+            into,
+            threads,
+        } => compact(&config, from, into, threads),
     }
 }
 
@@ -187,6 +196,71 @@ fn delete(
     let deleted = delete::delete(&store, &filter, indexer.as_mut(), &mut progress)?;
     store.checkpoint()?;
     println!("deleted {deleted} events");
+    Ok(())
+}
+
+/// `ditto-relay compact`: see [`compact`]. With `--from` and `--into`, the
+/// database in `--from` (stopped, or a snapshot) is copied into `--into`,
+/// and nothing else is done. Else the relay's own database is compacted in
+/// place, with no relay running.
+fn compact(
+    config: &Config,
+    from: Option<PathBuf>,
+    into: Option<PathBuf>,
+    threads: usize,
+) -> anyhow::Result<()> {
+    let mut progress = |p: &compact::Progress| {
+        let left = match p.entries {
+            0 => String::new(),
+            done => {
+                let secs =
+                    p.elapsed.as_secs_f64() * (p.total.saturating_sub(done)) as f64 / done as f64;
+                format!(", about {:.0} minutes left", secs / 60.0)
+            }
+        };
+        eprintln!(
+            "{}: {} of {} entries, {:.1} GB, in {:.0?}{left}",
+            p.table,
+            p.entries,
+            p.total,
+            p.bytes as f64 / 1e9,
+            p.elapsed,
+        );
+    };
+    let copied = match (from, into) {
+        (Some(from), Some(into)) => {
+            compact::copy(&from, &into, config.map_size, threads, &mut progress)?
+        }
+        (None, None) => {
+            let db = &config.db_path;
+            let Some(_lock) = control::Lock::try_acquire(db)? else {
+                bail!("the relay is using the database: stop it first");
+            };
+            // As the relay opens it, so that it's as it was at its last
+            // checkpoint if the machine went down, then flushed to disk:
+            // the copy replaces the checkpoint.
+            let store = open_store(config)?;
+            store.checkpoint()?;
+            drop(store);
+            let copied = compact::in_place(db, config.map_size, threads, &mut progress)?;
+            println!(
+                "the old file is {}: remove it once the relay runs well on the new one",
+                db.join(compact::OLD_FILE).display()
+            );
+            copied
+        }
+        _ => bail!("--from and --into go together"),
+    };
+    for (table, entries) in &copied.tables {
+        println!("{table}: {entries} entries");
+    }
+    println!(
+        "compacted {:.1} GB into {:.1} GB in {:.0?}, {:.0?} of it splitting the tables",
+        copied.before as f64 / 1e9,
+        copied.after as f64 / 1e9,
+        copied.elapsed,
+        copied.split,
+    );
     Ok(())
 }
 
@@ -355,6 +429,12 @@ enum Command {
         age: Option<u64>,
         dry_run: bool,
     },
+    /// Compact the database: see [`compact`].
+    Compact {
+        from: Option<PathBuf>,
+        into: Option<PathBuf>,
+        threads: usize,
+    },
 }
 
 impl Args {
@@ -366,6 +446,7 @@ impl Args {
             command: Command::Serve,
         };
         let (mut filter, mut age, mut dry_run) = (None, None, false);
+        let (mut from, mut into, mut threads) = (None, None, None);
         while let Some(arg) = args.next() {
             let arg = arg.into_string().map_err(|_| anyhow!(USAGE))?;
             let (name, inline) = match arg.split_once('=') {
@@ -391,11 +472,30 @@ impl Args {
                         dry_run: false,
                     }
                 }
+                "compact" if matches!(parsed.command, Command::Serve) => {
+                    parsed.command = Command::Compact {
+                        from: None,
+                        into: None,
+                        threads: COMPACT_THREADS,
+                    }
+                }
+                "--from" => from = Some(PathBuf::from(value()?)),
+                "--into" => into = Some(PathBuf::from(value()?)),
+                "--threads" => {
+                    threads = Some(value()?.parse().context("--threads must be a number")?)
+                }
                 "--filter" => filter = Some(value()?),
                 "--age" => age = Some(value()?.parse().context("--age must be seconds")?),
                 "--dry-run" if inline.is_none() => dry_run = true,
                 _ => bail!(USAGE),
             }
+        }
+        let deleting = filter.is_some() || age.is_some() || dry_run;
+        let compacting = from.is_some() || into.is_some() || threads.is_some();
+        if (deleting && !matches!(parsed.command, Command::Delete { .. }))
+            || (compacting && !matches!(parsed.command, Command::Compact { .. }))
+        {
+            bail!(USAGE)
         }
         match &mut parsed.command {
             Command::Delete {
@@ -403,8 +503,13 @@ impl Args {
                 age: a,
                 dry_run: d,
             } => (*f, *a, *d) = (filter, age, dry_run),
-            Command::Serve | Command::Check if filter.is_some() || age.is_some() || dry_run => {
-                bail!(USAGE)
+            Command::Compact {
+                from: f,
+                into: i,
+                threads: t,
+            } => {
+                (*f, *i) = (from, into);
+                *t = threads.unwrap_or(COMPACT_THREADS);
             }
             Command::Serve | Command::Check => {}
         }
@@ -460,6 +565,25 @@ mod tests {
         };
         assert_eq!(filter.as_deref(), Some("{\"a\":\"=\"}"));
 
+        let Command::Compact {
+            from,
+            into,
+            threads,
+        } = parse("compact --from /a --into=/b --threads 8")
+            .unwrap()
+            .command
+        else {
+            panic!("not compact");
+        };
+        assert_eq!(
+            (from, into, threads),
+            (Some("/a".into()), Some("/b".into()), 8)
+        );
+        let Command::Compact { threads, .. } = parse("compact").unwrap().command else {
+            panic!("not compact");
+        };
+        assert_eq!(threads, COMPACT_THREADS);
+
         for bad in [
             "--dry-run",
             "--age 5",
@@ -471,6 +595,11 @@ mod tests {
             "check delete",
             "delete check",
             "check --dry-run",
+            "compact --dry-run",
+            "delete --threads 4",
+            "--from x",
+            "compact --threads x",
+            "compact delete",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

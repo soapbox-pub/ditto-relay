@@ -107,6 +107,27 @@ meanwhile waits for it to finish. Removing an address's current version also rem
 its older versions that the filter matches, and the newest version left becomes
 current. Nothing stops deleted events from being published again.
 
+## Compacting the database
+
+```sh
+systemctl stop ditto-relay
+sudo -u ditto-relay ditto-relay compact
+systemctl start ditto-relay
+```
+
+LMDB never shrinks its file. After deleting much of the database, what's left is
+spread thinly through a file many times its size, so less of it stays in memory and
+the relay reads the disk more. `compact` rewrites the database's indexes into a new
+file, packed in order, and puts it in place. It needs the relay stopped, and room for
+the new file, which is about the size of what's live. The old file is kept beside it,
+as `db/data.mdb.old`: remove it once the relay runs well on the new one. Event records
+(`db/bodies`) are written in order and kept packed already, so they're left alone.
+
+It reads with 32 threads at once, as the live pages of a big file are scattered, and
+waiting on them one at a time is what makes `mdb_copy -c` slow. `--threads` changes
+how many. `compact --from <dir> --into <dir>` only copies the database in `--from`,
+which must be stopped or a snapshot, into `--into`, to see how long it takes.
+
 ## Tor
 
 ```toml
