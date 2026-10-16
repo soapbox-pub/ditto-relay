@@ -324,7 +324,7 @@ mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
-            true,
+            crate::lmdb::Opening::SYNC,
             test_tags(),
             history,
             Some(wot),

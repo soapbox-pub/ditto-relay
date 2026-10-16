@@ -34,10 +34,13 @@ pub struct Config {
     pub db_path: PathBuf,
     /// LMDB map size in bytes. This is virtual address space, not disk usage.
     pub map_size: usize,
-    /// Whether each write is on disk before it's answered. Without, LMDB
-    /// writes into its map and leaves flushing it to the kernel, which
-    /// makes writes several times faster, but a crash of the machine (not
-    /// just the relay) can lose recent writes or corrupt the database.
+    /// Whether each write is on disk before it's answered. Without, the
+    /// kernel writes commits to disk when it likes, which makes writes
+    /// several times faster, but a crash of the machine (not just the
+    /// relay) loses the latest. On a filesystem that keeps writes in
+    /// order, as ZFS does, what's left is sound; on others it can be
+    /// corrupt, and the relay then opens the commit before the latest if
+    /// that one's sound.
     pub lmdb_sync: bool,
     /// The relay's own URL, which NIP-42 authentication and NIP-62 requests
     /// to vanish name it by.

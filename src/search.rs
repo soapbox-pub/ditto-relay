@@ -317,6 +317,9 @@ struct Payload {
     /// The [`VERSION`] it was indexed with.
     #[serde(default)]
     version: u32,
+    /// The [id](Store::id) of the store it was indexed from.
+    #[serde(default)]
+    store: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -374,7 +377,10 @@ impl SearchIndex {
         kinds.sort_unstable();
         kinds.dedup();
         let schema = schema();
-        let store_next_seq = store.next_seq(&*store.read()?)?;
+        let (store_next_seq, store_id) = {
+            let txn = store.read()?;
+            (store.next_seq(&txn)?, store.id(&txn)?)
+        };
 
         let mut opened = None;
         if dir.join("meta.json").exists() {
@@ -385,12 +391,24 @@ impl SearchIndex {
                 .payload
                 .and_then(|payload| serde_json::from_str::<Payload>(&payload).ok());
             match payload {
-                // Further along than the LMDB means it's another LMDB's.
+                // Another store's, if it says so, or further along than
+                // the store without saying it's the same one. The same one
+                // further along lost commits in a crash of the machine.
                 Some(p)
-                    if p.next_seq <= store_next_seq
-                        && p.version == VERSION
-                        && index.schema() == schema =>
+                    if p.version == VERSION
+                        && index.schema() == schema
+                        && p.store
+                            .as_ref()
+                            .is_none_or(|id| Some(id) == store_id.as_ref())
+                        && (p.next_seq <= store_next_seq || p.store.is_some()) =>
                 {
+                    if p.next_seq > store_next_seq {
+                        tracing::warn!(
+                            "the search index has events the database lost, as a crash of the machine can lose them: skipping their sequence numbers, {store_next_seq} to {}",
+                            p.next_seq
+                        );
+                        store.skip_to(p.next_seq)?;
+                    }
                     opened = Some((index, p.next_seq));
                 }
                 _ => {
@@ -438,6 +456,7 @@ impl SearchIndex {
             writer: index.writer(WRITER_MEMORY)?,
             search: search.clone(),
             next_seq,
+            store_id,
             dirty: false,
         };
         Ok((search, indexer))
@@ -1235,6 +1254,8 @@ pub struct Indexer {
     search: Arc<SearchIndex>,
     /// The sequence number to index from next.
     next_seq: u64,
+    /// The [id](Store::id) of the store it indexes.
+    store_id: Option<String>,
     /// Whether anything's changed since the last commit.
     dirty: bool,
 }
@@ -1290,6 +1311,7 @@ impl Indexer {
         let payload = Payload {
             next_seq: self.next_seq,
             version: VERSION,
+            store: self.store_id.clone(),
         };
         let mut commit = self.writer.prepare_commit()?;
         commit.set_payload(&serde_json::to_string(&payload)?);
@@ -1353,7 +1375,7 @@ mod tests {
     use crate::event::Event;
     use crate::event::tests::signed;
     use crate::record;
-    use crate::store::tests::{MAX_VALUES, open, put, test_tags};
+    use crate::store::tests::{MAX_VALUES, open, open_in, put, test_tags};
     use serde_json::json;
 
     fn view_text(event: &Event) -> Vec<String> {
@@ -1846,6 +1868,35 @@ mod tests {
         let (index, _) = SearchIndex::open(dir.path(), vec![1], &other).unwrap();
         assert_eq!(index.reader.searcher().num_docs(), 0);
         drop((index, db));
+    }
+
+    /// A crash of the machine can lose the store's latest commits and not
+    /// the index's: the index is kept, and the sequence numbers it has
+    /// that the store lost aren't given to other events.
+    #[test]
+    fn keeps_an_index_ahead_of_its_store_after_a_crash() {
+        let (db, store) = open();
+        put(&store, &signed(1, 100, 1, vec![], "kept"));
+        let behind = tempfile::tempdir().unwrap();
+        let bodies = behind.path().join("bodies");
+        std::fs::create_dir(&bodies).unwrap();
+        store.copy_compact(behind.path(), &bodies).unwrap();
+        put(&store, &signed(1, 200, 1, vec![], "lost"));
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (_, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+            indexer.catch_up_all(&store).unwrap();
+        }
+        drop((store, db));
+
+        let store = open_in(behind.path());
+        let (index, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+        assert_eq!(index.reader.searcher().num_docs(), 2);
+        assert_eq!(store.next_seq(&store.read().unwrap()).unwrap(), 3);
+        let fresh = signed(1, 300, 1, vec![], "fresh");
+        assert_eq!(put(&store, &fresh), crate::store::Outcome::Stored(3));
+        indexer.catch_up_all(&store).unwrap();
+        assert_eq!(index.reader.searcher().num_docs(), 3);
     }
 
     #[test]

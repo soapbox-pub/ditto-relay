@@ -122,7 +122,7 @@ use crate::event::decode_hex;
 use crate::facets;
 use crate::filter::Filter;
 use crate::hll::{self, Registers};
-use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
+use crate::lmdb::{Db, DbFlags, Env, Opening, Result, RoTxn, RwTxn, Txn, Usage};
 use crate::metrics::METRICS;
 use crate::rank::{self, Rank};
 use crate::record::{self, Element, EventView, Header, tag_value};
@@ -171,6 +171,9 @@ const PAGE: usize = 4096;
 
 /// NIP-59 gift wraps.
 const GIFT_WRAP: u16 = 1059;
+
+/// The `meta` key of the store's [id](Store::id).
+const STORE_ID: &[u8] = b"store_id";
 
 /// The `meta` key of the history cap the store was last pruned to.
 const HISTORY_MAX_VERSIONS: &[u8] = b"history_max_versions";
@@ -406,6 +409,32 @@ impl Tables {
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         })
     }
+
+    fn all(self) -> Vec<Db> {
+        vec![
+            self.events,
+            self.ids,
+            self.created,
+            self.kinds,
+            self.authors,
+            self.author_kinds,
+            self.tags,
+            self.hll,
+            self.facets,
+            self.wot,
+            self.wot_queue,
+            self.engagement,
+            self.scores,
+            self.ranked,
+            self.applied,
+            self.rank_queue,
+            self.zaps,
+            self.replaceable,
+            self.history,
+            self.expiring,
+            self.meta,
+        ]
+    }
 }
 
 pub struct Store {
@@ -429,7 +458,7 @@ impl Store {
     pub fn open(
         dir: &Path,
         map_size: usize,
-        sync: bool,
+        opening: Opening,
         indexed_tags: IndexedTags,
         history: History,
         wot: Option<Wot>,
@@ -438,7 +467,7 @@ impl Store {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("Could not create the database directory {}", dir.display())
         })?;
-        let mut env = Env::open(dir, map_size, sync, 32, 1024)
+        let mut env = Env::open(dir, map_size, opening, 32, 1024)
             .with_context(|| format!("Could not open the database at {}", dir.display()))?;
         let bodies = dir.join(BODIES_DIR);
         std::fs::create_dir_all(&bodies).with_context(|| {
@@ -448,7 +477,7 @@ impl Store {
             )
         })?;
         let bodies = env
-            .attach(&bodies, map_size, sync, 1, 1024)
+            .attach(&bodies, map_size, opening, 1, 1024)
             .with_context(|| format!("Could not open the database at {}", bodies.display()))?;
         let tables = Tables::open(&env, bodies)?;
         // Where an older `ditto-relay delete`, which wrote the store itself,
@@ -482,6 +511,7 @@ impl Store {
             deletions_from: covered.unwrap_or(1),
         };
         let next = store.drop_uncommitted()?;
+        store.name()?;
         // Saved since the last event was stored, or a new database.
         if store.deletions_from >= next {
             store.deletions.set_ready();
@@ -505,9 +535,9 @@ impl Store {
         rank: Rank,
     ) -> anyhow::Result<Store> {
         let opening = || format!("Could not open the database at {}", dir.display());
-        let mut env = Env::open_read_only(dir, map_size, 32, 1024).with_context(opening)?;
+        let mut env = Env::open_read_only(dir, map_size, false, 32, 1024).with_context(opening)?;
         let bodies = env
-            .attach(&dir.join(BODIES_DIR), map_size, true, 1, 1024)
+            .attach(&dir.join(BODIES_DIR), map_size, Opening::SYNC, 1, 1024)
             .with_context(opening)?;
         let tables = Tables::open(&env, bodies).with_context(opening)?;
         Ok(Store {
@@ -523,6 +553,31 @@ impl Store {
             deletions_path: dir.join(DELETION_FILTER_FILE),
             deletions_from: 1,
         })
+    }
+
+    /// Check that the store at `dir`, or with `previous` the commit before
+    /// its latest, can be read: see [`Env::check`]. Pages a crash left
+    /// unwritten may be read as anything, and LMDB trusts what it reads,
+    /// so this can crash rather than fail, and is best run in a process of
+    /// its own. A store not yet made is fine.
+    pub fn check_readable(dir: &Path, map_size: usize, previous: bool) -> Result<()> {
+        if !dir.join("data.mdb").exists() {
+            return Ok(());
+        }
+        let mut env = Env::open_read_only(dir, map_size, previous, 32, 1024)?;
+        let opening = Opening {
+            sync: true,
+            previous,
+        };
+        let bodies = env.attach(&dir.join(BODIES_DIR), map_size, opening, 1, 1024)?;
+        let tables = match Tables::open(&env, bodies) {
+            Ok(tables) => tables.all(),
+            // Made by an older relay, without every table: LMDB's own are
+            // still checked.
+            Err(err) if err.is_not_found() => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        env.check(&tables)
     }
 
     /// Remove the records a crash left in `bodies` under sequence numbers
@@ -707,6 +762,37 @@ impl Store {
         Ok(txn
             .get(self.tables.meta, b"next_seq")?
             .map_or(1, |v| u64::from_be_bytes(v.try_into().unwrap_or_default())))
+    }
+
+    /// Never give out a sequence number below `next`. Without sync, a crash
+    /// of the machine can lose the latest commits while what's kept beside
+    /// the store, like the search index, knows of the events they stored:
+    /// their sequence numbers mustn't be given to others.
+    pub fn skip_to(&self, next: u64) -> Result<()> {
+        let mut txn = self.write()?;
+        if next > self.next_seq(&txn)? {
+            txn.put(self.tables.meta, b"next_seq", &next.to_be_bytes())?;
+            txn.commit()?;
+        }
+        Ok(())
+    }
+
+    /// The store's id, made at random the first time it's asked for, by
+    /// which what's kept beside it can tell it from another.
+    pub fn id(&self, txn: &Txn) -> Result<Option<String>> {
+        Ok(txn.get(self.tables.meta, STORE_ID)?.map(hex::encode))
+    }
+
+    /// Make the store's [id](Self::id) if it has none.
+    fn name(&self) -> Result<()> {
+        if self.id(&*self.read()?)?.is_some() {
+            return Ok(());
+        }
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).expect("the OS has randomness");
+        let mut txn = self.write()?;
+        txn.put(self.tables.meta, STORE_ID, &id)?;
+        txn.commit()
     }
 
     /// Whether an event is stored, expired or not.
@@ -2176,17 +2262,42 @@ pub mod tests {
 
     fn open_with(map_size: usize, history: History) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            dir.path(),
+        let store = open_in_with(dir.path(), map_size, history);
+        (dir, store)
+    }
+
+    /// The store in `dir`, as [`open`] opens it.
+    pub fn open_in(dir: &Path) -> Store {
+        open_in_with(dir, 1 << 26, History::new(true, vec![], 20))
+    }
+
+    fn open_in_with(dir: &Path, map_size: usize, history: History) -> Store {
+        Store::open(
+            dir,
             map_size,
-            true,
+            Opening::SYNC,
             test_tags(),
             history,
             None,
             Rank::default(),
         )
-        .unwrap();
-        (dir, store)
+        .unwrap()
+    }
+
+    /// A sound store can be read, its latest commit and the one before,
+    /// and so can one not yet made. A corrupt one is in [`crate::lmdb`]'s
+    /// tests.
+    #[test]
+    fn checks_whether_a_store_can_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        assert!(Store::check_readable(&gone, 1 << 26, false).is_ok());
+        let store = open_in(dir.path());
+        put(&store, &signed(1, 100, 1, vec![], "hi"));
+        // LMDB must not have an environment open twice in a process.
+        drop(store);
+        assert!(Store::check_readable(dir.path(), 1 << 26, false).is_ok());
+        assert!(Store::check_readable(dir.path(), 1 << 26, true).is_ok());
     }
 
     pub fn put(store: &Store, event: &Event) -> Outcome {
@@ -2566,7 +2677,7 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
-            true,
+            Opening::SYNC,
             test_tags(),
             history,
             None,
@@ -2586,7 +2697,7 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
-            true,
+            Opening::SYNC,
             test_tags(),
             history,
             None,
@@ -2840,7 +2951,7 @@ pub mod tests {
             Store::open(
                 dir.path(),
                 1 << 26,
-                true,
+                Opening::SYNC,
                 test_tags(),
                 history,
                 None,
@@ -2915,7 +3026,7 @@ pub mod tests {
         let store = Store::open(
             dir.path(),
             1 << 26,
-            true,
+            Opening::SYNC,
             test_tags(),
             history,
             None,

@@ -37,6 +37,23 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether this is what LMDB finds when the pages a commit points to
+    /// aren't what it wrote, as a crash of the machine can leave them if
+    /// they weren't written to disk in order.
+    pub fn is_corruption(self) -> bool {
+        matches!(
+            self.0,
+            ffi::MDB_CORRUPTED | ffi::MDB_PAGE_NOTFOUND | ffi::MDB_INVALID
+        )
+    }
+
+    /// Whether this is a table or entry not found.
+    pub fn is_not_found(self) -> bool {
+        self.0 == ffi::MDB_NOTFOUND
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn check(code: i32) -> Result<()> {
@@ -153,14 +170,46 @@ pub struct Env {
 unsafe impl Send for Env {}
 unsafe impl Sync for Env {}
 
+/// How an environment is opened to be written.
+#[derive(Debug, Clone, Copy)]
+pub struct Opening {
+    /// Whether each commit is flushed to disk before it returns. Without,
+    /// the kernel writes it when it likes. LMDB still writes a commit's
+    /// pages before the page that points to them, so on a filesystem that
+    /// keeps writes in order, as ZFS does, a crash of the machine loses
+    /// the latest commits but can't corrupt what's left. Never with
+    /// `MDB_WRITEMAP`, whose writes into the map the kernel flushes in any
+    /// order.
+    pub sync: bool,
+    /// Open the commit before the latest, for when the latest is corrupt.
+    /// The next commit makes that the latest, dropping the one after it.
+    pub previous: bool,
+}
+
+impl Opening {
+    pub const SYNC: Opening = Opening {
+        sync: true,
+        previous: false,
+    };
+
+    fn flags(self) -> u32 {
+        let mut flags = match self.sync {
+            true => 0,
+            false => ffi::MDB_NOSYNC,
+        };
+        if self.previous {
+            flags |= ffi::MDB_PREVSNAPSHOT;
+        }
+        flags
+    }
+}
+
 impl Env {
     /// Open (creating if need be) the environment in the directory `path`.
-    /// Without `sync`, commits write into the map and return, and the
-    /// kernel flushes it when it likes.
     pub fn open(
         path: &Path,
         map_size: usize,
-        sync: bool,
+        opening: Opening,
         max_dbs: u32,
         max_readers: u32,
     ) -> Result<Env> {
@@ -168,23 +217,17 @@ impl Env {
             ptrs: Vec::new(),
             read_only: false,
         };
-        // Writing each dirty page with its own pwrite, as LMDB otherwise
-        // does, is most of what a commit costs, and on ZFS most of what
-        // the writer does. Writing into the map instead, the kernel
-        // flushes a page rewritten by many commits once.
-        let flags = match sync {
-            true => 0,
-            false => ffi::MDB_WRITEMAP | ffi::MDB_MAPASYNC,
-        };
-        env.add(path, map_size, flags, max_dbs, max_readers)?;
+        env.add(path, map_size, opening.flags(), max_dbs, max_readers)?;
         Ok(env)
     }
 
     /// Open the existing environment in the directory `path` only to read.
-    /// Its tables must exist already, and are opened without writing.
+    /// Its tables must exist already, and are opened without writing. With
+    /// `previous`, the commit before the latest is read.
     pub fn open_read_only(
         path: &Path,
         map_size: usize,
+        previous: bool,
         max_dbs: u32,
         max_readers: u32,
     ) -> Result<Env> {
@@ -192,7 +235,12 @@ impl Env {
             ptrs: Vec::new(),
             read_only: true,
         };
-        env.add(path, map_size, ffi::MDB_RDONLY, max_dbs, max_readers)?;
+        let opening = Opening {
+            sync: true,
+            previous,
+        };
+        let flags = ffi::MDB_RDONLY | opening.flags();
+        env.add(path, map_size, flags, max_dbs, max_readers)?;
         Ok(env)
     }
 
@@ -200,22 +248,26 @@ impl Env {
     /// `path`, whose tables share this one's transactions, returning which
     /// it is for [`create_db_in`](Self::create_db_in). It's for tables
     /// written in order, mostly appended to: the pages a commit writes are
-    /// together, so they're written with a single call, not one each, and
-    /// never read first, as writing into the map would. Without `sync`,
-    /// commits aren't flushed to disk before they return.
+    /// together, so they're written with a single call, not one each.
+    /// Only `opening.previous` counts if this one was opened only to read.
     pub fn attach(
         &mut self,
         path: &Path,
         map_size: usize,
-        sync: bool,
+        opening: Opening,
         max_dbs: u32,
         max_readers: u32,
     ) -> Result<usize> {
         assert!(self.ptrs.len() < MAX_ENVS, "too many environments");
-        let flags = match (self.read_only, sync) {
-            (true, _) => ffi::MDB_RDONLY,
-            (false, true) => 0,
-            (false, false) => ffi::MDB_NOSYNC,
+        let flags = match self.read_only {
+            true => {
+                let previous = Opening {
+                    sync: true,
+                    ..opening
+                };
+                ffi::MDB_RDONLY | previous.flags()
+            }
+            false => opening.flags(),
         };
         self.add(path, map_size, flags, max_dbs, max_readers)?;
         Ok(self.ptrs.len() - 1)
@@ -346,6 +398,22 @@ impl Env {
                 libc::POSIX_FADV_WILLNEED,
             );
         }
+    }
+
+    /// Read the first and last entries of every environment's freelist and
+    /// table of tables, and of each of `dbs`: every page from each tree's
+    /// root down its edges, where a commit whose pages never reached the
+    /// disk would point at what was there before. Cheap, so no proof.
+    pub fn check(&self, dbs: &[Db]) -> Result<()> {
+        // LMDB's own tables: the freelist, then the table of tables.
+        let own = (0..self.ptrs.len()).flat_map(|env| [0, 1].map(|dbi| Db { dbi, env }));
+        let txn = self.read_txn()?;
+        for db in own.chain(dbs.iter().copied()) {
+            let mut cursor = txn.cursor(db)?;
+            cursor.first()?;
+            cursor.last()?;
+        }
+        Ok(())
     }
 
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
@@ -562,6 +630,10 @@ impl<'t> Cursor<'t> {
         self.op(None, None, ffi::MDB_FIRST)
     }
 
+    pub fn last(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_LAST)
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Entry<'t>>> {
         self.op(None, None, ffi::MDB_NEXT)
@@ -633,9 +705,65 @@ impl Drop for Cursor<'_> {
 mod tests {
     use super::*;
 
+    const NOSYNC: Opening = Opening {
+        sync: false,
+        previous: false,
+    };
+
+    /// What a crash of the machine leaves if a commit's meta page reached
+    /// the disk and the pages it points to didn't, as can happen with
+    /// writes the filesystem reorders: the latest commit is corrupt, and
+    /// the one before it isn't. Opening that one drops the latest for good
+    /// once something's committed.
+    #[test]
+    fn opens_the_commit_before_a_corrupt_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.mdb");
+        let fill = |byte: u8| {
+            let env = Env::open(dir.path(), 1 << 24, Opening::SYNC, 4, 16).unwrap();
+            let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
+            let mut txn = env.write_txn().unwrap();
+            for i in 0..1000u32 {
+                txn.put(db, &i.to_be_bytes(), &[byte; 100]).unwrap();
+            }
+            txn.commit().unwrap();
+        };
+        fill(1);
+        let before = std::fs::read(&file).unwrap();
+        fill(2);
+        let after = std::fs::read(&file).unwrap();
+        // Both meta pages as they are now, and nothing else written since.
+        let mut torn = before;
+        torn.resize(after.len(), 0);
+        torn[..2 * 4096].copy_from_slice(&after[..2 * 4096]);
+        std::fs::write(&file, &torn).unwrap();
+
+        let read = |previous: bool| -> Result<Option<u8>> {
+            let env = Env::open_read_only(dir.path(), 1 << 24, previous, 4, 16)?;
+            let db = env.create_db("plain", DbFlags::PLAIN)?;
+            env.check(&[db])?;
+            let txn = env.read_txn()?;
+            Ok(txn.get(db, &7u32.to_be_bytes())?.map(|v| v[0]))
+        };
+        assert!(read(false).unwrap_err().is_corruption());
+        assert_eq!(read(true).unwrap(), Some(1));
+
+        let previous = Opening {
+            sync: true,
+            previous: true,
+        };
+        let env = Env::open(dir.path(), 1 << 24, previous, 4, 16).unwrap();
+        let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
+        let mut txn = env.write_txn().unwrap();
+        txn.put(db, b"after", b"").unwrap();
+        txn.commit().unwrap();
+        drop(env);
+        assert_eq!(read(false).unwrap(), Some(1));
+    }
+
     fn open() -> (tempfile::TempDir, Env) {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), 1 << 24, true, 4, 16).unwrap();
+        let env = Env::open(dir.path(), 1 << 24, Opening::SYNC, 4, 16).unwrap();
         (dir, env)
     }
 
@@ -667,8 +795,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let other = dir.path().join("other");
         std::fs::create_dir(&other).unwrap();
-        let mut env = Env::open(dir.path(), 1 << 24, false, 4, 16).unwrap();
-        assert_eq!(env.attach(&other, 1 << 24, false, 4, 16).unwrap(), 1);
+        let mut env = Env::open(dir.path(), 1 << 24, NOSYNC, 4, 16).unwrap();
+        assert_eq!(env.attach(&other, 1 << 24, NOSYNC, 4, 16).unwrap(), 1);
         let main = env.create_db("main", DbFlags::PLAIN).unwrap();
         let appended = env
             .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
@@ -691,8 +819,8 @@ mod tests {
         txn.commit().unwrap();
         drop(env);
 
-        let mut env = Env::open(dir.path(), 1 << 24, true, 4, 16).unwrap();
-        env.attach(&other, 1 << 24, true, 4, 16).unwrap();
+        let mut env = Env::open(dir.path(), 1 << 24, Opening::SYNC, 4, 16).unwrap();
+        env.attach(&other, 1 << 24, Opening::SYNC, 4, 16).unwrap();
         let main = env.create_db("main", DbFlags::PLAIN).unwrap();
         let appended = env
             .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
@@ -712,8 +840,8 @@ mod tests {
         let other = dir.path().join("other");
         std::fs::create_dir(&other).unwrap();
         {
-            let mut env = Env::open(dir.path(), 1 << 24, true, 4, 16).unwrap();
-            env.attach(&other, 1 << 24, true, 4, 16).unwrap();
+            let mut env = Env::open(dir.path(), 1 << 24, Opening::SYNC, 4, 16).unwrap();
+            env.attach(&other, 1 << 24, Opening::SYNC, 4, 16).unwrap();
             let main = env.create_db("dups", DbFlags::DUP_FIXED).unwrap();
             let appended = env
                 .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
@@ -724,8 +852,8 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        let mut env = Env::open_read_only(dir.path(), 1 << 24, 4, 16).unwrap();
-        env.attach(&other, 1 << 24, true, 4, 16).unwrap();
+        let mut env = Env::open_read_only(dir.path(), 1 << 24, false, 4, 16).unwrap();
+        env.attach(&other, 1 << 24, Opening::SYNC, 4, 16).unwrap();
         let main = env.create_db("dups", DbFlags::DUP_FIXED).unwrap();
         let appended = env
             .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
@@ -757,14 +885,14 @@ mod tests {
     #[test]
     fn keeps_writes_without_sync() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), 1 << 24, false, 4, 16).unwrap();
+        let env = Env::open(dir.path(), 1 << 24, NOSYNC, 4, 16).unwrap();
         let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
         let mut txn = env.write_txn().unwrap();
         txn.put(db, b"a", &[7; 10_000]).unwrap();
         txn.commit().unwrap();
         drop(env);
 
-        let env = Env::open(dir.path(), 1 << 24, true, 4, 16).unwrap();
+        let env = Env::open(dir.path(), 1 << 24, Opening::SYNC, 4, 16).unwrap();
         let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
         let txn = env.read_txn().unwrap();
         assert_eq!(txn.get(db, b"a").unwrap(), Some(&[7; 10_000][..]));

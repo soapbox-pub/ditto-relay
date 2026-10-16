@@ -21,6 +21,15 @@ it is tagged.
   open to everyone.
   A connection is challenged to authenticate only once it's refused something
   for want of it.
+- `lmdb_sync = false` no longer risks corrupting the database on a filesystem
+  that keeps writes in order, like ZFS: a crash of the machine loses the last
+  few seconds of writes, and nothing else. It used to write through LMDB's
+  memory map, whose pages the kernel writes in any order. Elsewhere, if a
+  crash leaves the latest commit unreadable, the relay opens the one before,
+  having checked which it can read in a process of its own, as reading a
+  corrupt one can crash. A search index that kept events the database lost is
+  kept, rather than rebuilt from nothing, and their sequence numbers aren't
+  given to other events.
 - `ditto-relay delete` no longer holds up the running relay's writes. Each
   of its transactions is sized to take about 50 ms, by how long the last
   took, and the next waits at least as long, so the writer spends at most

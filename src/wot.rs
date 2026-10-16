@@ -494,7 +494,7 @@ mod tests {
         Store::open(
             dir,
             1 << 28,
-            true,
+            crate::lmdb::Opening::SYNC,
             test_tags(),
             history,
             wot,

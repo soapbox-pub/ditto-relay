@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing_subscriber::EnvFilter;
 
 use ditto_relay::config::{Config, Environment};
+use ditto_relay::lmdb::Opening;
 use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
@@ -22,9 +23,20 @@ use ditto_relay::{control, delete, facets, key, metrics, relay, trends};
 const USAGE: &str = "usage: ditto-relay [--config <path>] \
                      [check | delete [--filter <json>] [--age <seconds>] [--dry-run]]";
 
+/// The command [`open_store`] runs itself with to check the store.
+const CHECK_STORE: &str = "__check-store";
+
+/// How the store check exits: readable, corrupt, or couldn't say.
+const READABLE: i32 = 0;
+const CORRUPT: i32 = 2;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse(std::env::args_os().skip(1))?;
+    let mut raw = std::env::args_os().skip(1).peekable();
+    if raw.peek().is_some_and(|arg| arg == CHECK_STORE) {
+        check_store(raw.skip(1));
+    }
+    let args = Args::parse(raw)?;
     let config = Config::load(args.config.as_deref(), &Environment::current())?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&config.log).context("invalid log directives")?)
@@ -50,13 +62,35 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Open the store as the relay does, holding the [`control::Lock`].
+/// Open the store as the relay does, holding the [`control::Lock`]. If a
+/// crash of the machine has left the latest commit corrupt, the one before
+/// it is opened instead, which drops the latest.
 fn open_store(config: &Config) -> anyhow::Result<Store> {
     let (indexed_tags, history, wot, rank) = store_settings(config)?;
+    let previous = match readable(config, false) {
+        Some(false) => {
+            tracing::error!(
+                "the database's latest commit can't be read, as a crash of the machine can leave it: trying the one before"
+            );
+            if readable(config, true) != Some(true) {
+                bail!(
+                    "neither the database's latest commit nor the one before it can be read: restore {} from a backup",
+                    config.db_path.display()
+                );
+            }
+            tracing::warn!("opening the commit before the latest, which is dropped");
+            true
+        }
+        Some(true) | None => false,
+    };
+    let opening = Opening {
+        sync: config.lmdb_sync,
+        previous,
+    };
     let store = Store::open(
         &config.db_path,
         config.map_size,
-        config.lmdb_sync,
+        opening,
         indexed_tags,
         history,
         wot,
@@ -64,6 +98,54 @@ fn open_store(config: &Config) -> anyhow::Result<Store> {
     )?;
     tracing::info!("opened LMDB at {}", config.db_path.display());
     Ok(store)
+}
+
+/// Whether the store, or with `previous` the commit before its latest, can
+/// be read, checked by this binary in a process of its own, as reading a
+/// corrupt one can crash. None if it couldn't be checked.
+fn readable(config: &Config, previous: bool) -> Option<bool> {
+    let status = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .arg(CHECK_STORE)
+            .arg(&config.db_path)
+            .arg(config.map_size.to_string())
+            .args(previous.then_some("--previous"))
+            .status()
+    });
+    match status {
+        Ok(status) if status.code() == Some(READABLE) => Some(true),
+        // Killed by a signal, as by a bad page read, has no code.
+        Ok(status) if matches!(status.code(), Some(CORRUPT) | None) => Some(false),
+        Ok(status) => {
+            tracing::warn!("couldn't check the database: the check {status}");
+            None
+        }
+        Err(err) => {
+            tracing::warn!("couldn't check the database: {err}");
+            None
+        }
+    }
+}
+
+/// `__check-store <dir> <map size> [--previous]`, which [`readable`] runs:
+/// exit [`READABLE`], [`CORRUPT`], or otherwise if it couldn't say.
+fn check_store(mut args: impl Iterator<Item = OsString>) -> ! {
+    let dir = args.next().map(PathBuf::from);
+    let map_size = args
+        .next()
+        .and_then(|size| size.into_string().ok()?.parse().ok());
+    let previous = args.next().is_some_and(|arg| arg == "--previous");
+    let (Some(dir), Some(map_size)) = (dir, map_size) else {
+        eprintln!("usage: ditto-relay {CHECK_STORE} <dir> <map size> [--previous]");
+        std::process::exit(1);
+    };
+    match Store::check_readable(&dir, map_size, previous) {
+        Ok(()) => std::process::exit(READABLE),
+        Err(err) => {
+            eprintln!("checking {}: {err}", dir.display());
+            std::process::exit(if err.is_corruption() { CORRUPT } else { 1 })
+        }
+    }
 }
 
 /// What the store is opened with.

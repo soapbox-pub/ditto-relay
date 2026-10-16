@@ -2107,7 +2107,16 @@ mod tests {
 
     fn open(dir: &std::path::Path, wot: Option<Wot>, rank: Rank) -> Store {
         let history = History::new(true, vec![], 20);
-        Store::open(dir, 1 << 28, true, test_tags(), history, wot, rank).unwrap()
+        Store::open(
+            dir,
+            1 << 28,
+            crate::lmdb::Opening::SYNC,
+            test_tags(),
+            history,
+            wot,
+            rank,
+        )
+        .unwrap()
     }
 
     fn put(store: &Store, event: &Event) {
