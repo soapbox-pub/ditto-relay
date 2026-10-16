@@ -21,6 +21,12 @@ it is tagged.
   open to everyone.
   A connection is challenged to authenticate only once it's refused something
   for want of it.
+- `ditto-relay delete` no longer holds up the running relay's writes. Each
+  of its transactions is sized to take about 50 ms, by how long the last
+  took, and the next waits at least as long, so the writer spends at most
+  half its time deleting. Before, it removed 1,000 events per transaction
+  however long that took: in a database with a big freelist, as long as 40
+  seconds, with every write waiting on it.
 
 ## [2.3.0]
 

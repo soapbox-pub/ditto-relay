@@ -4,9 +4,10 @@
 //! LMDB has one writer at a time, and the running relay's hardly ever lets
 //! go of it between commits, so another process would wait on it
 //! indefinitely. While the relay runs, it does the deleting, asked over its
-//! [control socket](crate::control): its writer removes the matches a
-//! [`CHUNK`] per transaction, between its other work, and tells its search
-//! indexer what went, as it does for NIP-09 deletions. Only when the relay
+//! [control socket](crate::control): its writer removes the matches in
+//! small transactions, paced so they never hold up its writes for long,
+//! between its other work, and tells its search indexer what went, as it
+//! does for NIP-09 deletions. Only when the relay
 //! isn't running does `delete` write the store, and the search index,
 //! itself, and then it must open them with the relay's configuration:
 //! opened with another web of trust or other ranking parameters, the store

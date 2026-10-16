@@ -1810,15 +1810,43 @@ pub enum Deleting {
     Failed(String),
 }
 
-/// Events to remove, a [`delete::CHUNK`] per transaction, between the
-/// writer's other work.
+/// How long a deletion's transaction should take, commit and all, as the
+/// writer holds up every write meanwhile. What removing an event costs
+/// varies by thousands of times: with its pages on disk, or in an
+/// environment whose freelist has grown huge, where committing what a
+/// transaction freed means searching it for contiguous pages.
+const DELETE_TARGET: Duration = Duration::from_millis(50);
+
+/// How many events a deletion's first transaction removes.
+const FIRST_DELETE_CHUNK: usize = 64;
+
+/// Events to remove, a chunk per transaction, between the writer's other
+/// work. Each chunk is sized for [`DELETE_TARGET`] by how long the last
+/// took, up to [`delete::CHUNK`], and the next waits at least as long as
+/// the last took, so the writer spends at most half its time deleting
+/// however slow removing an event gets.
 struct Deletion {
     filter: Filter,
     seqs: Vec<u64>,
     /// How far through `seqs` it's got.
     next: usize,
     deleted: usize,
+    /// How many events the next chunk removes.
+    chunk: usize,
+    /// When the next chunk may start.
+    resume: Instant,
     progress: tokio::sync::mpsc::UnboundedSender<Deleting>,
+}
+
+/// The size of the chunk after one of `chunk` events that took `took`.
+fn next_delete_chunk(chunk: usize, took: Duration) -> usize {
+    if took > DELETE_TARGET {
+        (chunk / 2).max(1)
+    } else if took < DELETE_TARGET / 2 {
+        (chunk * 2).min(delete::CHUNK)
+    } else {
+        chunk
+    }
 }
 
 /// Remove the next chunk of `deletion`'s events, and `tell` what went.
@@ -1832,9 +1860,20 @@ fn delete_chunk(store: &Store, deletion: &mut Deletion, tell: &impl Fn(Written))
         );
         return true;
     }
-    let end = (deletion.next + delete::CHUNK).min(deletion.seqs.len());
+    let end = (deletion.next + deletion.chunk).min(deletion.seqs.len());
     let chunk = &deletion.seqs[deletion.next..end];
-    match delete::remove(store, chunk, &deletion.filter) {
+    let start = Instant::now();
+    let outcome = delete::remove(store, chunk, &deletion.filter);
+    let took = start.elapsed();
+    if took > DELETE_TARGET * 10 {
+        tracing::warn!(
+            "removing {} events for a deletion took {took:.1?}",
+            chunk.len()
+        );
+    }
+    deletion.chunk = next_delete_chunk(deletion.chunk, took);
+    deletion.resume = Instant::now() + took;
+    match outcome {
         Ok((deleted, removed)) => {
             tell((Vec::new(), removed));
             deletion.deleted += deleted;
@@ -1907,6 +1946,7 @@ impl Writer {
                 let mut deleting = std::collections::VecDeque::<Box<Deletion>>::new();
                 let step = |deleting: &mut std::collections::VecDeque<Box<Deletion>>| {
                     if let Some(deletion) = deleting.front_mut()
+                        && Instant::now() >= deletion.resume
                         && delete_chunk(&store, deletion, &tell)
                     {
                         deleting.pop_front();
@@ -1944,10 +1984,13 @@ impl Writer {
                         }
                         next_save = Instant::now() + DELETION_FILTER_SAVE_INTERVAL;
                     }
-                    let wait = match trust || !deleting.is_empty() {
+                    let mut wait = match trust {
                         true => Duration::ZERO,
                         false => next_sweep.saturating_duration_since(Instant::now()),
                     };
+                    if let Some(deletion) = deleting.front() {
+                        wait = wait.min(deletion.resume.saturating_duration_since(Instant::now()));
+                    }
                     let first = match rx.recv_timeout(wait) {
                         Ok(Request::Write(job)) => {
                             METRICS.write_queue.dec();
@@ -2029,9 +2072,9 @@ impl Writer {
     }
 
     /// Remove those of `seqs` that `filter` matches, as `ditto-relay delete`
-    /// asks, a [`delete::CHUNK`] per transaction, between the writer's other
-    /// work, and tell the search indexer what went. Dropping what's
-    /// returned abandons what's left.
+    /// asks, a chunk per transaction, paced as [`Deletion`] says, between
+    /// the writer's other work, and tell the search indexer what went.
+    /// Dropping what's returned abandons what's left.
     pub fn delete(
         &self,
         filter: Filter,
@@ -2043,6 +2086,8 @@ impl Writer {
             seqs,
             next: 0,
             deleted: 0,
+            chunk: FIRST_DELETE_CHUNK,
+            resume: Instant::now(),
             progress,
         });
         if let Err(std::sync::mpsc::SendError(Request::Delete(deletion))) =
@@ -2616,6 +2661,16 @@ pub mod tests {
         assert_eq!(store.expire(&mut txn, now + 1000, 100).unwrap(), [4]);
         txn.commit().unwrap();
         assert_eq!(entries(&store), 0);
+    }
+
+    #[test]
+    fn sizes_deletion_chunks_by_how_long_they_take() {
+        let ms = Duration::from_millis;
+        assert_eq!(next_delete_chunk(64, ms(1)), 128);
+        assert_eq!(next_delete_chunk(800, ms(1)), delete::CHUNK);
+        assert_eq!(next_delete_chunk(64, ms(40)), 64);
+        assert_eq!(next_delete_chunk(64, ms(200)), 32);
+        assert_eq!(next_delete_chunk(1, Duration::from_secs(30)), 1);
     }
 
     #[test]
