@@ -21,6 +21,12 @@ it is tagged.
   open to everyone.
   A connection is challenged to authenticate only once it's refused something
   for want of it.
+- The relay warns, at startup and in `ditto-relay check`, when its database is
+  kept on ZFS in records bigger than LMDB's 4K pages, naming the dataset to
+  `zfs set recordsize=4K`. In 16K records, ZFS read a record from disk
+  before every page written, and writes were many times slower. After the
+  change, `ditto-relay compact` writes `bodies` anew too, so both files get
+  the new records.
 - `ditto-relay compact` rewrites the database's indexes into a new file,
   holding only what's live, packed in order, with the relay stopped. The old
   file is kept beside it until it's removed. After a big delete, LMDB's file

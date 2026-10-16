@@ -129,6 +129,7 @@ use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
 use crate::metrics::METRICS;
 use crate::rank::{self, Rank};
 use crate::record::{self, Element, EventView, Header, tag_value};
+use crate::storage;
 use crate::wot::{self, Wot};
 
 pub const STAMP_LEN: usize = 10;
@@ -192,7 +193,7 @@ const EXPIRING: &[u8] = &[0];
 const DELETION_FILTER_BITS: u64 = 1 << 31;
 
 /// The directory, in the database's, of the environment records are kept in.
-const BODIES_DIR: &str = "bodies";
+pub const BODIES_DIR: &str = "bodies";
 
 /// The deletion filter's file, in the database's directory.
 const DELETION_FILTER_FILE: &str = "deletions.bloom";
@@ -504,6 +505,9 @@ impl Store {
                 dir.display()
             )
         })?;
+        for mismatch in storage::check(&files) {
+            tracing::warn!("{mismatch}");
+        }
         let tables = Tables::open(&env, bodies)?;
         // Where an older `ditto-relay delete`, which wrote the store itself,
         // left what it removed for the search indexer to delete.

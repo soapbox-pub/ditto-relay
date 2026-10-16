@@ -13,7 +13,7 @@ use ditto_relay::config::{Config, Environment};
 use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
-use ditto_relay::store::{History, IndexedTags, Store};
+use ditto_relay::store::{BODIES_DIR, History, IndexedTags, Store};
 use ditto_relay::tls::{self, Tls};
 use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
@@ -104,6 +104,15 @@ fn check(config: &Config) -> anyhow::Result<()> {
     match key::read(&config.secret_key_file)? {
         Some(keypair) => println!("key: {}, in {path}", key::pubkey(&keypair)),
         None => println!("key: a new one to be made in {path}"),
+    }
+    let files =
+        ditto_relay::checkpoint::files(&config.db_path, &[&config.db_path.join(BODIES_DIR)]);
+    let mismatches = ditto_relay::storage::check(&files);
+    if mismatches.is_empty() {
+        println!("storage: suits LMDB");
+    }
+    for mismatch in mismatches {
+        println!("storage: {mismatch}");
     }
     println!("nip85: {}", if config.nip85 { "on" } else { "off" });
     match &config.tls {
@@ -210,7 +219,7 @@ fn compact(
     threads: usize,
 ) -> anyhow::Result<()> {
     let mut progress = |p: &compact::Progress| {
-        let left = match p.entries {
+        let left = match p.done {
             0 => String::new(),
             done => {
                 let secs =
@@ -219,10 +228,11 @@ fn compact(
             }
         };
         eprintln!(
-            "{}: {} of {} entries, {:.1} GB, in {:.0?}{left}",
+            "{}: {} of {} {}, {:.1} GB, in {:.0?}{left}",
             p.table,
-            p.entries,
+            p.done,
             p.total,
+            p.unit,
             p.bytes as f64 / 1e9,
             p.elapsed,
         );
@@ -243,10 +253,28 @@ fn compact(
             store.checkpoint()?;
             drop(store);
             let copied = compact::in_place(db, config.map_size, threads, &mut progress)?;
-            println!(
-                "the old file is {}: remove it once the relay runs well on the new one",
-                db.join(compact::OLD_FILE).display()
-            );
+            let mut old = vec![db.join(compact::OLD_FILE)];
+            match copied.bodies {
+                compact::Bodies::Left => {}
+                compact::Bodies::Rewritten(bytes, took) => {
+                    println!(
+                        "wrote bodies anew, in smaller records: {:.1} GB in {took:.0?}",
+                        bytes as f64 / 1e9
+                    );
+                    old.push(db.join(BODIES_DIR).join(compact::OLD_FILE));
+                }
+                compact::Bodies::NoRoom(need, free) => println!(
+                    "bodies would be kept in smaller records written anew, but that needs {:.1} GB free, and there's {:.1} GB",
+                    need as f64 / 1e9,
+                    free as f64 / 1e9
+                ),
+            }
+            for old in old {
+                println!(
+                    "the old file is {}: remove it once the relay runs well on the new one",
+                    old.display()
+                );
+            }
             copied
         }
         _ => bail!("--from and --into go together"),

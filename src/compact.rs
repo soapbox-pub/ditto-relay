@@ -17,11 +17,15 @@
 //! too many values to read one page at a time, as the author of millions of
 //! events has, is split into pieces of its values for the threads to read.
 //!
-//! Only the main environment is copied: `bodies` is written in order, its
-//! freed pages filled by the records that come after them, so it stays
-//! packed.
+//! Only the main environment is compacted: `bodies` is written in order,
+//! its freed pages filled by the records that come after them, so it stays
+//! packed. [`in_place`] writes it anew, as it is, only if a new file would
+//! suit ZFS better: see [`crate::storage`].
 
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,6 +34,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail, ensure};
 
 use crate::lmdb::{Cursor, Db, DbFlags, Env, Txn};
+use crate::storage;
+use crate::store::BODIES_DIR;
 
 /// The most ranges a table is split into.
 const MAX_RANGES: usize = 1 << 16;
@@ -56,15 +62,23 @@ pub const OLD_FILE: &str = "data.mdb.old";
 /// Where [`in_place`] writes its copy, in the database's directory.
 const COPY_DIR: &str = "compact";
 
+/// Where [`in_place`] writes a new `bodies` file, beside the old.
+const BODIES_COPY: &str = "data.mdb.compact";
+
+/// How much is read and written at once, writing `bodies` anew.
+const REWRITE_CHUNK: usize = 16 << 20;
+
 /// How a copy's going.
 pub struct Progress<'a> {
     /// The table being copied.
     pub table: &'a str,
-    /// Entries copied, of them all, counting each duplicate.
-    pub entries: u64,
+    /// How much is copied, of how much, in `unit`s.
+    pub done: u64,
     pub total: u64,
-    /// Bytes of keys and values copied.
+    pub unit: &'a str,
+    /// Bytes copied.
     pub bytes: u64,
+    /// Since copying the tables, or `bodies`, began.
     pub elapsed: Duration,
 }
 
@@ -78,6 +92,19 @@ pub struct Copied {
     /// How long splitting the tables into ranges took.
     pub split: Duration,
     pub elapsed: Duration,
+    pub bodies: Bodies,
+}
+
+/// What [`in_place`] did with `bodies`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Bodies {
+    /// Left as it was.
+    Left,
+    /// Written anew, in smaller records, this many bytes, taking this long.
+    Rewritten(u64, Duration),
+    /// It'd be in smaller records written anew, but there's not the room
+    /// for a copy: the bytes needed, and free.
+    NoRoom(u64, u64),
 }
 
 /// A run of one table's keys: from `start`, to before `end` or to the last.
@@ -227,8 +254,9 @@ pub fn copy(
                     if said.elapsed() >= Duration::from_secs(1) {
                         progress(&Progress {
                             table: &table.name,
-                            entries,
+                            done: entries,
                             total,
+                            unit: "entries",
                             bytes: bytes + uncommitted,
                             elapsed: start.elapsed(),
                         });
@@ -272,6 +300,7 @@ pub fn copy(
         after,
         split,
         elapsed: start.elapsed(),
+        bodies: Bodies::Left,
     })
 }
 
@@ -281,6 +310,9 @@ pub fn copy(
 /// it to remove once the copy's known good; there mustn't be one already.
 /// The database's checkpoint, of the file replaced, is removed, so a crash
 /// of the machine before the relay makes its own leaves the copy alone.
+/// Then if the new file is kept in smaller records than `bodies`, as when
+/// its ZFS dataset's `recordsize` has been lowered, `bodies` is written
+/// anew too, and its old file kept as well.
 pub fn in_place(
     dir: &Path,
     map_size: usize,
@@ -288,11 +320,13 @@ pub fn in_place(
     progress: &mut dyn FnMut(&Progress),
 ) -> anyhow::Result<Copied> {
     let old = dir.join(OLD_FILE);
-    if old.exists() {
-        bail!(
-            "{} is there, left by an earlier compact: remove it once the database is known good",
-            old.display()
-        );
+    for old in [&old, &dir.join(BODIES_DIR).join(OLD_FILE)] {
+        if old.exists() {
+            bail!(
+                "{} is there, left by an earlier compact: remove it once the database is known good",
+                old.display()
+            );
+        }
     }
     let into = dir.join(COPY_DIR);
     // Left by a compact that didn't finish, and of no use.
@@ -317,7 +351,111 @@ pub fn in_place(
         std::fs::File::open(dir)?.sync_all()
     };
     swap().with_context(|| format!("Could not put the copy in place in {}", dir.display()))?;
-    Ok(copied)
+    let bodies = rewrite_bodies(dir, map_size, false, progress)?;
+    Ok(Copied { bodies, ..copied })
+}
+
+/// Write `bodies` of the database in `dir` anew, as it is, if the main
+/// environment's file, just written, is kept in smaller records, or if
+/// `always`, keeping the old file as [`OLD_FILE`] beside it.
+fn rewrite_bodies(
+    dir: &Path,
+    map_size: usize,
+    always: bool,
+    progress: &mut dyn FnMut(&Progress),
+) -> anyhow::Result<Bodies> {
+    let bodies = dir.join(BODIES_DIR);
+    let file = bodies.join(DATA_FILE);
+    let (Ok(old), Ok(new)) = (
+        std::fs::metadata(&file),
+        std::fs::metadata(dir.join(DATA_FILE)),
+    ) else {
+        return Ok(Bodies::Left);
+    };
+    // The main file says how a file written anew is kept only where it is.
+    let smaller = old.dev() == new.dev()
+        && storage::smaller_anew((old.len(), old.blksize()), (new.len(), new.blksize()));
+    if !always && !smaller {
+        return Ok(Bodies::Left);
+    }
+    // Only what LMDB has used of it: the rest is never read.
+    let used = Env::open_read_only(&bodies, map_size, 1, 16)
+        .and_then(|env| env.usage(0))
+        .with_context(|| format!("Could not open the database at {}", bodies.display()))?
+        .used
+        .min(old.len());
+    let (need, free) = (used + used / 20, free_space(&bodies)?);
+    if free < need {
+        return Ok(Bodies::NoRoom(need, free));
+    }
+    let start = Instant::now();
+    let copy = bodies.join(BODIES_COPY);
+    match std::fs::remove_file(&copy) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+        _ => {}
+    }
+    rewrite(&file, &copy, used, progress)
+        .with_context(|| format!("Could not write {} anew", file.display()))?;
+    let swap = || -> io::Result<()> {
+        std::fs::rename(&file, bodies.join(OLD_FILE))?;
+        std::fs::rename(&copy, &file)?;
+        match std::fs::remove_file(bodies.join("lock.mdb")) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+            _ => {}
+        }
+        File::open(&bodies)?.sync_all()
+    };
+    swap().with_context(|| format!("Could not put the copy in place in {}", bodies.display()))?;
+    Ok(Bodies::Rewritten(used, start.elapsed()))
+}
+
+/// Copy the first `len` bytes of `from` into the new file `to`, durably, by
+/// reading and writing them: copying with `copy_file_range`, as
+/// `std::fs::copy` does, lets ZFS share the blocks, records and all.
+fn rewrite(
+    from: &Path,
+    to: &Path,
+    len: u64,
+    progress: &mut dyn FnMut(&Progress),
+) -> io::Result<()> {
+    let from = File::open(from)?;
+    let to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)?;
+    let mut buffer = vec![0; REWRITE_CHUNK];
+    let (start, mut said, mut at) = (Instant::now(), Instant::now(), 0);
+    while at < len {
+        let n = usize::try_from(len - at).map_or(buffer.len(), |left| left.min(buffer.len()));
+        from.read_exact_at(&mut buffer[..n], at)?;
+        to.write_all_at(&buffer[..n], at)?;
+        at += n as u64;
+        if said.elapsed() >= Duration::from_secs(1) {
+            progress(&Progress {
+                table: BODIES_DIR,
+                done: at,
+                total: len,
+                unit: "bytes",
+                bytes: at,
+                elapsed: start.elapsed(),
+            });
+            said = Instant::now();
+        }
+    }
+    to.sync_all()
+}
+
+/// The bytes free for an unprivileged user on the filesystem `dir` is on.
+fn free_space(dir: &Path) -> io::Result<u64> {
+    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: plain data, filled in by the kernel, and a NUL-terminated path.
+    let mut stat = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
 /// Split `table` into ranges of keys, returning where each begins, then
@@ -848,6 +986,41 @@ mod tests {
             .sum();
         // Whole pages, so some twice.
         assert!(read >= count, "{read} {count}");
+    }
+
+    /// `bodies` written anew holds just what it did, and the store opens
+    /// with it as with the old.
+    #[test]
+    fn writes_bodies_anew() {
+        use crate::event::tests::signed;
+        use crate::store::tests::{open_in, put};
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_in(dir.path());
+        let events: Vec<_> = (0..200)
+            .map(|n| signed(1, 1000 + n, 1, vec![], &"x".repeat(n as usize * 10)))
+            .collect();
+        for event in &events {
+            put(&store, event);
+        }
+        store.checkpoint().unwrap();
+        drop(store);
+        let bodies = dir.path().join(BODIES_DIR);
+        let before = contents(&bodies);
+        // Same records here, so only when told.
+        let left = rewrite_bodies(dir.path(), 1 << 30, false, &mut |_| {}).unwrap();
+        assert_eq!(left, Bodies::Left);
+        let done = rewrite_bodies(dir.path(), 1 << 30, true, &mut |_| {}).unwrap();
+        assert!(matches!(done, Bodies::Rewritten(..)));
+        assert!(bodies.join(OLD_FILE).exists());
+        assert!(!bodies.join(BODIES_COPY).exists());
+        assert_eq!(contents(&bodies), before);
+        let store = open_in(dir.path());
+        let txn = store.read().unwrap();
+        assert_eq!(store.len(&txn).unwrap(), events.len());
+        drop(txn);
+        drop(store);
+        // Not again, until the old file's gone.
+        assert!(in_place(dir.path(), 1 << 30, 2, &mut |_| {}).is_err());
     }
 
     #[test]

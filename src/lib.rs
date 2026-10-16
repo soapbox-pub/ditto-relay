@@ -24,6 +24,7 @@ pub mod rank;
 pub mod record;
 pub mod relay;
 pub mod search;
+pub mod storage;
 pub mod store;
 pub mod tls;
 pub mod tor;

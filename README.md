@@ -121,12 +121,28 @@ the relay reads the disk more. `compact` rewrites the database's indexes into a 
 file, packed in order, and puts it in place. It needs the relay stopped, and room for
 the new file, which is about the size of what's live. The old file is kept beside it,
 as `db/data.mdb.old`: remove it once the relay runs well on the new one. Event records
-(`db/bodies`) are written in order and kept packed already, so they're left alone.
+(`db/bodies`) are written in order and kept packed already, so they're left alone,
+unless a file written anew would suit ZFS better (see below). Then they're copied as
+they are, and the old file is kept as `db/bodies/data.mdb.old`.
 
 It reads with 32 threads at once, as the live pages of a big file are scattered, and
 waiting on them one at a time is what makes `mdb_copy -c` slow. `--threads` changes
 how many. `compact --from <dir> --into <dir>` only copies the database in `--from`,
 which must be stopped or a snapshot, into `--into`, to see how long it takes.
+
+## Storage
+
+The database works on any filesystem. On ZFS, its dataset's `recordsize` should be
+4K, LMDB's page size. ZFS never changes part of a record in place, so in bigger records
+it reads a record from disk before each page the relay writes into it, and writing is
+many times slower: on SATA SSDs, about 2,000 pages a second in 16K records, against
+77,000 in 4K. The relay checks this at startup and in `ditto-relay check`, and says
+which dataset to change. A file keeps the records it was written in, so after
+`zfs set recordsize=4K <dataset>` (on the host, for a container), stop the relay and
+run `ditto-relay compact`, which writes the files anew.
+
+The same goes for a VM's disk kept on a ZFS zvol: its `volblocksize` should be 4K too.
+The relay can't see that from inside the VM.
 
 ## Tor
 
