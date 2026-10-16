@@ -43,7 +43,7 @@ pub const FILE: &str = "checkpoint";
 /// as a crash of the machine can lose.
 pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-const MAGIC: &[u8; 8] = b"DRCKPT01";
+const MAGIC: &[u8; 8] = b"DRCKPT02";
 
 /// LMDB's meta page: where in it its magic number and the id of the
 /// transaction that wrote it are.
@@ -60,9 +60,11 @@ pub fn boot_id() -> Option<String> {
 /// One environment's part of a checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Saved {
-    /// Which file it is, by device and inode.
-    dev: u64,
+    /// Which file it is, by inode and when it was made (0 if the
+    /// filesystem doesn't say): not by device, which ZFS numbers anew each
+    /// time it mounts a dataset.
     ino: u64,
+    born: u64,
     meta: Meta,
 }
 
@@ -80,8 +82,8 @@ impl Checkpoint {
         out.extend_from_slice(self.boot_id.as_bytes());
         put(&mut out, self.envs.len() as u64);
         for env in &self.envs {
-            put(&mut out, env.dev);
             put(&mut out, env.ino);
+            put(&mut out, env.born);
             put(&mut out, env.meta.txnid);
             put(&mut out, env.meta.page_size as u64);
             put(&mut out, env.meta.pages.len() as u64);
@@ -102,7 +104,7 @@ impl Checkpoint {
         let boot_id = String::from_utf8(reader.take(len)?.to_vec()).ok()?;
         let mut envs = Vec::new();
         for _ in 0..reader.num()? {
-            let (dev, ino, txnid) = (reader.num()?, reader.num()?, reader.num()?);
+            let (ino, born, txnid) = (reader.num()?, reader.num()?, reader.num()?);
             let page_size = reader.num()? as usize;
             let len = reader.num()? as usize;
             if len != 2 * page_size || page_size < META_TXNID_AT + 8 {
@@ -110,8 +112,8 @@ impl Checkpoint {
             }
             let pages = reader.take(len)?.to_vec();
             envs.push(Saved {
-                dev,
                 ino,
+                born,
                 meta: Meta {
                     txnid,
                     page_size,
@@ -154,6 +156,15 @@ fn newest_txnid(pages: &[u8], page_size: usize) -> Option<u64> {
             ))
         })
         .max()
+}
+
+/// When a file was made, in nanoseconds since the epoch, or 0 if its
+/// filesystem doesn't say.
+fn born(stat: &std::fs::Metadata) -> u64 {
+    stat.created()
+        .ok()
+        .and_then(|born| born.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |born| born.as_nanos() as u64)
 }
 
 /// Whether `meta`'s pages hold its commit's meta page: they may not, if
@@ -212,8 +223,8 @@ pub fn save(
     for (file, meta) in files.iter().zip(metas) {
         let stat = std::fs::metadata(file)?;
         envs.push(Saved {
-            dev: stat.dev(),
             ino: stat.ino(),
+            born: born(&stat),
             meta: meta.clone(),
         });
     }
@@ -279,7 +290,7 @@ pub fn recover(dir: &Path, files: &[PathBuf], boot_id: Option<&str>) -> io::Resu
             Err(err) => return Err(err),
         };
         let stat = file.metadata()?;
-        if (stat.dev(), stat.ino()) != (saved.dev, saved.ino) {
+        if (stat.ino(), born(&stat)) != (saved.ino, saved.born) {
             return Ok(Recovered::Ignored(format!(
                 "{} has been replaced",
                 path.display()
@@ -321,8 +332,8 @@ mod tests {
         let checkpoint = Checkpoint {
             boot_id: "boot".into(),
             envs: vec![Saved {
-                dev: 1,
-                ino: 2,
+                ino: 1,
+                born: 2,
                 meta: Meta {
                     txnid: 3,
                     page_size: 256,
