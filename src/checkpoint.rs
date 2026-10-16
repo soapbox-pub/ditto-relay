@@ -250,8 +250,9 @@ pub enum Recovered {
     /// in the page cache, and the store's as it was left.
     SameBoot,
     /// The machine has booted since: the store's back at the checkpoint,
-    /// the commits since dropped. Each environment's commit, in order.
-    Restored(Vec<u64>),
+    /// the commits since dropped unread, intact or not. For each
+    /// environment, in order, the checkpoint's commit and the latest found.
+    Restored(Vec<(u64, Option<u64>)>),
     /// The checkpoint isn't this store's, or is unreadable, so the store's
     /// as it was left. Why.
     Ignored(String),
@@ -309,16 +310,21 @@ pub fn recover(dir: &Path, files: &[PathBuf], boot_id: Option<&str>) -> io::Resu
                 saved.meta.txnid
             )));
         }
-        opened.push((file, current));
+        opened.push((file, current, newest));
     }
-    for ((file, current), saved) in opened.iter().zip(&checkpoint.envs) {
+    for ((file, current, _), saved) in opened.iter().zip(&checkpoint.envs) {
         if *current != saved.meta.pages {
             file.write_all_at(&saved.meta.pages, 0)?;
             file.sync_all()?;
         }
     }
     Ok(Recovered::Restored(
-        checkpoint.envs.iter().map(|env| env.meta.txnid).collect(),
+        checkpoint
+            .envs
+            .iter()
+            .zip(&opened)
+            .map(|(env, (_, _, newest))| (env.meta.txnid, *newest))
+            .collect(),
     ))
 }
 
@@ -417,7 +423,10 @@ mod tests {
         else {
             panic!("not restored");
         };
-        assert_eq!(txnids, metas.iter().map(|m| m.txnid).collect::<Vec<_>>());
+        // The meta pages since are garbage, so the latest commits aren't
+        // known.
+        let expected: Vec<_> = metas.iter().map(|m| (m.txnid, None)).collect();
+        assert_eq!(txnids, expected);
         let (env, main, appended) = open();
         let txn = env.read_txn().unwrap();
         assert_eq!(txn.len(main).unwrap(), 3000);

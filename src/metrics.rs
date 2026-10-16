@@ -96,6 +96,8 @@ pub struct Metrics {
     pub writes: Timer,
     /// Events waiting for the writer.
     pub write_queue: Gauge,
+    /// Time spent making checkpoints durable, writes going on meanwhile.
+    pub checkpoints: Timer,
     /// Time spent querying for REQs, not sending what's found.
     pub reqs: Timer,
     pub counts: Timer,
@@ -132,6 +134,7 @@ pub static METRICS: Metrics = Metrics {
     plugin: Timer::new(),
     writes: Timer::new(),
     write_queue: Gauge::new(),
+    checkpoints: Timer::new(),
     reqs: Timer::new(),
     counts: Timer::new(),
     syncs: Timer::new(),
@@ -233,6 +236,7 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
         "Events waiting for the writer.",
         m.write_queue.get() as f64,
     );
+    out.timer("checkpoint", "Checkpoints made durable", &m.checkpoints);
     out.timer("req", "REQ queries", &m.reqs);
     out.timer("count", "COUNT queries", &m.counts);
     out.timer("sync", "NIP-77 sync messages answered", &m.syncs);

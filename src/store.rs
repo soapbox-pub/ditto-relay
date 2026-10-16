@@ -473,9 +473,19 @@ impl Store {
         let recovering = || format!("Could not restore the database at {}", dir.display());
         match checkpoint::recover(dir, &files, boot_id.as_deref()).with_context(recovering)? {
             Recovered::Nothing | Recovered::SameBoot => {}
-            Recovered::Restored(txnids) => tracing::warn!(
-                "the machine went down since the database was last open: put it back as it was at its last checkpoint, commits {txnids:?}, losing what was written after"
-            ),
+            Recovered::Restored(commits) => {
+                let commits: Vec<String> = commits
+                    .iter()
+                    .map(|(at, latest)| match latest {
+                        Some(latest) => format!("{at}, dropping {}", latest.saturating_sub(*at)),
+                        None => format!("{at}, its later meta pages unreadable"),
+                    })
+                    .collect();
+                tracing::warn!(
+                    "the machine went down since the database was last open: put it back as it was at its last checkpoint (commit {}), losing what was written after, which may or may not have been intact",
+                    commits.join("; bodies commit ")
+                )
+            }
             Recovered::Ignored(why) => {
                 tracing::warn!("not restoring the database's checkpoint, as {why}")
             }
@@ -616,7 +626,9 @@ impl Store {
         );
         checkpoints.finishing = Some(std::thread::spawn(move || {
             let start = Instant::now();
-            match checkpoint::finish(&env, &dir, &files, boot_id.as_deref(), &metas) {
+            let finished = checkpoint::finish(&env, &dir, &files, boot_id.as_deref(), &metas);
+            METRICS.checkpoints.since(start);
+            match finished {
                 Ok(()) if start.elapsed() > checkpoint::INTERVAL => tracing::warn!(
                     "a checkpoint took {:.1?}, longer than the time between them",
                     start.elapsed()
