@@ -7,13 +7,13 @@
 //! [`crate::delete`]). When nothing answers, `delete` takes the lock itself,
 //! and a relay starting meanwhile waits for it.
 //!
-//! A request is a line of JSON, answered with lines of JSON: how it's going,
-//! at most every [`PROGRESS_INTERVAL`], then how it went.
+//! A request is a line of JSON, answered with a line of JSON. A deletion is
+//! answered once it's [queued](crate::pending), and what it covers hidden,
+//! with its id; the relay removes it after, in the background.
 //!
 //! ```text
 //! → {"delete":{"filter":"{\"kinds\":[1]}","age":86400}}
-//! ← {"deleted":1000}
-//! ← {"done":1234}    or    {"error":"..."}
+//! ← {"queued":12}    or    {"error":"..."}
 //! ```
 
 use std::io::{BufRead, Write};
@@ -21,7 +21,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -31,15 +30,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::delete;
-use crate::store::{Deleting, Store, Writer};
+use crate::store::{Store, Writer};
 
 /// Held by the running relay, in the database's directory.
 pub const LOCK_FILE: &str = "ditto-relay.lock";
 /// Where the running relay answers, in the database's directory.
 pub const SOCKET_FILE: &str = "control.sock";
-
-/// How often a long deletion says how it's going.
-const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The longest request read.
 const MAX_REQUEST: u64 = 1 << 20;
@@ -57,10 +53,8 @@ enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Reply {
-    /// How many events have been removed so far.
-    Deleted(usize),
-    /// Finished, having removed this many.
-    Done(usize),
+    /// The deletion's queued, under this id.
+    Queued(u64),
     Error(String),
 }
 
@@ -163,17 +157,7 @@ async fn answer(stream: UnixStream, store: Arc<Store>, writer: Writer) {
     let outcome = match read.read_line(&mut line).await {
         Ok(_) => match serde_json::from_str(&line) {
             Ok(Request::Delete { filter, age }) => {
-                let hung_up = async {
-                    // Nothing more is asked, so anything read is the end.
-                    let _ = read.read(&mut [0]).await;
-                };
-                tokio::select! {
-                    outcome = delete(filter.as_deref(), age, store, writer, &mut write) => outcome,
-                    () = hung_up => {
-                        tracing::info!("ditto-relay delete hung up, so its deletion is abandoned");
-                        return;
-                    }
-                }
+                delete(filter, age, store, writer, &mut write).await
             }
             Err(err) => Err(anyhow::anyhow!("not a request: {err}")),
         },
@@ -190,51 +174,38 @@ async fn send(write: &mut (impl AsyncWriteExt + Unpin), reply: &Reply) -> std::i
     write.write_all(&line).await
 }
 
-/// Have the writer delete what the filter matches, saying how it goes.
-/// Dropped, as when the asker hangs up, it abandons what's left.
+/// Have the writer queue a deletion of what the filter matches, or picks,
+/// and say it's queued.
 async fn delete(
-    filter: Option<&str>,
+    json: Option<String>,
     age: Option<u64>,
     store: Arc<Store>,
     writer: Writer,
     write: &mut (impl AsyncWriteExt + Unpin),
 ) -> anyhow::Result<()> {
-    let filter = delete::filter(filter, age, crate::event::now(), &store.indexed_tags)?;
-    let matched = filter.clone();
-    let seqs = tokio::task::spawn_blocking(move || delete::matching(&store, &matched)).await??;
-    tracing::info!(
-        "deleting what a filter matches, as ditto-relay delete asked: {} events and their versions",
-        seqs.len()
-    );
-    let mut progress = writer.delete(filter, seqs);
-    let mut said = Instant::now();
-    while let Some(update) = progress.recv().await {
-        match update {
-            Deleting::SoFar(deleted) if said.elapsed() >= PROGRESS_INTERVAL => {
-                send(write, &Reply::Deleted(deleted)).await?;
-                said = Instant::now();
-            }
-            Deleting::SoFar(_) => {}
-            Deleting::Done(deleted) => {
-                tracing::info!("deleted {deleted} events, as ditto-relay delete asked");
-                send(write, &Reply::Done(deleted)).await?;
-                return Ok(());
-            }
-            Deleting::Failed(err) => bail!(err),
-        }
-    }
-    bail!("the writer stopped")
+    let filter = delete::filter(
+        json.as_deref(),
+        age,
+        crate::event::now(),
+        &store.indexed_tags,
+    )?;
+    // Picking reads, maybe for a while: not on the runtime's threads.
+    let target =
+        tokio::task::spawn_blocking(move || delete::target(&store, filter, json.as_deref(), age))
+            .await??;
+    let pending = writer.delete(target).await?;
+    send(write, &Reply::Queued(pending.id)).await?;
+    Ok(())
 }
 
-/// Ask the relay answering at `path` to delete what the filter matches,
-/// telling `progress` how many so far as it goes. Returns how many, or None
-/// if no relay is answering there.
+/// Ask the relay answering at `path` to delete what the filter matches.
+/// Returns the id it's queued under, or None if no relay is answering
+/// there.
 pub fn request_delete(
     path: &Path,
     filter: Option<&str>,
     age: Option<u64>,
-    mut progress: impl FnMut(usize),
-) -> anyhow::Result<Option<usize>> {
+) -> anyhow::Result<Option<u64>> {
     let mut stream = match std::os::unix::net::UnixStream::connect(path) {
         Ok(stream) => stream,
         Err(err)
@@ -261,14 +232,13 @@ pub fn request_delete(
     let mut line = serde_json::to_vec(&request).expect("a request serializes");
     line.push(b'\n');
     stream.write_all(&line)?;
-    for line in std::io::BufReader::new(stream).lines() {
+    if let Some(line) = std::io::BufReader::new(stream).lines().next() {
         match serde_json::from_str(&line?).context("the relay answered nonsense")? {
-            Reply::Deleted(deleted) => progress(deleted),
-            Reply::Done(deleted) => return Ok(Some(deleted)),
+            Reply::Queued(id) => return Ok(Some(id)),
             Reply::Error(err) => bail!("the relay couldn't delete: {err}"),
         }
     }
-    bail!("the relay hung up before it was done")
+    bail!("the relay hung up before answering")
 }
 
 #[cfg(test)]
@@ -285,8 +255,9 @@ mod tests {
         assert!(Lock::try_acquire(&db).unwrap().is_some());
     }
 
-    /// The relay's writer deletes, between its own writes, tells the search
-    /// indexer what went, and says how it went.
+    /// The relay's writer queues a deletion, hiding what it covers at once,
+    /// removes it between its own writes, and tells the search indexer what
+    /// went.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_relay_deletes_when_asked() {
         use crate::event::tests::signed;
@@ -294,7 +265,7 @@ mod tests {
 
         let (dir, store) = open();
         let store = Arc::new(store);
-        let count = delete::CHUNK as u64 + 10;
+        let count = 1010;
         for i in 0..count {
             put(&store, &signed(1, 100 + i, 1, vec![], "spam"));
         }
@@ -308,13 +279,26 @@ mod tests {
         let author = signed(1, 0, 1, vec![], "").pubkey;
         let filter = format!(r#"{{"authors":["{author}"]}}"#);
         let asked = path.clone();
-        let deleted = tokio::task::spawn_blocking(move || {
-            request_delete(&asked, Some(&filter), None, |_| {})
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(deleted, Some(count as usize));
+        let id = tokio::task::spawn_blocking(move || request_delete(&asked, Some(&filter), None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, Some(1));
+        // Hidden at once.
+        let visible = |store: &Store| {
+            let txn = store.read().unwrap();
+            (1..=count + 1)
+                .filter(|&seq| store.load(&txn, seq).unwrap().is_some())
+                .count()
+        };
+        assert_eq!(visible(&store), 1);
+        // Gone soon after.
+        for _ in 0..500 {
+            if store.pending().is_empty() && store.len(&store.read().unwrap()).unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(store.len(&store.read().unwrap()).unwrap(), 1);
         let removed: usize = told.try_iter().map(|seqs| seqs.len()).sum();
         assert_eq!(removed, count as usize);
@@ -322,7 +306,7 @@ mod tests {
         // A bad filter is the relay's to refuse, and says why.
         let asked = path.clone();
         let refused = tokio::task::spawn_blocking(move || {
-            request_delete(&asked, Some("{\"kinds\":\"x\"}"), None, |_| {})
+            request_delete(&asked, Some("{\"kinds\":\"x\"}"), None)
         })
         .await
         .unwrap();
@@ -344,17 +328,9 @@ mod tests {
     fn nobody_answering_is_no_relay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SOCKET_FILE);
-        assert!(
-            request_delete(&path, None, Some(1), |_| {})
-                .unwrap()
-                .is_none()
-        );
+        assert!(request_delete(&path, None, Some(1)).unwrap().is_none());
         // One a relay left behind.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-        assert!(
-            request_delete(&path, None, Some(1), |_| {})
-                .unwrap()
-                .is_none()
-        );
+        assert!(request_delete(&path, None, Some(1)).unwrap().is_none());
     }
 }

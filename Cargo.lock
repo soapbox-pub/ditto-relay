@@ -1205,6 +1205,7 @@ dependencies = [
  "lmdb-master-sys",
  "rand 0.10.3",
  "rcgen",
+ "roaring",
  "rustls",
  "safelog",
  "secp256k1",
@@ -3618,6 +3619,16 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roaring"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18bd8a37d17a58532776dcdf6041ce64929adca78e8489d5cacbafe99229d3e1"
+dependencies = [
+ "bytemuck",
+ "byteorder",
 ]
 
 [[package]]

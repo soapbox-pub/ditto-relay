@@ -152,9 +152,10 @@ fn check(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ditto-relay delete`: see [`delete`]. The running relay is asked to do
-/// it, if there is one; else it's done here, holding the [`control::Lock`]
-/// so that no relay starts meanwhile.
+/// `ditto-relay delete`: see [`delete`]. The running relay is asked to
+/// queue it, if there is one, and does it in the background; else it's done
+/// here and now, holding the [`control::Lock`] so that no relay starts
+/// meanwhile.
 fn delete(
     config: &Config,
     json: Option<&str>,
@@ -177,16 +178,11 @@ fn delete(
         return Ok(());
     }
 
-    let mut said = Instant::now();
-    let mut progress = |deleted| {
-        if said.elapsed() >= Duration::from_secs(1) {
-            eprintln!("deleted {deleted} events so far");
-            said = Instant::now();
-        }
-    };
     let socket = control::socket_path(&config.db_path);
-    if let Some(deleted) = control::request_delete(&socket, json, age, &mut progress)? {
-        println!("deleted {deleted} events");
+    if let Some(id) = control::request_delete(&socket, json, age)? {
+        println!(
+            "queued deletion {id}: what it matches is hidden now, and the relay removes it in the background, saying how it goes in its log"
+        );
         return Ok(());
     }
     let Some(_lock) = control::Lock::try_acquire(&config.db_path)? else {
@@ -195,14 +191,28 @@ fn delete(
             socket.display()
         );
     };
-    let store = open_store(config)?;
+    let store = Arc::new(open_store(config)?);
+    let target = delete::target(&store, filter, json, age)?;
+    let mut said = Instant::now();
+    let progress = |deleted| {
+        if said.elapsed() >= Duration::from_secs(1) {
+            eprintln!("deleted {deleted} events so far");
+            said = Instant::now();
+        }
+    };
     let mut indexer = match config.search {
         true => {
             Some(SearchIndex::open(&config.search_path, config.search_kinds.clone(), &store)?.1)
         }
         false => None,
     };
-    let deleted = delete::delete(&store, &filter, indexer.as_mut(), &mut progress)?;
+    let deleted = delete::delete(
+        &store,
+        Some(store.clone()),
+        target,
+        indexer.as_mut(),
+        progress,
+    )?;
     store.checkpoint()?;
     println!("deleted {deleted} events");
     Ok(())

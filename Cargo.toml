@@ -26,6 +26,7 @@ libc = "0.2.190"
 lmdb-master-sys = "0.2.6"
 # The certificate a TLS-ALPN-01 challenge is answered with.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+roaring = "0.11.5"
 # The TLS clients connect with when [tls] is on, and Arti speaks to Tor
 # relays with, which leaves choosing its cryptography to the application.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

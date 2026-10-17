@@ -45,12 +45,38 @@ it is tagged.
   unreadable. A search index that kept events the database lost is kept,
   rather than rebuilt from nothing, and their sequence numbers aren't given to
   other events.
-- `ditto-relay delete` no longer holds up the running relay's writes. Each
-  of its transactions is sized to take about 50 ms, by how long the last
-  took, and the next waits at least as long, so the writer spends at most
-  half its time deleting. Before, it removed 1,000 events per transaction
-  however long that took: in a database with a big freelist, as long as 40
-  seconds, with every write waiting on it.
+- Deleting is instant. `ditto-relay delete` returns as soon as the running
+  relay has queued the deletion, and what it matches is hidden from clients
+  from then on: every event read is checked against the deletions pending,
+  in memory. The relay removes the events afterwards, in the background, and
+  says how it's going in its log; a queued deletion survives a restart. Only
+  events stored before it was asked for are deleted. NIP-09 deletions and
+  NIP-62 requests to vanish work the same way, so one by a prolific author no
+  longer holds up every write while it's carried out. Counts answered from
+  the indexes alone include what's hidden until it's gone.
+- `ditto-relay delete` takes any filter a REQ does, search text included,
+  and one with a `limit` or `distinct:author` deletes the events it picks as
+  of then, by its sort: `sort:top` with a limit deletes the most engaged
+  with.
+- Big deletions are some hundred times faster to carry out. Of hundreds of
+  thousands of events or more, each index is swept once, in order, read
+  ahead on many threads, rather than every event taken out of twenty places
+  at random; on a copy of a 276-million-event database, its 3 billion index
+  entries were swept in about 13 minutes. Smaller ones are removed an event
+  at a time, as before.
+- Removing no longer holds up the running relay's writes. Each transaction
+  is sized to take about 50 ms, by how long the last took, and once the
+  relay has written anything, the next waits at least as long, so a busy
+  writer spends at most half its time deleting, and an idle one deletes
+  flat out. Before, it removed 1,000 events per transaction however long
+  that took: in a database with a big freelist, as long as 40 seconds, with
+  every write waiting on it.
+- A crash could leave the index entries of an event behind after its record
+  was removed: the two files commit one after the other. An event's record
+  is now removed in a transaction of its own, after its index entries.
+- Building the search index reads the records ahead of itself, as it was
+  meant to: it asked the kernel for pages at the wrong offsets, and so for
+  nothing. The relay finds where LMDB maps its files now.
 
 ## [2.3.0]
 

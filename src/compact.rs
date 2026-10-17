@@ -27,8 +27,8 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
@@ -183,20 +183,7 @@ pub fn copy(
 
     let mut ranges = Vec::new();
     for (n, table) in tables.iter().enumerate() {
-        let bounds = split(&source, table, threads.max(1))?;
-        let ends = bounds.iter().skip(1).map(|end| Some(end.clone()));
-        // The last bound is the table's last key, in the last range.
-        let ends: Vec<_> = ends
-            .take(bounds.len().saturating_sub(2))
-            .chain([None])
-            .collect();
-        for (start, end) in bounds.into_iter().zip(ends) {
-            ranges.push(Range {
-                table: n,
-                start,
-                end,
-            });
-        }
+        ranges.extend(ranges_of(n, split(&source, table, threads.max(1))?));
     }
     let split = start.elapsed();
 
@@ -219,6 +206,7 @@ pub fn copy(
         ahead: threads * AHEAD_PER_THREAD,
         pieces: &pieces,
         done: &done,
+        renew: false,
     };
     std::thread::scope(|scope| -> anyhow::Result<()> {
         for _ in 0..threads {
@@ -654,6 +642,122 @@ fn walk<'t>(
     Ok(())
 }
 
+/// The ranges of table `n` that [`split`]'s `bounds` begin.
+fn ranges_of(n: usize, bounds: Vec<Vec<u8>>) -> Vec<Range> {
+    let ends = bounds.iter().skip(1).map(|end| Some(end.clone()));
+    // The last bound is the table's last key, in the last range.
+    let ends: Vec<_> = ends
+        .take(bounds.len().saturating_sub(2))
+        .chain([None])
+        .collect();
+    bounds
+        .into_iter()
+        .zip(ends)
+        .map(|(start, end)| Range {
+            table: n,
+            start,
+            end,
+        })
+        .collect()
+}
+
+/// Threads reading a table of a live store ahead of something walking it
+/// in order, a [`crate::reap`] sweep, as [`copy`]'s read ahead of the copy.
+/// Each reads a range in a read transaction of its own, so that none pins
+/// pages LMDB could reuse for long. They stop when it's dropped.
+pub(crate) struct TableAhead {
+    shared: Arc<Ahead>,
+}
+
+struct Ahead {
+    table: [Table; 1],
+    ranges: OnceLock<Vec<Range>>,
+    copying: AtomicUsize,
+    next: AtomicUsize,
+    pieces: Mutex<VecDeque<Piece>>,
+    done: AtomicBool,
+}
+
+impl TableAhead {
+    /// Split `db` into ranges, and once it is, read them on `threads`
+    /// threads, ahead of where [`at`](Self::at) says the walk is.
+    pub(crate) fn start(
+        store: Arc<crate::store::Store>,
+        db: Db,
+        flags: DbFlags,
+        threads: usize,
+    ) -> TableAhead {
+        let shared = Arc::new(Ahead {
+            table: [Table {
+                name: String::new(),
+                db,
+                flags,
+            }],
+            ranges: OnceLock::new(),
+            copying: AtomicUsize::new(0),
+            next: AtomicUsize::new(0),
+            pieces: Mutex::new(VecDeque::new()),
+            done: AtomicBool::new(false),
+        });
+        let ahead = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("sweep-ahead".into())
+            .spawn(move || {
+                let env = store.env();
+                let ranges = match split(env, &ahead.table[0], threads) {
+                    Ok(bounds) => ranges_of(0, bounds),
+                    Err(err) => {
+                        tracing::debug!("splitting a table to read ahead failed: {err:#}");
+                        return;
+                    }
+                };
+                let ranges = ahead.ranges.get_or_init(|| ranges);
+                let reader = Reader {
+                    env,
+                    tables: &ahead.table,
+                    ranges,
+                    copying: &ahead.copying,
+                    next: &ahead.next,
+                    ahead: threads * AHEAD_PER_THREAD,
+                    pieces: &ahead.pieces,
+                    done: &ahead.done,
+                    renew: true,
+                };
+                std::thread::scope(|scope| {
+                    for _ in 0..threads {
+                        scope.spawn(|| reader.run());
+                    }
+                });
+            });
+        if let Err(err) = spawned {
+            tracing::debug!("no thread to read ahead: {err}");
+        }
+        TableAhead { shared }
+    }
+
+    /// The walk is at `key`. Keys are compared as bytes, as they are in
+    /// every table but those with integer keys, for which this does
+    /// nothing.
+    pub(crate) fn at(&self, key: &[u8]) {
+        let Some(ranges) = self.shared.ranges.get() else {
+            return;
+        };
+        if self.shared.table[0].flags.integer_key {
+            return;
+        }
+        let n = ranges.partition_point(|range| range.start[..] <= *key);
+        self.shared
+            .copying
+            .store(n.saturating_sub(1), Ordering::Relaxed);
+    }
+}
+
+impl Drop for TableAhead {
+    fn drop(&mut self) {
+        self.shared.done.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The threads that read ahead of the copy.
 struct Reader<'a> {
     env: &'a Env,
@@ -668,6 +772,9 @@ struct Reader<'a> {
     /// Pieces of big keys, in order, read before any more ranges.
     pieces: &'a Mutex<VecDeque<Piece>>,
     done: &'a AtomicBool,
+    /// Whether to read each range in a transaction of its own, as of a
+    /// store being written meanwhile.
+    renew: bool,
 }
 
 impl Reader<'_> {
@@ -675,10 +782,17 @@ impl Reader<'_> {
     /// copied, so their pages are in memory when it gets to them, until
     /// it's done.
     fn run(&self) {
-        let Ok(txn) = self.env.read_txn() else {
+        let Ok(mut txn) = self.env.read_txn() else {
             return;
         };
         while !self.done.load(Ordering::Relaxed) {
+            if self.renew {
+                drop(txn);
+                txn = match self.env.read_txn() {
+                    Ok(txn) => txn,
+                    Err(_) => return,
+                };
+            }
             let piece = self.pieces.lock().expect("unpoisoned").pop_front();
             if let Some(piece) = piece {
                 if let Err(err) = read_piece(&txn, &self.tables[piece.table], &piece) {

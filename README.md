@@ -97,15 +97,30 @@ ditto-relay delete --filter '{"kinds":[1]}' --age 7776000
 ```
 
 `delete` removes every stored event a NIP-01 filter matches, as `strfry delete` does.
-`--age` only removes events at least that many seconds old. `--dry-run` only counts
-them, and only reads, so it never holds up the relay. Run it with the relay's own
-config, as the relay's user. While the relay is running, `delete` asks it to do the
-deleting: the relay removes the events in small transactions between its own writes,
-and drops them from the search index. Progress is shown as it goes, and Ctrl-C stops
-it. With the relay stopped, `delete` removes the events itself, and a relay started
-meanwhile waits for it to finish. Removing an address's current version also removes
-its older versions that the filter matches, and the newest version left becomes
-current. Nothing stops deleted events from being published again.
+The filter matches as a REQ's would, NIP-50 search text and extensions included, so
+`{"search":"protocol:atproto"}` deletes every bridged Bluesky event. A filter with a
+`limit` or `distinct:author` deletes the events it picks as of then: with `sort:top`
+and a limit, the most engaged with. `--age` only removes events at least that many
+seconds old. `--dry-run` only counts them, and only reads, so it never holds up the
+relay. Run it with the relay's own config, as the relay's user.
+
+While the relay is running, `delete` returns as soon as the relay has queued the
+deletion, and from then on, no client sees what it matches, however many events that
+is. The relay removes them afterwards, in the background, between its own writes,
+deleting flat out while it has nothing else to write and at most half the time while
+it does, and says how it's going in its log. A deletion of hundreds of thousands of
+events or more sweeps each index once, in order, rather than removing every event
+from twenty places at random. A queued deletion survives a restart, and goes on where
+it left off. Only events stored before it was asked for are deleted. Counts the relay
+answers from its indexes alone include them until they're gone.
+
+NIP-09 deletions and NIP-62 requests to vanish are queued the same way: what they
+name is hidden as soon as they're stored, and removed after.
+
+With the relay stopped, `delete` removes the events itself, then and there, and a
+relay started meanwhile waits for it to finish. Removing an address's current version
+also removes its older versions that the filter matches, and the newest version left
+becomes current. Nothing stops deleted events from being published again.
 
 ## Compacting the database
 

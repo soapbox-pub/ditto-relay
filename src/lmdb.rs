@@ -41,6 +41,18 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether it's LMDB's `MDB_NOTFOUND`, as for a table that isn't there.
+    pub fn is_not_found(&self) -> bool {
+        self.0 == ffi::MDB_NOTFOUND
+    }
+
+    /// LMDB's `MDB_CORRUPTED`, for something read that can't be.
+    pub fn corrupted() -> Error {
+        Error(ffi::MDB_CORRUPTED)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn check(code: i32) -> Result<()> {
@@ -681,6 +693,18 @@ impl RwTxn<'_> {
         }
     }
 
+    /// A cursor that walks `db` deleting as it goes, for sweeping a table.
+    pub fn sweeper(&mut self, db: Db) -> Result<Sweeper<'_>> {
+        let mut ptr = ptr::null_mut();
+        // SAFETY: a live write transaction, borrowed mutably while the
+        // cursor lives; it's closed on drop.
+        check(unsafe { ffi::mdb_cursor_open(self.0.of(db), db.dbi, &mut ptr) })?;
+        Ok(Sweeper {
+            ptr,
+            _txn: PhantomData,
+        })
+    }
+
     /// A cursor that appends to `db`, for writing a table in order.
     pub fn appender(&mut self, db: Db) -> Result<Appender<'_>> {
         let mut ptr = ptr::null_mut();
@@ -896,6 +920,81 @@ impl Appender<'_> {
     }
 }
 
+/// A cursor that walks a table in order and deletes the entry it's on, from
+/// [`RwTxn::sweeper`]. Seeking the next entry after a delete is done from
+/// where the cursor is, which LMDB does without a search from the root
+/// while it's on the same page. What it returns is
+/// borrowed from it, so nothing it read outlives a delete, which can change
+/// the page it was on.
+pub struct Sweeper<'t> {
+    ptr: *mut ffi::MDB_cursor,
+    _txn: PhantomData<&'t mut ()>,
+}
+
+impl Sweeper<'_> {
+    fn op(
+        &mut self,
+        key: Option<&[u8]>,
+        value: Option<&[u8]>,
+        op: ffi::MDB_cursor_op,
+    ) -> Result<Option<Entry<'_>>> {
+        let mut k = key.map_or_else(empty, val);
+        let mut v = value.map_or_else(empty, val);
+        // SAFETY: a live cursor; the slices returned borrow it, so they
+        // can't be held across a delete.
+        let hit = found(unsafe { ffi::mdb_cursor_get(self.ptr, &mut k, &mut v, op) })?;
+        Ok(hit.map(|()| unsafe { (bytes(&k), bytes(&v)) }))
+    }
+
+    pub fn first(&mut self) -> Result<Option<Entry<'_>>> {
+        self.op(None, None, ffi::MDB_FIRST)
+    }
+
+    /// The next entry: the key's next value, or the next key's first.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Entry<'_>>> {
+        self.op(None, None, ffi::MDB_NEXT)
+    }
+
+    /// The entry the cursor is on. Not after a [`del`](Self::del): that
+    /// leaves it between entries.
+    pub fn current(&mut self) -> Result<Option<Entry<'_>>> {
+        self.op(None, None, ffi::MDB_GET_CURRENT)
+    }
+
+    /// The first entry of the next key.
+    pub fn next_nodup(&mut self) -> Result<Option<Entry<'_>>> {
+        self.op(None, None, ffi::MDB_NEXT_NODUP)
+    }
+
+    /// The first entry whose key is at least `key`.
+    pub fn set_range(&mut self, key: &[u8]) -> Result<Option<Entry<'_>>> {
+        self.op(Some(key), None, ffi::MDB_SET_RANGE)
+    }
+
+    /// Within `key`'s duplicates, the first value at least `value`.
+    pub fn get_both_range(&mut self, key: &[u8], value: &[u8]) -> Result<Option<Entry<'_>>> {
+        self.op(Some(key), Some(value), ffi::MDB_GET_BOTH_RANGE)
+    }
+
+    /// Delete the entry the cursor is on: in a duplicate-sorted table, just
+    /// that value. Seek what's after it by the deleted key, or key and
+    /// value: what [`next`](Self::next) returns after a delete isn't
+    /// reliable, not when the entry was the last on its page, where it can
+    /// read past the page's end.
+    pub fn del(&mut self) -> Result<()> {
+        // SAFETY: a live cursor of a live write transaction, on an entry.
+        check(unsafe { ffi::mdb_cursor_del(self.ptr, 0) })
+    }
+}
+
+impl Drop for Sweeper<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the cursor's transaction is still alive (it's borrowed).
+        unsafe { ffi::mdb_cursor_close(self.ptr) }
+    }
+}
+
 impl Drop for Appender<'_> {
     fn drop(&mut self) {
         // SAFETY: the cursor's transaction is still alive (it's borrowed).
@@ -1083,6 +1182,60 @@ mod tests {
         assert_eq!(cursor.last_dup().unwrap().unwrap().1, 30u16.to_be_bytes());
         assert!(cursor.set(b"x").unwrap().is_none());
         assert_eq!(txn.len(db).unwrap(), 4);
+    }
+
+    /// Deleting as it walks, and seeking what's after, it sees every entry
+    /// once, across pages of duplicates and keys alike.
+    #[test]
+    fn sweeps_a_table_in_one_walk() {
+        let (_dir, env) = open();
+        let db = env.create_db("dups", DbFlags::DUP_FIXED).unwrap();
+        let mut txn = env.write_txn().unwrap();
+        for n in 0..3000u32 {
+            txn.put_dup(db, b"big", &n.to_be_bytes()).unwrap();
+        }
+        for n in 0..3u32 {
+            txn.put_dup(db, b"gone", &n.to_be_bytes()).unwrap();
+        }
+        txn.put_dup(db, b"last", &7u32.to_be_bytes()).unwrap();
+        let mut sweeper = txn.sweeper(db).unwrap();
+        let owned = |e: Option<Entry>| e.map(|(k, v)| (k.to_vec(), v.to_vec()));
+        let mut entry = owned(sweeper.first().unwrap());
+        let mut seen = 0;
+        while let Some((key, value)) = entry {
+            seen += 1;
+            let n = u32::from_be_bytes(value[..].try_into().unwrap());
+            entry = if key == b"gone" || (key == b"big" && n % 2 == 1) {
+                sweeper.del().unwrap();
+                // What's after it, sought.
+                match owned(sweeper.get_both_range(&key, &value).unwrap()) {
+                    Some(next) => Some(next),
+                    None => match owned(sweeper.set_range(&key).unwrap()) {
+                        Some((found, _)) if found == key => owned(sweeper.next_nodup().unwrap()),
+                        other => other,
+                    },
+                }
+            } else {
+                owned(sweeper.next().unwrap())
+            };
+        }
+        assert_eq!(seen, 3004);
+        drop(sweeper);
+        txn.commit().unwrap();
+        let txn = env.read_txn().unwrap();
+        assert_eq!(txn.len(db).unwrap(), 1501);
+        let mut cursor = txn.cursor(db).unwrap();
+        assert!(cursor.set(b"gone").unwrap().is_none());
+        cursor.set(b"big").unwrap();
+        assert_eq!(cursor.count().unwrap(), 1500);
+        assert!(
+            cursor
+                .get_both_range(b"big", &1u32.to_be_bytes())
+                .unwrap()
+                .unwrap()
+                .1
+                == 2u32.to_be_bytes()
+        );
     }
 
     /// Where a value read is in the file, as read ahead goes by.

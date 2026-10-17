@@ -31,6 +31,8 @@
 //! | `replaceable`   | address                      | seq (u64 BE)           |
 //! | `history`       | address                      | stamps                 |
 //! | `expiring`      | `EXPIRING`                   | expiry stamps          |
+//! | `pending`       | id ‖ field ([`pending`])     | a pending deletion     |
+//! | `unlinked`      | seq (native u64)             | nothing                |
 //! | `meta`          | name                         | value                  |
 //!
 //! `events` is in an environment of its own, `bodies/` inside the database's
@@ -40,7 +42,11 @@
 //! in memory, and records are appended a commit at a time, in one write.
 //! See [`crate::lmdb`] for how the two are kept consistent; [`Store::open`]
 //! drops records a crash left behind, under sequence numbers never
-//! committed, and a record removed meanwhile is read as gone. After a crash
+//! committed. `bodies` commits first, so a record is never removed in the
+//! transaction that takes it out of the indexes: a crash between the
+//! commits would leave index entries pointing at nothing. The event's
+//! sequence number goes in `unlinked` instead, which reads it as gone, and
+//! the writer removes the record in a transaction of its own after. After a crash
 //! of the machine, the store is put back at its last
 //! [checkpoint](crate::checkpoint), made every few seconds as it's written.
 //!
@@ -71,16 +77,17 @@
 //! sweep away those that have expired, oldest first. Until it does, counts
 //! that need no events loaded still include them.
 //!
-//! A NIP-09 deletion removes what it names when it arrives, and is kept, so
+//! A NIP-09 deletion hides what it names as it's stored, and leaves
+//! removing it to the writer, after (see [`crate::pending`]). It's kept, so
 //! that what it names is refused if it arrives later: its `e` and `a` tags
 //! are indexed like any other, so whether an event has been deleted is a
 //! lookup or two of `tags` under kind 5. Deleting an address's current
 //! version by id makes the newest version left in its history current.
 //!
-//! A NIP-62 request to vanish removes everything its author published up
-//! to it, history and all, and the gift wraps addressed to them; kept, it
-//! refuses those again, by one lookup of `author_kinds` under kind 62. The
-//! relay only stores the requests addressed to it.
+//! A NIP-62 request to vanish hides, then removes, everything its author
+//! published up to it, history and all, and the gift wraps addressed to
+//! them; kept, it refuses those again, by one lookup of `author_kinds`
+//! under kind 62. The relay only stores the requests addressed to it.
 //!
 //! A tag key is name length ‖ name ‖ value length ‖ value ‖ kind, so a tag
 //! is counted per kind — followers, reactions — by LMDB for free, and all
@@ -99,7 +106,7 @@
 //! Another process only ever opens the store [to read](Store::open_read_only)
 //! while the relay runs: the relay's writer hardly ever lets go of LMDB's
 //! writer lock, so one that asked for it would wait on it indefinitely.
-//! What `ditto-relay delete` removes, the writer [removes](Writer::delete)
+//! What `ditto-relay delete` asks for, the writer [queues](Writer::delete)
 //! for it.
 //!
 //! Each tag key with at least [`HLL_THRESHOLD`] events has a NIP-45
@@ -108,17 +115,19 @@
 //! forget, so one counts authors whose events have since gone too.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
+use arc_swap::ArcSwap;
+use roaring::RoaringTreemap;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::checkpoint::{self, Recovered};
-use crate::delete;
 use crate::deletions;
 use crate::event::KindClass;
 use crate::event::decode_hex;
@@ -127,6 +136,8 @@ use crate::filter::Filter;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
 use crate::metrics::METRICS;
+use crate::pending::{self, Hidden, Target};
+use crate::purge::Purger;
 use crate::rank::{self, Rank};
 use crate::record::{self, Element, EventView, Header, tag_value};
 use crate::storage;
@@ -159,10 +170,10 @@ const MAX_ADDRESS_D: usize = 256;
 pub const CREATED: &[u8] = &[0];
 
 /// NIP-09 deletion requests.
-const DELETION: u16 = 5;
+pub const DELETION: u16 = 5;
 
 /// NIP-62 requests to vanish.
-const VANISH: u16 = 62;
+pub const VANISH: u16 = 62;
 
 /// Records [`Store::read_ahead`] reads on each thread, at least.
 const PREFETCH_CHUNK: usize = if cfg!(test) { 2 } else { 32 };
@@ -174,7 +185,7 @@ const PREFETCH_THREADS: usize = 8;
 const PAGE: usize = 4096;
 
 /// NIP-59 gift wraps.
-const GIFT_WRAP: u16 = 1059;
+pub const GIFT_WRAP: u16 = 1059;
 
 /// The `meta` key of the store's [id](Store::id).
 const STORE_ID: &[u8] = b"store_id";
@@ -186,7 +197,7 @@ const HISTORY_MAX_VERSIONS: &[u8] = b"history_max_versions";
 const PRUNE_CHUNK: usize = 1000;
 
 /// The one key of the `expiring` table.
-const EXPIRING: &[u8] = &[0];
+pub(crate) const EXPIRING: &[u8] = &[0];
 
 /// The deletion filter's size: 256 MiB, enough for some 200 million keys
 /// before it rules out much less than 99% of the rest.
@@ -384,6 +395,8 @@ pub struct Tables {
     pub replaceable: Db,
     pub history: Db,
     pub expiring: Db,
+    pub pending: Db,
+    pub unlinked: Db,
     pub meta: Db,
 }
 
@@ -410,6 +423,8 @@ impl Tables {
             replaceable: env.create_db("replaceable", DbFlags::PLAIN)?,
             history: env.create_db("history", DbFlags::DUP_FIXED)?,
             expiring: env.create_db("expiring", DbFlags::DUP_FIXED)?,
+            pending: env.create_db("pending", DbFlags::PLAIN)?,
+            unlinked: env.create_db("unlinked", DbFlags::INTEGER_KEY)?,
             meta: env.create_db("meta", DbFlags::PLAIN)?,
         })
     }
@@ -436,6 +451,17 @@ pub struct Store {
     /// The id of the boot of the machine the store was opened in.
     boot_id: Option<String>,
     checkpoints: Mutex<Checkpoints>,
+    /// The pending deletions, whose events reads hide: see [`pending`].
+    pub(crate) hidden: ArcSwap<Hidden>,
+    /// Those queued in the write transaction being made, to unhide if it
+    /// doesn't commit.
+    pub(crate) uncommitted: Mutex<Vec<u64>>,
+    /// What the [sweep](crate::purge) under way removes, which
+    /// [`remove`](Self::remove) leaves to it.
+    pub(crate) sweeping: Mutex<Option<Arc<RoaringTreemap>>>,
+    /// Whether anything may be in `unlinked`, so that the writer needn't
+    /// look when nothing's been removed.
+    unlinking: AtomicBool,
 }
 
 /// When the store's [checkpoints](crate::checkpoint) are made.
@@ -544,14 +570,20 @@ impl Store {
                 last: Instant::now(),
                 finishing: None,
             }),
+            hidden: ArcSwap::default(),
+            uncommitted: Mutex::default(),
+            sweeping: Mutex::default(),
+            unlinking: AtomicBool::new(true),
         };
         let next = store.drop_uncommitted()?;
+        store.load_pending()?;
         store.name()?;
         // Saved since the last event was stored, or a new database.
         if store.deletions_from >= next {
             store.deletions.set_ready();
         }
         store.prune_all()?;
+        store.forget()?;
         wot::open(&store, store.wot.as_ref())?;
         rank::open(&store)?;
         Ok(store)
@@ -593,6 +625,10 @@ impl Store {
                 last: Instant::now(),
                 finishing: None,
             }),
+            hidden: ArcSwap::default(),
+            uncommitted: Mutex::default(),
+            sweeping: Mutex::default(),
+            unlinking: AtomicBool::new(false),
         })
     }
 
@@ -783,6 +819,11 @@ impl Store {
         self.env.will_need(self.bodies, record, len);
     }
 
+    /// The store's environments, for reading ahead of the writer.
+    pub(crate) fn env(&self) -> &Env {
+        &self.env
+    }
+
     /// The main environment's usage, and `bodies`'.
     pub fn usage(&self) -> Result<(Usage, Usage)> {
         Ok((self.env.usage(0)?, self.env.usage(self.bodies)?))
@@ -897,20 +938,34 @@ impl Store {
         }
     }
 
-    /// A stored event, unless it has expired.
+    /// A stored event, as clients may see it: unless it has expired, or a
+    /// pending deletion covers it.
     pub fn load<'t>(&self, txn: &'t Txn, seq: u64) -> Result<Option<EventView<'t>>> {
         let now = crate::event::now();
-        Ok(txn
-            .get(self.tables.events, &seq.to_ne_bytes())?
-            .and_then(EventView::new)
-            .filter(|view| !view.is_expired(now)))
+        Ok(self
+            .stored(txn, seq)?
+            .filter(|view| !view.is_expired(now) && !self.hides(seq, view)))
     }
 
-    /// A stored event, expired or not.
+    /// A stored event, expired or not, and whether or not a pending
+    /// deletion covers it.
     pub fn stored<'t>(&self, txn: &'t Txn, seq: u64) -> Result<Option<EventView<'t>>> {
-        Ok(txn
-            .get(self.tables.events, &seq.to_ne_bytes())?
-            .and_then(EventView::new))
+        Ok(self.raw(txn, seq)?.and_then(EventView::new))
+    }
+
+    /// A stored event's record: not one removed, its record left until the
+    /// writer gets to it (see `unlinked`).
+    fn raw<'t>(&self, txn: &'t Txn, seq: u64) -> Result<Option<&'t [u8]>> {
+        let key = seq.to_ne_bytes();
+        let Some(record) = txn.get(self.tables.events, &key)? else {
+            return Ok(None);
+        };
+        // A small table, in memory: cheaper than wondering whether it's
+        // empty as of `txn`.
+        if txn.get(self.tables.unlinked, &key)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(record))
     }
 
     /// Read the records of `seqs` on several threads at once, each in a
@@ -945,10 +1000,14 @@ impl Store {
     /// content.
     pub fn header<'t>(&self, txn: &'t Txn, seq: u64) -> Result<Option<Header<'t>>> {
         let now = crate::event::now();
-        Ok(txn
-            .get(self.tables.events, &seq.to_ne_bytes())?
-            .and_then(Header::new)
-            .filter(|header| !header.is_expired(now)))
+        let Some(record) = self.raw(txn, seq)? else {
+            return Ok(None);
+        };
+        // What a deletion covers can take the whole event to say.
+        if self.may_hide(seq) && EventView::new(record).is_some_and(|view| self.hides(seq, &view)) {
+            return Ok(None);
+        }
+        Ok(Header::new(record).filter(|header| !header.is_expired(now)))
     }
 
     /// How many events are stored.
@@ -963,14 +1022,22 @@ impl Store {
         records: impl IntoIterator<Item = &'a [u8]>,
         now: u32,
     ) -> Result<Batch> {
-        let mut txn = self.write()?;
-        let mut batch = Batch::default();
-        for record in records {
-            let outcome = self.insert(&mut txn, record, now, &mut batch.removed)?;
-            batch.outcomes.push(outcome);
+        let written = (|| {
+            let mut txn = self.write()?;
+            let mut batch = Batch::default();
+            for record in records {
+                let outcome = self.insert(&mut txn, record, now, &mut batch.removed)?;
+                batch.outcomes.push(outcome);
+            }
+            txn.commit()?;
+            Ok(batch)
+        })();
+        match &written {
+            Ok(_) => self.committed_queued(),
+            // What deletions it queued are hidden no longer.
+            Err(_) => self.forget_uncommitted(),
         }
-        txn.commit()?;
-        Ok(batch)
+        written
     }
 
     /// Read, in a read transaction, what [`insert`](Self::insert)ing a
@@ -1115,10 +1182,17 @@ impl Store {
         for key in self.deletion_keys(&view) {
             self.deletions.add(&key);
         }
-        match view.kind() {
-            DELETION => self.delete(txn, &view, now, removed)?,
-            VANISH => self.vanish(txn, &view, seq, removed)?,
-            _ => {}
+        // What they cover is hidden now, and removed later.
+        let target = match view.kind() {
+            DELETION => Some(Target::Deletion(pending::Deletion::of(&view))),
+            VANISH => Some(Target::Vanish {
+                author: *view.pubkey(),
+                until: created_at,
+            }),
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.queue_deletion(txn, seq, target)?;
         }
         Ok(Outcome::Stored(seq))
     }
@@ -1136,18 +1210,17 @@ impl Store {
         Ok(cursor.last_dup()?.map(|(_, stamp)| stamp_created_at(stamp)))
     }
 
-    /// Carry out a NIP-62 request to vanish, stored under `seq`: remove
-    /// every other event by its author up to its `created_at`, history too,
-    /// and the gift wraps addressed to them.
-    fn vanish(
+    /// What a NIP-62 request to vanish by `pubkey` at `until` removes,
+    /// below `watermark`: every event by its author up to then, history
+    /// too, and the gift wraps addressed to them.
+    pub(crate) fn vanishing(
         &self,
-        txn: &mut RwTxn,
-        request: &EventView,
-        seq: u64,
-        removed: &mut Vec<u64>,
-    ) -> Result<()> {
+        txn: &Txn,
+        pubkey: &[u8; 32],
+        until: u32,
+        watermark: u64,
+    ) -> Result<RoaringTreemap> {
         let t = self.tables;
-        let (pubkey, until) = (request.pubkey(), request.created_at());
         let mut seqs = Vec::new();
         let mut push = |stamp: &[u8]| {
             seqs.push(stamp_seq(stamp));
@@ -1171,14 +1244,7 @@ impl Store {
         }
         drop(cursor);
 
-        seqs.sort_unstable();
-        seqs.dedup();
-        for old in seqs {
-            if old != seq && self.remove(txn, old)? {
-                removed.push(old);
-            }
-        }
-        Ok(())
+        Ok(seqs.into_iter().filter(|&seq| seq < watermark).collect())
     }
 
     /// Whether a stored NIP-09 deletion covers an event: one that names its
@@ -1342,70 +1408,81 @@ impl Store {
         Ok(false)
     }
 
-    /// Carry out a NIP-09 deletion: remove the events it names by id that
-    /// its author [may delete](may_delete), and every version of the
-    /// addresses it names, of its author's, up to its `created_at`. Removing
-    /// an address's current version makes the newest left current.
-    fn delete(
+    /// What a NIP-09 deletion removes, below `watermark`: the events it
+    /// names by id that its author [may delete](may_delete), and every
+    /// version of the addresses it names, of its author's, up to when it
+    /// was made.
+    pub(crate) fn deleting(
         &self,
-        txn: &mut RwTxn,
-        deletion: &EventView,
-        now: u32,
-        removed: &mut Vec<u64>,
-    ) -> Result<()> {
-        let author = deletion.pubkey();
-        let mut ids = Vec::new();
-        let mut addresses = Vec::new();
-        for (name, value) in deletion.tag_values() {
-            match (name, value) {
-                ("e", Element::Hex(id)) => ids.push(id),
-                ("a", value) => addresses.extend(parse_address(&value.to_text(), author)),
-                _ => {}
+        txn: &Txn,
+        deletion: &pending::Deletion,
+        watermark: u64,
+    ) -> Result<RoaringTreemap> {
+        let mut seqs = RoaringTreemap::new();
+        for id in &deletion.ids {
+            if let Some(seq) = self.seq_of(txn, id)?
+                && let Some(target) = self.stored(txn, seq)?
+                && may_delete(&deletion.author, &target)
+            {
+                seqs.insert(seq);
             }
         }
-
-        for id in ids {
-            let Some(seq) = self.seq_of(txn, id)? else {
-                continue;
-            };
-            let Some(target) = self.load(txn, seq)? else {
-                continue;
-            };
-            if !may_delete(author, &target) {
-                continue;
-            }
-            let promote = match self.is_current(txn, seq, &target)? {
-                true => address_of(&target),
-                false => None,
-            };
-            self.remove(txn, seq)?;
-            removed.push(seq);
-            if let Some(address) = promote {
-                self.promote(txn, &address, now, removed)?;
-            }
-        }
-
-        for address in addresses {
+        for address in &deletion.addresses {
             // The current version is the newest, so if it goes, all go.
-            let mut seqs = Vec::new();
             each_stamp(
                 txn,
                 self.tables.history,
-                &address,
+                address,
                 0,
-                deletion.created_at(),
+                deletion.until,
                 |stamp| {
-                    seqs.push(stamp_seq(stamp));
+                    seqs.insert(stamp_seq(stamp));
                     true
                 },
             )?;
-            for seq in seqs {
-                if self.remove(txn, seq)? {
-                    removed.push(seq);
-                }
-            }
         }
-        Ok(())
+        seqs.remove_range(watermark..);
+        Ok(seqs)
+    }
+
+    /// Remove a stored event, as a deletion does: if it's its address's
+    /// current version, the newest version left that no deletion covers is
+    /// made current. Notes in `removed` what search no longer has.
+    pub(crate) fn remove_version(
+        &self,
+        txn: &mut RwTxn,
+        seq: u64,
+        now: u32,
+        removed: &mut Vec<u64>,
+    ) -> Result<bool> {
+        self.remove_version_unless(txn, seq, now, removed, true)
+    }
+
+    /// [`remove_version`](Self::remove_version), with `guarded` false
+    /// whether or not a sweep is to remove it: for the sweep itself.
+    pub(crate) fn remove_version_unless(
+        &self,
+        txn: &mut RwTxn,
+        seq: u64,
+        now: u32,
+        removed: &mut Vec<u64>,
+        guarded: bool,
+    ) -> Result<bool> {
+        let Some(view) = self.stored(txn, seq)? else {
+            return Ok(false);
+        };
+        let promote = match self.is_current(txn, seq, &view)? {
+            true => address_of(&view),
+            false => None,
+        };
+        if !self.remove_unless(txn, seq, guarded)? {
+            return Ok(false);
+        }
+        removed.push(seq);
+        if let Some(address) = promote {
+            self.promote(txn, &address, now, removed)?;
+        }
+        Ok(true)
     }
 
     /// Make the newest version left at an address current, if there is one.
@@ -1443,10 +1520,10 @@ impl Store {
         Ok(())
     }
 
-    /// The events [`remove_matching`](Self::remove_matching) removes for
-    /// `seq`, and the address it makes the newest version left current at,
-    /// if any.
-    fn matching_versions(
+    /// The events deleting by `filter` removes for `seq`: it, if `filter`
+    /// matches it, and if it's its address's current version, the versions
+    /// kept in its history that `filter` matches. With the address, if so.
+    pub(crate) fn matching_versions(
         &self,
         txn: &Txn,
         seq: u64,
@@ -1477,39 +1554,14 @@ impl Store {
         Ok((seqs, Some(address)))
     }
 
-    /// How many events [`remove_matching`](Self::remove_matching) would
-    /// remove for each of `seqs`, all told.
+    /// How many events deleting by `filter` would remove for each of
+    /// `seqs`, all told.
     pub fn count_matching(&self, txn: &Txn, seqs: &[u64], filter: &Filter) -> Result<usize> {
         let mut all = std::collections::HashSet::new();
         for &seq in seqs {
             all.extend(self.matching_versions(txn, seq, filter)?.0);
         }
         Ok(all.len())
-    }
-
-    /// Remove a stored event, expired or not, if `filter` matches it. If
-    /// it's an address's current version, so go the versions kept in its
-    /// history that `filter` matches, and the newest left is made current.
-    /// Notes in `removed` what search no longer has, and returns how many
-    /// went.
-    pub fn remove_matching(
-        &self,
-        txn: &mut RwTxn,
-        seq: u64,
-        filter: &Filter,
-        now: u32,
-        removed: &mut Vec<u64>,
-    ) -> Result<usize> {
-        let (seqs, promote) = self.matching_versions(txn, seq, filter)?;
-        for &seq in &seqs {
-            if self.remove(txn, seq)? {
-                removed.push(seq);
-            }
-        }
-        if let Some(address) = promote {
-            self.promote(txn, &address, now, removed)?;
-        }
-        Ok(seqs.len())
     }
 
     /// Keep a record under the next sequence number, findable by id.
@@ -1530,15 +1582,21 @@ impl Store {
     }
 
     /// Remove up to `max` events that have expired by `now`, the earliest
-    /// to expire first, returning their sequence numbers.
+    /// to expire first, returning their sequence numbers. One a sweep is
+    /// to remove is left to it, but no longer filed as expiring.
     pub fn expire(&self, txn: &mut RwTxn, now: u32, max: usize) -> Result<Vec<u64>> {
-        let mut seqs = Vec::new();
+        let mut stamps = Vec::new();
         each_stamp(txn, self.tables.expiring, EXPIRING, 0, now, |stamp| {
-            seqs.push(stamp_seq(stamp));
-            seqs.len() < max
+            stamps.push(stamp.to_vec());
+            stamps.len() < max
         })?;
-        for &seq in &seqs {
-            self.remove(txn, seq)?;
+        let mut seqs = Vec::with_capacity(stamps.len());
+        for stamp in stamps {
+            let seq = stamp_seq(&stamp);
+            if !self.remove(txn, seq)? {
+                txn.del(self.tables.expiring, EXPIRING, Some(&stamp))?;
+            }
+            seqs.push(seq);
         }
         Ok(seqs)
     }
@@ -1688,9 +1746,21 @@ impl Store {
     }
 
     /// Delete a stored event, current or history, and every index entry
-    /// pointing at it.
+    /// pointing at it. Its record is only [unlinked](Self::forget): the
+    /// writer removes it after this transaction commits. One the sweep
+    /// under way is to remove is left to it.
     pub fn remove(&self, txn: &mut RwTxn, seq: u64) -> Result<bool> {
+        self.remove_unless(txn, seq, true)
+    }
+
+    fn remove_unless(&self, txn: &mut RwTxn, seq: u64, guarded: bool) -> Result<bool> {
         let t = self.tables;
+        if guarded
+            && let Some(sweeping) = &*self.sweeping.lock().expect("unpoisoned")
+            && sweeping.contains(seq)
+        {
+            return Ok(false);
+        }
         let Some(record) = self.record(txn, seq)? else {
             return Ok(false);
         };
@@ -1703,8 +1773,43 @@ impl Store {
             txn.del(t.expiring, EXPIRING, Some(&stamp(expiration, seq)))?;
         }
         txn.del(t.ids, view.id(), None)?;
-        txn.del(t.events, &seq.to_ne_bytes(), None)?;
+        txn.put(t.unlinked, &seq.to_ne_bytes(), &[])?;
+        self.unlinking.store(true, Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Remove the records of the events [removed](Self::remove) since this
+    /// was last done, in a transaction of its own after theirs, and so after
+    /// they're out of the indexes. Returns how many went.
+    pub fn forget(&self) -> Result<usize> {
+        let t = self.tables;
+        let mut forgotten = 0;
+        while self.unlinking.load(Ordering::Relaxed) {
+            let mut txn = self.write()?;
+            let mut seqs = Vec::new();
+            let mut cursor = txn.cursor(t.unlinked)?;
+            let mut entry = cursor.first()?;
+            while let Some((key, _)) = entry
+                && seqs.len() < MAX_SWEEP
+            {
+                seqs.push(key.to_vec());
+                entry = cursor.next()?;
+            }
+            drop(cursor);
+            let left = entry.is_some();
+            for key in &seqs {
+                txn.del(t.events, key, None)?;
+                txn.del(t.unlinked, key, None)?;
+            }
+            if !seqs.is_empty() {
+                txn.commit()?;
+            }
+            forgotten += seqs.len();
+            if !left {
+                self.unlinking.store(false, Ordering::Relaxed);
+            }
+        }
+        Ok(forgotten)
     }
 
     /// Take a stored event out of the indexes queries use, keeping it by id
@@ -1718,10 +1823,8 @@ impl Store {
         Ok(true)
     }
 
-    fn record(&self, txn: &Txn, seq: u64) -> Result<Option<Vec<u8>>> {
-        Ok(txn
-            .get(self.tables.events, &seq.to_ne_bytes())?
-            .map(<[u8]>::to_vec))
+    pub(crate) fn record(&self, txn: &Txn, seq: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self.raw(txn, seq)?.map(<[u8]>::to_vec))
     }
 
     fn unindex_view(&self, txn: &mut RwTxn, seq: u64, view: &EventView) -> Result<()> {
@@ -1798,7 +1901,7 @@ fn vanish_key(pubkey: &[u8; 32]) -> Vec<u8> {
 }
 
 /// The address a replaceable or addressable event is kept under.
-fn address_of(view: &EventView) -> Option<Vec<u8>> {
+pub(crate) fn address_of(view: &EventView) -> Option<Vec<u8>> {
     let kind = view.kind();
     let mut d = Vec::new();
     match KindClass::of(kind) {
@@ -1811,7 +1914,7 @@ fn address_of(view: &EventView) -> Option<Vec<u8>> {
 
 /// The address an `a` tag names, as an address of the store's, if it's of
 /// a replaceable or addressable event by `author`.
-fn parse_address(text: &str, author: &[u8; 32]) -> Option<Vec<u8>> {
+pub(crate) fn parse_address(text: &str, author: &[u8; 32]) -> Option<Vec<u8>> {
     let mut parts = text.splitn(3, ':');
     let kind: u16 = parts.next()?.parse().ok()?;
     let pubkey = decode_hex::<32>(parts.next()?)?;
@@ -1842,7 +1945,7 @@ fn address_text(view: &EventView) -> Option<String> {
 /// Whether a NIP-09 deletion by `author` can delete `target`: its own
 /// event, or a gift wrap addressed to it, but never a deletion or a vanish
 /// request.
-fn may_delete(author: &[u8; 32], target: &EventView) -> bool {
+pub(crate) fn may_delete(author: &[u8; 32], target: &EventView) -> bool {
     let kind = target.kind();
     if kind == DELETION || kind == VANISH {
         return false;
@@ -1949,7 +2052,8 @@ const MAX_SWEEP: usize = 10_000;
 /// thread that batches whatever is queued into a single transaction. Every
 /// [`SWEEP_INTERVAL`] it also removes the events that have expired. After
 /// each batch, and whenever nothing's queued, it pushes the web of trust
-/// along a turn at a time until there's nothing left to push.
+/// along a turn at a time until there's nothing left to push, and carries
+/// out the [pending deletions](crate::purge) a chunk at a time.
 ///
 /// Each event's pages are [prefetched](Store::prefetch) on the blocking
 /// pool before it's queued, so events arriving together have their pages
@@ -1963,100 +2067,35 @@ pub struct Writer {
 
 enum Request {
     Write(WriteJob),
-    Delete(Box<Deletion>),
+    Delete(Box<DeleteJob>),
     /// Store what's queued before this, then stop.
     Stop,
 }
 
-/// How a deletion the writer's making is going: see [`Writer::delete`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum Deleting {
-    /// This many events removed so far.
-    SoFar(usize),
-    /// Finished, having removed this many.
-    Done(usize),
-    Failed(String),
-}
+/// A deletion `ditto-relay delete` asks for, and where to say it's queued.
+type DeleteJob = (
+    Target,
+    oneshot::Sender<anyhow::Result<Arc<pending::Pending>>>,
+);
 
-/// How long a deletion's transaction should take, commit and all, as the
-/// writer holds up every write meanwhile. What removing an event costs
-/// varies by thousands of times: with its pages on disk, or in an
-/// environment whose freelist has grown huge, where committing what a
-/// transaction freed means searching it for contiguous pages.
-const DELETE_TARGET: Duration = Duration::from_millis(50);
-
-/// How many events a deletion's first transaction removes.
-const FIRST_DELETE_CHUNK: usize = 64;
-
-/// Events to remove, a chunk per transaction, between the writer's other
-/// work. Each chunk is sized for [`DELETE_TARGET`] by how long the last
-/// took, up to [`delete::CHUNK`], and the next waits at least as long as
-/// the last took, so the writer spends at most half its time deleting
-/// however slow removing an event gets.
-struct Deletion {
-    filter: Filter,
-    seqs: Vec<u64>,
-    /// How far through `seqs` it's got.
-    next: usize,
-    deleted: usize,
-    /// How many events the next chunk removes.
-    chunk: usize,
-    /// When the next chunk may start.
-    resume: Instant,
-    progress: tokio::sync::mpsc::UnboundedSender<Deleting>,
-}
-
-/// The size of the chunk after one of `chunk` events that took `took`.
-fn next_delete_chunk(chunk: usize, took: Duration) -> usize {
-    if took > DELETE_TARGET {
-        (chunk / 2).max(1)
-    } else if took < DELETE_TARGET / 2 {
-        (chunk * 2).min(delete::CHUNK)
-    } else {
-        chunk
-    }
-}
-
-/// Remove the next chunk of `deletion`'s events, and `tell` what went.
-/// Returns whether it's over: finished, failed, or abandoned by whoever
-/// asked for it.
-fn delete_chunk(store: &Store, deletion: &mut Deletion, tell: &impl Fn(Written)) -> bool {
-    if deletion.progress.is_closed() {
-        tracing::info!(
-            "a deletion was abandoned, after {} events",
-            deletion.deleted
-        );
-        return true;
-    }
-    let end = (deletion.next + deletion.chunk).min(deletion.seqs.len());
-    let chunk = &deletion.seqs[deletion.next..end];
-    let start = Instant::now();
-    let outcome = delete::remove(store, chunk, &deletion.filter);
-    let took = start.elapsed();
-    if took > DELETE_TARGET * 10 {
-        tracing::warn!(
-            "removing {} events for a deletion took {took:.1?}",
-            chunk.len()
-        );
-    }
-    deletion.chunk = next_delete_chunk(deletion.chunk, took);
-    deletion.resume = Instant::now() + took;
-    match outcome {
-        Ok((deleted, removed)) => {
-            tell((Vec::new(), removed));
-            deletion.deleted += deleted;
-            deletion.next = end;
-            let done = end == deletion.seqs.len();
-            let _ = deletion.progress.send(match done {
-                true => Deleting::Done(deletion.deleted),
-                false => Deleting::SoFar(deletion.deleted),
-            });
-            done
+/// Queue a deletion of what `target` covers of what's stored now.
+fn queue(store: &Store, target: Target) -> anyhow::Result<Arc<pending::Pending>> {
+    let queued = (|| {
+        let mut txn = store.write()?;
+        let watermark = store.next_seq(&txn)?;
+        let pending = store.queue_deletion(&mut txn, watermark, target)?;
+        txn.commit()?;
+        Ok::<_, crate::lmdb::Error>(pending)
+    })();
+    match queued {
+        Ok(pending) => {
+            store.committed_queued();
+            tracing::info!("{} queued, below {}", pending.describe(), pending.watermark);
+            Ok(pending)
         }
         Err(err) => {
-            tracing::error!("deleting failed, after {} events: {err}", deletion.deleted);
-            let _ = deletion.progress.send(Deleting::Failed(err.to_string()));
-            true
+            store.forget_uncommitted();
+            Err(err.into())
         }
     }
 }
@@ -2102,6 +2141,10 @@ impl Writer {
                 .expect("failed to spawn the deletion filter thread");
         }
 
+        // Before anything's written, so a sweep under way is left alone.
+        let mut purger = Purger::new(&store, Some(store.clone()), true).unwrap_or_else(|err| {
+            panic!("couldn't read the pending deletions: {err:#}");
+        });
         let prefetching = store.clone();
         let thread = std::thread::Builder::new()
             .name("lmdb-writer".into())
@@ -2111,27 +2154,25 @@ impl Writer {
                 let mut saving: Option<JoinHandle<()>> = None;
                 // Whether the web of trust may have pushing to do.
                 let mut trust = true;
-                let mut deleting = std::collections::VecDeque::<Box<Deletion>>::new();
-                let step = |deleting: &mut std::collections::VecDeque<Box<Deletion>>| {
-                    if let Some(deletion) = deleting.front_mut()
-                        && Instant::now() >= deletion.resume
-                        && delete_chunk(&store, deletion, &tell)
-                    {
-                        deleting.pop_front();
-                    }
-                };
                 let turn = |trust: &mut bool| {
                     *trust = store.turn().unwrap_or_else(|err| {
                         tracing::error!("a background turn failed: {err}");
                         false
                     });
                 };
+                let forget = || {
+                    if let Err(err) = store.forget() {
+                        tracing::error!("removing the records of removed events failed: {err}");
+                    }
+                };
                 loop {
+                    forget();
                     if Instant::now() >= next_sweep {
                         match sweep(&store) {
                             Ok(removed) => tell((Vec::new(), removed)),
                             Err(err) => tracing::error!("sweeping expired events failed: {err}"),
                         }
+                        forget();
                         // Expired follow lists move trust.
                         trust = true;
                         next_sweep = Instant::now() + SWEEP_INTERVAL;
@@ -2156,21 +2197,22 @@ impl Writer {
                         true => Duration::ZERO,
                         false => next_sweep.saturating_duration_since(Instant::now()),
                     };
-                    if let Some(deletion) = deleting.front() {
-                        wait = wait.min(deletion.resume.saturating_duration_since(Instant::now()));
+                    if let Some(due) = purger.due(&store) {
+                        wait = wait.min(due.saturating_duration_since(Instant::now()));
                     }
                     let first = match rx.recv_timeout(wait) {
                         Ok(Request::Write(job)) => {
                             METRICS.write_queue.dec();
                             job
                         }
-                        Ok(Request::Delete(deletion)) => {
-                            deleting.push_back(deletion);
+                        Ok(Request::Delete(job)) => {
+                            let (target, reply) = *job;
+                            let _ = reply.send(queue(&store, target));
                             continue;
                         }
                         Ok(Request::Stop) => break,
                         Err(RecvTimeoutError::Timeout) => {
-                            step(&mut deleting);
+                            purger.step(&store, &tell);
                             if trust {
                                 turn(&mut trust);
                             }
@@ -2180,13 +2222,14 @@ impl Writer {
                     };
                     let mut batch = vec![first];
                     let mut stop = false;
+                    let mut deletes = Vec::new();
                     while batch.len() < MAX_WRITE_BATCH {
                         match rx.try_recv() {
                             Ok(Request::Write(job)) => {
                                 METRICS.write_queue.dec();
                                 batch.push(job);
                             }
-                            Ok(Request::Delete(deletion)) => deleting.push_back(deletion),
+                            Ok(Request::Delete(job)) => deletes.push(job),
                             Ok(Request::Stop) => {
                                 stop = true;
                                 break;
@@ -2196,20 +2239,24 @@ impl Writer {
                     }
 
                     write(&store, batch, &tell);
+                    for job in deletes {
+                        let (target, reply) = *job;
+                        let _ = reply.send(queue(&store, target));
+                    }
                     if stop {
                         break;
                     }
+                    // Writes come first: what runs between them waits as
+                    // long as it last took.
+                    purger.wrote();
                     // A follow list in the batch may have moved trust; a
                     // turn between batches keeps it from falling behind. A
-                    // deletion's chunk between them keeps it going however
+                    // chunk of deleting between them keeps it going however
                     // busy the relay is.
                     turn(&mut trust);
-                    step(&mut deleting);
+                    purger.step(&store, &tell);
                 }
-                for deletion in deleting {
-                    let stopped = format!("the relay stopped, after {} events", deletion.deleted);
-                    let _ = deletion.progress.send(Deleting::Failed(stopped));
-                }
+                forget();
                 if let Some(saving) = saving {
                     let _ = saving.join();
                 }
@@ -2243,32 +2290,21 @@ impl Writer {
         }
     }
 
-    /// Remove those of `seqs` that `filter` matches, as `ditto-relay delete`
-    /// asks, a chunk per transaction, paced by how long each takes, between
-    /// the writer's other work, and tell the search indexer what went.
-    /// Dropping what's returned abandons what's left.
-    pub fn delete(
-        &self,
-        filter: Filter,
-        seqs: Vec<u64>,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<Deleting> {
-        let (progress, rx) = tokio::sync::mpsc::unbounded_channel();
-        let deletion = Box::new(Deletion {
-            filter,
-            seqs,
-            next: 0,
-            deleted: 0,
-            chunk: FIRST_DELETE_CHUNK,
-            resume: Instant::now(),
-            progress,
-        });
-        if let Err(std::sync::mpsc::SendError(Request::Delete(deletion))) =
-            self.tx.send(Request::Delete(deletion))
+    /// Queue a deletion of what `target` covers of what's stored now, as
+    /// `ditto-relay delete` asks. It's hidden once this returns; the writer
+    /// removes it after, between its other work, and tells the search
+    /// indexer what went.
+    pub async fn delete(&self, target: Target) -> anyhow::Result<Arc<pending::Pending>> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Request::Delete(Box::new((target, reply))))
+            .is_err()
         {
-            let gone = Deleting::Failed("the writer thread is gone".into());
-            let _ = deletion.progress.send(gone);
+            bail!("writer thread is gone");
         }
-        rx
+        rx.await
+            .map_err(|_| anyhow!("writer thread dropped the request"))?
     }
 
     /// Store an encoded record.
@@ -2365,12 +2401,22 @@ pub mod tests {
         put_at(store, event, crate::event::now())
     }
 
-    /// Offer an event as if it were `now`.
+    /// Offer an event as if it were `now`, and carry out any deletion it
+    /// asks for, as the writer would soon after.
     pub fn put_at(store: &Store, event: &Event, now: u32) -> Outcome {
-        store
+        let outcome = store
             .write_batch([record::encode(event).as_slice()], now)
             .unwrap()
-            .outcomes[0]
+            .outcomes[0];
+        settle(store);
+        outcome
+    }
+
+    /// Carry out the pending deletions, and remove the records of what's
+    /// been removed, as the writer would.
+    pub fn settle(store: &Store) {
+        crate::purge::run(store, None, &|_| {}, |_| {}).unwrap();
+        store.forget().unwrap();
     }
 
     /// Whether an event is stored, and not expired.
@@ -2379,6 +2425,48 @@ pub mod tests {
         let id: [u8; 32] = hex::decode(&event.id).unwrap().try_into().unwrap();
         let seq = store.seq_of(&txn, &id).unwrap();
         seq.is_some_and(|seq| store.load(&txn, seq).unwrap().is_some())
+    }
+
+    /// Every entry of every table but `meta`, to compare stores.
+    pub fn everything(store: &Store) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        let t = store.tables;
+        let txn = store.read().unwrap();
+        [
+            t.events,
+            t.ids,
+            t.created,
+            t.kinds,
+            t.authors,
+            t.author_kinds,
+            t.tags,
+            t.hll,
+            t.facets,
+            t.wot,
+            t.wot_queue,
+            t.engagement,
+            t.scores,
+            t.ranked,
+            t.applied,
+            t.rank_queue,
+            t.zaps,
+            t.replaceable,
+            t.history,
+            t.expiring,
+            t.pending,
+            t.unlinked,
+        ]
+        .iter()
+        .map(|&db| {
+            let mut cursor = txn.cursor(db).unwrap();
+            let mut entries = Vec::new();
+            let mut entry = cursor.first().unwrap();
+            while let Some((key, value)) = entry {
+                entries.push((key.to_vec(), value.to_vec()));
+                entry = cursor.next().unwrap();
+            }
+            entries
+        })
+        .collect()
     }
 
     /// Every index entry of every table, to check removals leave nothing.
@@ -2398,6 +2486,8 @@ pub mod tests {
             t.replaceable,
             t.history,
             t.expiring,
+            t.unlinked,
+            t.pending,
         ]
         .iter()
         .map(|&db| txn.len(db).unwrap())
@@ -2431,11 +2521,35 @@ pub mod tests {
         let mut txn = store.write().unwrap();
         assert!(store.remove(&mut txn, 1).unwrap());
         txn.commit().unwrap();
+        // Its record reads as gone, though it's only unlinked, until it's
+        // forgotten in a transaction of its own.
+        assert!(store.stored(&store.read().unwrap(), 1).unwrap().is_none());
+        assert_eq!(entries(&store), 2);
+        assert_eq!(store.forget().unwrap(), 1);
         assert_eq!(entries(&store), 0);
 
         // Sequence numbers aren't reused.
         let other = signed(1, 100, 1, vec![], "again");
         assert_eq!(put(&store, &other), Outcome::Stored(2));
+    }
+
+    /// A record unlinked when the relay stops before its writer gets to
+    /// it is removed when the store's opened again.
+    #[test]
+    fn forgets_what_was_unlinked_when_reopened() {
+        let (dir, store) = open();
+        put(&store, &signed(1, 100, 1, vec![], "gone"));
+        put(&store, &signed(1, 200, 1, vec![], "kept"));
+        let mut txn = store.write().unwrap();
+        assert!(store.remove(&mut txn, 1).unwrap());
+        // Not twice.
+        assert!(!store.remove(&mut txn, 1).unwrap());
+        txn.commit().unwrap();
+        drop(store);
+        let store = open_in(dir.path());
+        let txn = store.read().unwrap();
+        assert_eq!(txn.len(store.tables.unlinked).unwrap(), 0);
+        assert_eq!(store.len(&txn).unwrap(), 1);
     }
 
     #[test]
@@ -2703,6 +2817,7 @@ pub mod tests {
             assert!(store.remove(&mut txn, seq).unwrap());
         }
         txn.commit().unwrap();
+        store.forget().unwrap();
         assert_eq!(entries(&store), 0);
     }
 
@@ -2830,17 +2945,8 @@ pub mod tests {
         assert!(store.expire(&mut txn, now, 100).unwrap().is_empty());
         assert_eq!(store.expire(&mut txn, now + 1000, 100).unwrap(), [4]);
         txn.commit().unwrap();
+        store.forget().unwrap();
         assert_eq!(entries(&store), 0);
-    }
-
-    #[test]
-    fn sizes_deletion_chunks_by_how_long_they_take() {
-        let ms = Duration::from_millis;
-        assert_eq!(next_delete_chunk(64, ms(1)), 128);
-        assert_eq!(next_delete_chunk(800, ms(1)), delete::CHUNK);
-        assert_eq!(next_delete_chunk(64, ms(40)), 64);
-        assert_eq!(next_delete_chunk(64, ms(200)), 32);
-        assert_eq!(next_delete_chunk(1, Duration::from_secs(30)), 1);
     }
 
     #[test]
@@ -2857,8 +2963,13 @@ pub mod tests {
         let batch = store
             .write_batch([record::encode(&deletion).as_slice()], 0)
             .unwrap();
-        assert_eq!(batch.removed, [1]);
+        // Hidden at once, removed after.
+        assert!(batch.removed.is_empty());
         assert!(!has(&store, &note) && has(&store, &deletion));
+        assert!(store.stored(&store.read().unwrap(), 1).unwrap().is_some());
+        settle(&store);
+        assert!(store.stored(&store.read().unwrap(), 1).unwrap().is_none());
+        assert!(store.pending().is_empty());
         assert_eq!(put(&store, &note), Outcome::Deleted);
 
         // Before it arrives, too.
@@ -2931,11 +3042,11 @@ pub mod tests {
         put(&store, &old);
         put(&store, &new);
         let deletion = signed(1, 300, 5, vec![vec!["e", &new.id]], "");
-        let batch = store
+        store
             .write_batch([record::encode(&deletion).as_slice()], 0)
             .unwrap();
-        // The new one, and the old one under its old sequence number.
-        assert_eq!(batch.removed, [2, 1]);
+        assert!(!has(&store, &new) && has(&store, &old));
+        settle(&store);
         assert!(!has(&store, &new) && has(&store, &old));
         // Stored again, after the deletion.
         assert_eq!(current(&store, &old), Some(4));
@@ -2973,10 +3084,17 @@ pub mod tests {
         }
 
         let request = signed(1, 200, 62, vec![vec!["relay", "ALL_RELAYS"]], "");
-        let batch = store
+        store
             .write_batch([record::encode(&request).as_slice()], 0)
             .unwrap();
-        assert_eq!(batch.removed, [1, 2, 3, 4, 5]);
+        // Hidden at once, removed after.
+        assert!(gone.iter().all(|event| !has(&store, event)));
+        for event in [&others, &later, &later_wrap, &request] {
+            assert!(has(&store, event));
+        }
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), 9);
+        settle(&store);
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), 4);
         assert!(gone.iter().all(|event| !has(&store, event)));
         for event in [&others, &later, &later_wrap, &request] {
             assert!(has(&store, event));

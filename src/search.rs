@@ -1196,6 +1196,8 @@ fn unindexed<'t>(
         if let Some(view) =
             EventView::new(record).filter(|view| !view.is_expired(now) && filter.matches(view))
             && store.is_current(txn, seq, &view)?
+            // Not removed, nor to be.
+            && store.load(txn, seq)?.is_some()
         {
             found.push((seq, view));
         }
@@ -1783,8 +1785,15 @@ mod tests {
         f.index_all();
         assert_eq!(f.index.reader.searcher().num_docs(), 2);
         let filter = Filter::parse(&json!({"until": 150}), &test_tags(), MAX_VALUES).unwrap();
-        let deleted =
-            crate::delete::delete(&f.store, &filter, Some(&mut f.indexer), |_| {}).unwrap();
+        let target = crate::delete::target(&f.store, filter, Some(r#"{"until":150}"#), None);
+        let deleted = crate::delete::delete(
+            &f.store,
+            None,
+            target.unwrap(),
+            Some(&mut f.indexer),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(f.index.reader.searcher().num_docs(), 1);
         assert!(f.search(json!({"search": "spam"})).is_empty());
