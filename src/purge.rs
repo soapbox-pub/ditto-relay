@@ -177,8 +177,10 @@ pub struct Purger {
     finished: VecDeque<(Instant, u64)>,
     chunk: usize,
     sweep_chunk: usize,
-    /// How long the last chunk took, and when the next may start.
+    /// How long the last chunk took, when it ended, and when the next may
+    /// start.
     took: Duration,
+    ended: Instant,
     resume: Instant,
     said: Instant,
     /// How many events it's removed, all told.
@@ -225,6 +227,7 @@ impl Purger {
             chunk: FIRST_CHUNK,
             sweep_chunk: FIRST_SWEEP_CHUNK,
             took: Duration::ZERO,
+            ended: Instant::now(),
             resume: Instant::now(),
             said: Instant::now(),
             total: 0,
@@ -301,9 +304,10 @@ impl Purger {
     }
 
     /// The writer has stored something: the next chunk waits as long as the
-    /// last took.
+    /// last took, from when it ended. From then, not from now: writes come
+    /// more often than a chunk takes, and each would put it off again.
     pub fn wrote(&mut self) {
-        self.resume = self.resume.max(Instant::now() + self.took);
+        self.resume = self.resume.max(self.ended + self.took);
     }
 
     /// Do a chunk of what's pending, if it's due, as the writer does between
@@ -360,7 +364,8 @@ impl Purger {
             tracing::warn!("a chunk of deleting took {:.1?}", self.took);
         }
         // Only once something's written: see `wrote`.
-        self.resume = Instant::now();
+        self.ended = Instant::now();
+        self.resume = self.ended;
         let job = &self.jobs[i];
         if done {
             tracing::info!(
@@ -1199,6 +1204,22 @@ mod tests {
         assert_eq!(everything(&swept), everything(&each));
         let left = swept.len(&swept.read().unwrap()).unwrap();
         assert!(left > 1000 && left < 2000, "{left}");
+    }
+
+    /// However often the writer writes, a chunk waits only as long as the
+    /// last took.
+    #[test]
+    fn writes_put_off_the_next_chunk_once() {
+        let (_dir, store) = open();
+        let mut purger = Purger::new(&store, None, false).unwrap();
+        purger.took = Duration::from_millis(600);
+        purger.ended = Instant::now();
+        purger.resume = purger.ended;
+        for _ in 0..5 {
+            purger.wrote();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(purger.resume, purger.ended + purger.took);
     }
 
     #[test]
