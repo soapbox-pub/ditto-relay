@@ -162,6 +162,9 @@ pub struct Usage {
 
 pub struct Env {
     ptrs: Vec<*mut ffi::MDB_env>,
+    /// Where each environment's file is mapped, and how much of it, if
+    /// that could be found: LMDB doesn't say.
+    maps: Vec<Option<(usize, usize)>>,
     /// Opened only to read: no write transaction can begin, so the writer's
     /// lock, which another process may hold, is never waited on.
     read_only: bool,
@@ -239,6 +242,7 @@ impl Env {
     fn new(read_only: bool) -> Env {
         Env {
             ptrs: Vec::new(),
+            maps: Vec::new(),
             read_only,
             pins: Mutex::default(),
         }
@@ -288,8 +292,10 @@ impl Env {
             // any blocking-pool thread. NORDAHEAD: lookups are random, so
             // read-ahead mostly wastes page cache once the map outgrows RAM.
             let flags = flags | ffi::MDB_NOTLS | ffi::MDB_NORDAHEAD;
-            check(ffi::mdb_env_open(ptr, path.as_ptr(), flags, 0o600))
+            check(ffi::mdb_env_open(ptr, path.as_ptr(), flags, 0o600))?;
         }
+        self.maps.push(map_of(ptr));
+        Ok(())
     }
 
     /// Begin a checkpoint of the latest commit: pin it, so that LMDB reuses
@@ -457,21 +463,14 @@ impl Env {
     /// environments are opened without the kernel's readahead, which
     /// random lookups have no use for. Only a hint, so failing is no error.
     pub fn will_need(&self, env: usize, at: &[u8], len: usize) {
-        let ptr = self.ptrs[env];
-        // SAFETY: plain data, filled in by LMDB from an open env.
-        let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
         let mut fd = -1;
-        if check(unsafe { ffi::mdb_env_info(ptr, &mut info) }).is_err()
-            || check(unsafe { ffi::mdb_env_get_fd(ptr, &mut fd) }).is_err()
-        {
+        // SAFETY: the env is open.
+        if check(unsafe { ffi::mdb_env_get_fd(self.ptrs[env], &mut fd) }).is_err() {
             return;
         }
-        let Some(offset) = (at.as_ptr() as usize).checked_sub(info.me_mapaddr as usize) else {
+        let Some(offset) = self.offset_of(env, at) else {
             return;
         };
-        if offset >= info.me_mapsize {
-            return;
-        }
         // SAFETY: advice on a file LMDB holds open; nothing is read or
         // written through any pointer.
         unsafe {
@@ -482,6 +481,14 @@ impl Env {
                 libc::POSIX_FADV_WILLNEED,
             );
         }
+    }
+
+    /// Where in environment `env`'s file `at`, read from its map, is, if
+    /// it's from there.
+    pub fn offset_of(&self, env: usize, at: &[u8]) -> Option<usize> {
+        let (base, len) = self.maps[env]?;
+        let offset = (at.as_ptr() as usize).checked_sub(base)?;
+        (offset < len).then_some(offset)
     }
 
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
@@ -504,6 +511,48 @@ impl Env {
             check(unsafe { ffi::mdb_txn_begin(*env, ptr::null_mut(), flags, slot) })?;
         }
         Ok(txn)
+    }
+}
+
+/// Where the environment `env`'s file is mapped, and how long the mapping
+/// is: LMDB's `me_mapaddr` is only where it asked to map it, with
+/// `MDB_FIXEDMAP`. Found in `/proc/self/maps`, as the one mapping of the
+/// file, by inode, from its start, of the map's size.
+fn map_of(env: *mut ffi::MDB_env) -> Option<(usize, usize)> {
+    // SAFETY: plain data, filled in by LMDB from an open env.
+    let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
+    let mut fd = -1;
+    check(unsafe { ffi::mdb_env_info(env, &mut info) }).ok()?;
+    check(unsafe { ffi::mdb_env_get_fd(env, &mut fd) }).ok()?;
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: an open descriptor, and a buffer of the right type.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    let mut found = maps.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let (range, _, offset, _, inode) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
+        let (start, end) = range.split_once('-')?;
+        let (start, end) = (
+            usize::from_str_radix(start, 16).ok()?,
+            usize::from_str_radix(end, 16).ok()?,
+        );
+        let ours = inode.parse::<u64>().ok()? == stat.st_ino as u64
+            && usize::from_str_radix(offset, 16).ok()? == 0
+            && end - start == info.me_mapsize.next_multiple_of(4096);
+        ours.then_some((start, end - start))
+    });
+    // The same file mapped twice, as by opening it twice: no telling which.
+    match (found.next(), found.next()) {
+        (Some(map), None) => Some(map),
+        _ => None,
     }
 }
 
@@ -1034,6 +1083,23 @@ mod tests {
         assert_eq!(cursor.last_dup().unwrap().unwrap().1, 30u16.to_be_bytes());
         assert!(cursor.set(b"x").unwrap().is_none());
         assert_eq!(txn.len(db).unwrap(), 4);
+    }
+
+    /// Where a value read is in the file, as read ahead goes by.
+    #[test]
+    fn knows_where_its_file_is_mapped() {
+        let (dir, env) = open();
+        let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
+        let mut txn = env.write_txn().unwrap();
+        txn.put(db, b"k", &[7; 3000]).unwrap();
+        txn.commit().unwrap();
+        env.sync().unwrap();
+        let txn = env.read_txn().unwrap();
+        let value = txn.get(db, b"k").unwrap().unwrap();
+        let offset = env.offset_of(0, value).expect("the map found");
+        let file = std::fs::read(dir.path().join("data.mdb")).unwrap();
+        assert_eq!(&file[offset..offset + value.len()], value);
+        assert_eq!(env.offset_of(0, &[1, 2, 3]), None);
     }
 
     #[test]
