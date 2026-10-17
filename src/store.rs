@@ -1975,20 +1975,14 @@ pub fn address(pubkey: &[u8; 32], kind: u16, d: &[u8]) -> Vec<u8> {
 
 type WriteJob = (Arc<Vec<u8>>, oneshot::Sender<anyhow::Result<Outcome>>);
 
-/// Remove every event that has expired, a transaction at a time, returning
-/// their sequence numbers.
-fn sweep(store: &Store) -> Result<Vec<u64>> {
-    let mut removed = Vec::new();
-    loop {
-        let mut txn = store.write()?;
-        let seqs = store.expire(&mut txn, crate::event::now(), MAX_SWEEP)?;
-        txn.commit()?;
-        let done = seqs.len() < MAX_SWEEP;
-        removed.extend(seqs);
-        if done {
-            return Ok(removed);
-        }
-    }
+/// Remove up to `max` events that have expired, in a transaction, returning
+/// their sequence numbers, and whether there may be more.
+fn sweep(store: &Store, max: usize) -> Result<(Vec<u64>, bool)> {
+    let mut txn = store.write()?;
+    let seqs = store.expire(&mut txn, crate::event::now(), max)?;
+    txn.commit()?;
+    let more = seqs.len() == max;
+    Ok((seqs, more))
 }
 
 /// The events a write stored, by sequence number, and what it removed.
@@ -2045,12 +2039,17 @@ fn save_deletions(store: &Store, covered: u64) {
     }
 }
 
-/// The most expired events removed in one write transaction.
+/// The most expired events removed in one write transaction, and how many
+/// the first removes: as for deleting, the transactions are sized by how
+/// long the last took. After days stopped, there can be tens of thousands
+/// to remove, which, cold, took minutes in one go, holding up every write.
 const MAX_SWEEP: usize = 10_000;
+const FIRST_SWEEP: usize = 64;
 
 /// LMDB allows one writer at a time, so all writes go through a dedicated
 /// thread that batches whatever is queued into a single transaction. Every
-/// [`SWEEP_INTERVAL`] it also removes the events that have expired. After
+/// [`SWEEP_INTERVAL`] it also removes the events that have expired, a
+/// chunk at a time between batches, until none are left. After
 /// each batch, and whenever nothing's queued, it pushes the web of trust
 /// along a turn at a time until there's nothing left to push, and carries
 /// out the [pending deletions](crate::purge) a chunk at a time.
@@ -2150,6 +2149,7 @@ impl Writer {
             .name("lmdb-writer".into())
             .spawn(move || {
                 let mut next_sweep = Instant::now();
+                let mut sweep_chunk = FIRST_SWEEP;
                 let mut next_save = Instant::now() + DELETION_FILTER_SAVE_INTERVAL;
                 let mut saving: Option<JoinHandle<()>> = None;
                 // Whether the web of trust may have pushing to do.
@@ -2168,14 +2168,27 @@ impl Writer {
                 loop {
                     forget();
                     if Instant::now() >= next_sweep {
-                        match sweep(&store) {
-                            Ok(removed) => tell((Vec::new(), removed)),
-                            Err(err) => tracing::error!("sweeping expired events failed: {err}"),
-                        }
+                        let start = Instant::now();
+                        let more = match sweep(&store, sweep_chunk) {
+                            Ok((removed, more)) => {
+                                tell((Vec::new(), removed));
+                                more
+                            }
+                            Err(err) => {
+                                tracing::error!("sweeping expired events failed: {err}");
+                                false
+                            }
+                        };
+                        sweep_chunk =
+                            crate::purge::next_chunk(sweep_chunk, start.elapsed(), MAX_SWEEP);
                         forget();
                         // Expired follow lists move trust.
                         trust = true;
-                        next_sweep = Instant::now() + SWEEP_INTERVAL;
+                        // The rest after what's queued.
+                        next_sweep = match more {
+                            true => Instant::now(),
+                            false => Instant::now() + SWEEP_INTERVAL,
+                        };
                     }
                     if Instant::now() >= next_save
                         && saving.as_ref().is_none_or(|saving| saving.is_finished())
