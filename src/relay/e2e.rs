@@ -726,6 +726,8 @@ async fn serves_the_onion_as_the_onion() {
         onion_location: true,
         client: crate::tor::client_config(dir.path(), Default::default()).unwrap(),
         service: crate::tor::service_config(Default::default()).unwrap(),
+        arti_table: Default::default(),
+        service_table: Default::default(),
     };
     let config = Config {
         url: "wss://relay.test/".into(),

@@ -190,6 +190,9 @@ pub struct Tor {
     pub onion_location: bool,
     pub client: arti_client::config::TorClientConfig,
     pub service: arti_client::config::onion_service::OnionServiceConfig,
+    /// `[tor.arti]` and `[tor.service]` as written, to show.
+    pub arti_table: toml::Table,
+    pub service_table: toml::Table,
 }
 
 /// The file as written. Every key is optional but `url`, and a key the
@@ -337,7 +340,18 @@ impl Config {
     /// Read the file `path` names, or else the first of the candidates that
     /// exists.
     pub fn load(path: Option<&Path>, env: &Environment) -> anyhow::Result<Self> {
-        let source = match path {
+        let source = Self::source(path, env)?;
+        let text = std::fs::read_to_string(&source)
+            .with_context(|| format!("couldn't read the config file {}", source.display()))?;
+        let file: File = toml::from_str(&text)
+            .with_context(|| format!("{} is not a valid config file", source.display()))?;
+        Self::from_file(file, &source, env).with_context(|| format!("in {}", source.display()))
+    }
+
+    /// The file [`load`](Self::load) reads: the one `path` names, or else
+    /// the first of the candidates that exists.
+    pub fn source(path: Option<&Path>, env: &Environment) -> anyhow::Result<PathBuf> {
+        Ok(match path {
             Some(path) => path.to_path_buf(),
             // One this user can't look into is there all the same: reading
             // it says so, where skipping it would quietly find another.
@@ -349,12 +363,7 @@ impl Config {
                     Err(error) => error.kind() == std::io::ErrorKind::PermissionDenied,
                 })
                 .ok_or_else(|| not_found(env))?,
-        };
-        let text = std::fs::read_to_string(&source)
-            .with_context(|| format!("couldn't read the config file {}", source.display()))?;
-        let file: File = toml::from_str(&text)
-            .with_context(|| format!("{} is not a valid config file", source.display()))?;
-        Self::from_file(file, &source, env).with_context(|| format!("in {}", source.display()))
+        })
     }
 
     fn from_file(file: File, source: &Path, env: &Environment) -> anyhow::Result<Self> {
@@ -419,8 +428,10 @@ impl Config {
                 Some(path) => resolve(path),
                 None => tor_dir.join("hs_ed25519_secret_key"),
             },
-            client: crate::tor::client_config(&tor_dir, tor.arti.unwrap_or_default())?,
-            service: crate::tor::service_config(tor.service.unwrap_or_default())?,
+            client: crate::tor::client_config(&tor_dir, tor.arti.clone().unwrap_or_default())?,
+            service: crate::tor::service_config(tor.service.clone().unwrap_or_default())?,
+            arti_table: tor.arti.unwrap_or_default(),
+            service_table: tor.service.unwrap_or_default(),
             dir: tor_dir,
             port: tor_port,
             onion_location: tor.onion_location.unwrap_or(true),
@@ -552,6 +563,138 @@ impl Config {
             tls,
             tor: enabled.then_some(tor),
         })
+    }
+
+    /// The settings in effect, defaults filled in, as a file would set
+    /// them. Those of `[tls]` and `[tor]` are only there when they're on.
+    pub fn to_toml(&self) -> String {
+        use toml::Value;
+        let text = |text: &str| Value::String(text.into());
+        let int = |n: u64| Value::Integer(i64::try_from(n).unwrap_or(i64::MAX));
+        let path = |path: &Path| text(&path.display().to_string());
+        let texts = |list: &[String]| Value::Array(list.iter().map(|t| text(t)).collect());
+        let kinds = |list: &[u16]| Value::Array(list.iter().map(|&k| int(k.into())).collect());
+        // Unset, a key with these is the relay's own; "" is none.
+        let image = |image: &Image| match image {
+            Image::Builtin => None,
+            Image::Url(url) => Some(text(url)),
+            Image::None => Some(text("")),
+        };
+
+        let mut file = toml::Table::new();
+        let mut set = |key: &str, value: Option<Value>| {
+            if let Some(value) = value {
+                file.insert(key.into(), value);
+            }
+        };
+        set("url", Some(text(&self.url)));
+        set("public_url", Some(text(&self.public_url)));
+        set("bind", Some(text(&self.bind)));
+        set(
+            "metrics_bind",
+            Some(text(self.metrics_bind.as_deref().unwrap_or(""))),
+        );
+        set("real_ip_header", self.real_ip_header.as_deref().map(text));
+        set("log", Some(text(&self.log)));
+        let data_dir = self.db_path.parent().unwrap_or(Path::new(""));
+        set("data_dir", Some(path(data_dir)));
+        set("map_size", Some(int(self.map_size as u64)));
+        set("name", Some(text(&self.name)));
+        set("description", Some(text(&self.description)));
+        set("pubkey", self.pubkey.as_deref().map(text));
+        set("contact", self.contact.as_deref().map(text));
+        set(
+            "software",
+            Some(text(self.software.as_deref().unwrap_or(""))),
+        );
+        set("icon", image(&self.icon));
+        set("banner", image(&self.banner));
+        set("secret_key_file", Some(path(&self.secret_key_file)));
+        set("nip85", Some(Value::Boolean(self.nip85)));
+        set("trends_interval", Some(int(self.trends_interval)));
+        set(
+            "trends_expiration",
+            Some(int(self.trends_expiration.into())),
+        );
+        set("max_message_size", Some(int(self.max_message_size as u64)));
+        set(
+            "max_subscriptions",
+            Some(int(self.max_subscriptions as u64)),
+        );
+        set("max_filters", Some(int(self.max_filters as u64)));
+        set("max_subid_length", Some(int(self.max_subid_length as u64)));
+        set("default_limit", Some(int(self.default_limit)));
+        set("max_limit", Some(int(self.max_limit)));
+        set(
+            "max_filter_values",
+            Some(int(self.max_filter_values as u64)),
+        );
+        set("max_future_seconds", Some(int(self.max_future_seconds)));
+        set("auth_kinds", Some(kinds(&self.auth_kinds)));
+        set("indexed_tags", Some(texts(&self.indexed_tags)));
+        set("history", Some(Value::Boolean(self.history)));
+        set(
+            "history_excluded_kinds",
+            Some(kinds(&self.history_excluded_kinds)),
+        );
+        set(
+            "history_max_versions",
+            Some(int(self.history_max_versions as u64)),
+        );
+        set("search", Some(Value::Boolean(self.search)));
+        set("search_kinds", Some(kinds(&self.search_kinds)));
+        set("search_commit_ms", Some(int(self.search_commit_ms)));
+        set("nsfw_hashtags", Some(texts(&self.nsfw_hashtags)));
+        set("negentropy", Some(Value::Boolean(self.negentropy)));
+        set(
+            "negentropy_max_events",
+            Some(int(self.negentropy_max_events as u64)),
+        );
+        let seeds: Vec<String> = self.wot_seeds.iter().map(hex::encode).collect();
+        set("wot_seeds", Some(texts(&seeds)));
+        set("wot_damping", Some(Value::Float(self.wot_damping)));
+        set("wot_full_trust", Some(int(self.wot_full_trust)));
+        set("wot_min_weight", Some(Value::Float(self.wot_min_weight)));
+        set("wot_budget", Some(int(self.wot_budget as u64)));
+        set("hot_half_life", Some(int(self.hot_half_life.into())));
+        set("rank_step", Some(Value::Float(self.rank_step)));
+        set(
+            "write_policy_plugin",
+            self.write_policy_plugin.as_deref().map(text),
+        );
+        set(
+            "write_policy_timeout_seconds",
+            Some(int(self.write_policy_timeout_seconds)),
+        );
+
+        let mut tls = toml::Table::new();
+        tls.insert("enabled".into(), Value::Boolean(self.tls.is_some()));
+        if let Some(t) = &self.tls {
+            tls.insert("dir".into(), path(&t.dir));
+            if let Some(email) = &t.email {
+                tls.insert("email".into(), text(email));
+            }
+            tls.insert("directory".into(), text(&t.directory));
+            let http_bind = t.http_bind.as_deref().unwrap_or("");
+            tls.insert("http_bind".into(), text(http_bind));
+        }
+        file.insert("tls".into(), Value::Table(tls));
+        let mut tor = toml::Table::new();
+        tor.insert("enabled".into(), Value::Boolean(self.tor.is_some()));
+        if let Some(t) = &self.tor {
+            tor.insert("dir".into(), path(&t.dir));
+            tor.insert("key_file".into(), path(&t.key_file));
+            tor.insert("port".into(), int(t.port.into()));
+            tor.insert("onion_location".into(), Value::Boolean(t.onion_location));
+            if !t.arti_table.is_empty() {
+                tor.insert("arti".into(), Value::Table(t.arti_table.clone()));
+            }
+            if !t.service_table.is_empty() {
+                tor.insert("service".into(), Value::Table(t.service_table.clone()));
+            }
+        }
+        file.insert("tor".into(), Value::Table(tor));
+        toml::to_string(&file).expect("a table serializes")
     }
 }
 
@@ -805,6 +948,99 @@ mod tests {
     fn the_example_is_valid() {
         let c = config(include_str!("../ditto-relay.example.toml")).unwrap();
         assert_eq!(c.url, "wss://relay.example.com/");
+    }
+
+    /// What `ditto-relay config show` prints is a file that loads as the
+    /// same configuration, every setting changed from its default or not.
+    #[test]
+    fn shows_what_loads_as_itself() {
+        // Arti's settings are compared as written: what it makes of them
+        // holds sets, which print in no particular order.
+        let client = crate::tor::client_config(Path::new("/"), Default::default()).unwrap();
+        let service = crate::tor::service_config(Default::default()).unwrap();
+        let comparable = |mut c: Config| {
+            if let Some(tor) = &mut c.tor {
+                (tor.client, tor.service) = (client.clone(), service.clone());
+            }
+            format!("{c:?}")
+        };
+        let same = |c: Config| {
+            let shown = c.to_toml();
+            let again = config(&shown).unwrap_or_else(|err| panic!("{err:#}\n{shown}"));
+            assert_eq!(again.to_toml(), shown);
+            assert_eq!(comparable(again), comparable(c), "{shown}");
+        };
+        same(config(r#"url = "ws://x""#).unwrap());
+        same(config(include_str!("../ditto-relay.example.toml")).unwrap());
+        same(
+            config(
+                r#"
+                url = "wss://relay.example.com/"
+                public_url = "https://example.com/relay"
+                bind = "0.0.0.0:1"
+                metrics_bind = ""
+                real_ip_header = "x-real-ip"
+                log = "debug"
+                data_dir = "/data"
+                map_size = 1234
+                name = "n"
+                description = "d"
+                pubkey = "0000000000000000000000000000000000000000000000000000000000000001"
+                contact = "c"
+                software = ""
+                icon = ""
+                banner = "https://example.com/b.png"
+                secret_key_file = "/k"
+                nip85 = false
+                trends_interval = 1
+                trends_expiration = 2
+                max_message_size = 3
+                max_subscriptions = 4
+                max_filters = 5
+                max_subid_length = 6
+                default_limit = 7
+                max_limit = 8
+                max_filter_values = 9
+                max_future_seconds = 10
+                auth_kinds = [4]
+                indexed_tags = []
+                history = false
+                history_excluded_kinds = []
+                history_max_versions = 2
+                search = false
+                search_kinds = [1]
+                search_commit_ms = 11
+                nsfw_hashtags = ["x"]
+                negentropy = false
+                negentropy_max_events = 12
+                wot_seeds = []
+                wot_damping = 0.5
+                wot_full_trust = 13
+                wot_min_weight = 0.5
+                wot_budget = 14
+                hot_half_life = 15
+                rank_step = 0.5
+                write_policy_plugin = "p"
+                write_policy_timeout_seconds = 16
+                [tls]
+                enabled = true
+                dir = "/tls"
+                email = "a@b.c"
+                http_bind = ""
+                [tor]
+                enabled = true
+                dir = "/tor"
+                key_file = "/tor/k"
+                port = 8080
+                onion_location = false
+                [tor.service]
+                num_intro_points = 5
+                [tor.arti]
+                vanguards.mode = "full"
+                "#,
+            )
+            .unwrap(),
+        );
     }
 
     #[test]

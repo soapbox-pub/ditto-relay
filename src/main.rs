@@ -26,7 +26,17 @@ const COMPACT_THREADS: usize = 32;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let config = Config::load(args.config.as_deref(), &Environment::current())?;
+    let env = Environment::current();
+    // Said before the file's read, so it can say which file isn't right.
+    if let Some(Command::Config {
+        command: ConfigCommand::Path,
+    }) = args.command
+    {
+        let source = Config::source(args.config.as_deref(), &env)?;
+        println!("{}", std::path::absolute(&source)?.display());
+        return Ok(());
+    }
+    let config = Config::load(args.config.as_deref(), &env)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&config.log).context("invalid log directives")?)
         .init();
@@ -42,7 +52,17 @@ async fn main() -> anyhow::Result<()> {
             // runtime would wait on, or panic in.
             std::process::exit(0)
         }
-        Command::Check => check(&config),
+        Command::Check { json } => check(&config, json),
+        Command::Config { command } => match command {
+            ConfigCommand::Path => unreachable!("said before the file was read"),
+            ConfigCommand::Show => {
+                let source = Config::source(args.config.as_deref(), &env)?;
+                let source = std::path::absolute(&source)?;
+                println!("# The settings in effect, from {}", source.display());
+                print!("{}", config.to_toml());
+                Ok(())
+            }
+        },
         Command::Delete {
             filter,
             age,
@@ -117,17 +137,56 @@ fn store_settings(config: &Config) -> anyhow::Result<(IndexedTags, History, Opti
 /// Say whether the configuration would start a relay, without starting one
 /// or opening its database: it's been read, and its log directives checked,
 /// by now.
-fn check(config: &Config) -> anyhow::Result<()> {
-    println!("url: {}", config.url);
-    println!("database: {}", config.db_path.display());
-    let path = config.secret_key_file.display();
-    match key::read(&config.secret_key_file)? {
-        Some(keypair) => println!("key: {}, in {path}", key::pubkey(&keypair)),
-        None => println!("key: a new one to be made in {path}"),
-    }
+fn check(config: &Config, json: bool) -> anyhow::Result<()> {
+    let key = key::read(&config.secret_key_file)?.map(|keypair| key::pubkey(&keypair));
     let files =
         ditto_relay::checkpoint::files(&config.db_path, &[&config.db_path.join(BODIES_DIR)]);
     let mismatches = ditto_relay::storage::check(&files);
+    let tls = config
+        .tls
+        .as_ref()
+        .map(|tls_config| (tls_config, tls::stored(tls_config)));
+    let tor = match &config.tor {
+        Some(tor) => Some((tor, OnionKey::read(&tor.key_file)?)),
+        None => None,
+    };
+
+    if json {
+        let report = serde_json::json!({
+            "valid": true,
+            "url": config.url,
+            "database": config.db_path,
+            "key": {"pubkey": key, "file": config.secret_key_file},
+            "storage": mismatches.iter().map(|mismatch| serde_json::json!({
+                "file": mismatch.file,
+                "record_size": mismatch.record,
+                "dataset": mismatch.dataset,
+                "problem": mismatch.to_string(),
+            })).collect::<Vec<_>>(),
+            "nip85": config.nip85,
+            "tls": tls.as_ref().map(|(tls_config, stored)| serde_json::json!({
+                "domain": tls_config.domain,
+                "dir": tls_config.dir,
+                "directory": tls_config.directory,
+                "days_left": stored.as_ref().ok().and_then(Option::as_ref).map(|cert| cert.days_left()),
+                "error": stored.as_ref().err().map(|error| format!("{error:#}")),
+            })),
+            "tor": tor.as_ref().map(|(tor, key)| serde_json::json!({
+                "url": key.as_ref().map(|key| tor::url(&key.address, tor.port)),
+                "key_file": tor.key_file,
+            })),
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("url: {}", config.url);
+    println!("database: {}", config.db_path.display());
+    let path = config.secret_key_file.display();
+    match key {
+        Some(pubkey) => println!("key: {pubkey}, in {path}"),
+        None => println!("key: a new one to be made in {path}"),
+    }
     if mismatches.is_empty() {
         println!("storage: suits LMDB");
     }
@@ -135,8 +194,8 @@ fn check(config: &Config) -> anyhow::Result<()> {
         println!("storage: {mismatch}");
     }
     println!("nip85: {}", if config.nip85 { "on" } else { "off" });
-    match &config.tls {
-        Some(tls_config) => match tls::stored(tls_config) {
+    match tls {
+        Some((tls_config, stored)) => match stored {
             Ok(Some(certificate)) => println!(
                 "tls: {}, with a certificate that expires in {} days, in {}",
                 tls_config.domain,
@@ -154,18 +213,16 @@ fn check(config: &Config) -> anyhow::Result<()> {
         },
         None => println!("tls: off"),
     }
-    match &config.tor {
-        Some(tor) => match OnionKey::read(&tor.key_file)? {
-            Some(key) => println!(
-                "tor: {}, with the key in {}",
-                tor::url(&key.address, tor.port),
-                tor.key_file.display()
-            ),
-            None => println!(
-                "tor: on, with a new key to be made in {}",
-                tor.key_file.display()
-            ),
-        },
+    match tor {
+        Some((tor, Some(key))) => println!(
+            "tor: {}, with the key in {}",
+            tor::url(&key.address, tor.port),
+            tor.key_file.display()
+        ),
+        Some((tor, None)) => println!(
+            "tor: on, with a new key to be made in {}",
+            tor.key_file.display()
+        ),
         None => println!("tor: off"),
     }
     println!("the configuration is valid");
@@ -650,8 +707,19 @@ key, before serving anything.")]
 would serve: its URL, database, key, storage, NIP-85, TLS and Tor.
 
 It doesn't start the relay or open its database, so it's safe to run \
-beside a running relay, before restarting it with a changed config.")]
-    Check,
+beside a running relay, before restarting it with a changed config. An \
+invalid config is said on stderr, and exits with status 1.")]
+    Check {
+        /// Print it as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show the config file in use, or the settings in effect
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
 
     /// Delete the events a filter matches
     #[command(
@@ -795,6 +863,24 @@ must be stopped or a snapshot, into --into, to see how long it takes.",
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the path of the config file in use
+    #[command(long_about = "Print the path of the config file in use: the \
+one --config names, or else the first of \
+~/.config/ditto-relay/ditto-relay.toml and \
+/etc/ditto-relay/ditto-relay.toml that exists. It's printed whether or \
+not the file is valid.")]
+    Path,
+    /// Print the settings in effect, defaults filled in, as TOML
+    #[command(long_about = "Print the settings in effect, defaults filled \
+in, as TOML: what the relay would run with. Relative paths are shown \
+resolved, against the file's directory. [tls] and [tor] settings are \
+shown only when they're turned on, and Arti's settings, under [tor.arti] \
+and [tor.service], only as written.")]
+    Show,
+}
+
 /// Ctrl-C, or SIGTERM from a service manager.
 async fn signal() {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -844,7 +930,15 @@ mod tests {
         };
         assert_eq!((file, no_verify), (Some("a.jsonl".into()), true));
         let args = parse("check -c a.toml").unwrap();
-        assert!(matches!(args.command, Some(Command::Check)) && args.config.is_some());
+        assert!(matches!(args.command, Some(Command::Check { json: false })));
+        assert!(args.config.is_some());
+        let args = parse("config show").unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Config {
+                command: ConfigCommand::Show
+            })
+        ));
 
         let args = parse("delete --filter {\"kinds\":[1]} -c a.toml --age 60 --dry-run").unwrap();
         assert_eq!(args.config, Some(PathBuf::from("a.toml")));
@@ -903,6 +997,8 @@ mod tests {
             "--from x",
             "compact --threads x",
             "compact delete",
+            "config",
+            "config frob",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
