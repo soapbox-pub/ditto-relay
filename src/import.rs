@@ -228,10 +228,14 @@ mod tests {
         );
         assert_eq!(tally.total(), 8);
 
-        // Stored in order: the deletion, after the note, deleted it.
+        // Stored in order: the deletion, after the note, deleted it: hidden,
+        // or by now gone.
         let txn = store.read().unwrap();
         let seq = store.seq_of(&txn, &event::decode_hex(&note.id).unwrap());
-        assert!(store.load(&txn, seq.unwrap().unwrap()).unwrap().is_none());
+        assert!(
+            seq.unwrap()
+                .is_none_or(|seq| store.load(&txn, seq).unwrap().is_none())
+        );
         drop(txn);
 
         // Already here, it's not checked again.

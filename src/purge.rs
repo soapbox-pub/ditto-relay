@@ -2,12 +2,14 @@
 //! removes, then removing it, a chunk at a time between the writer's other
 //! work. What they cover is hidden meanwhile, so none of this is hurried.
 //!
-//! What a deletion removes is found once, on a thread of its own, against a
-//! snapshot of the store, as the events it covers below its watermark,
-//! with, for a filter, the old versions it matches of an address whose
-//! current version it matches. Their sequence numbers are kept as its
-//! *plan*, and only those are removed: found again after some of their
-//! index entries had gone, they wouldn't all be.
+//! What a deletion removes is found once, against a snapshot of the store,
+//! as the events it covers below its watermark, with, for a filter, the old
+//! versions it matches of an address whose current version it matches.
+//! Their sequence numbers are kept as its *plan*, and only those are
+//! removed: found again after some of their index entries had gone, they
+//! wouldn't all be. Plans that may be slow to find, a filter's or a request
+//! to vanish's, are found on threads of their own (see [`Lane`]), so that a
+//! search of every event's text holds up no other deletion.
 //!
 //! A plan of fewer than [`SWEEP_AT`] events is removed an event at a time,
 //! as removing always was: each event out of the twenty or so index entries
@@ -168,11 +170,14 @@ pub struct Purger {
     jobs: Vec<Job>,
     /// The store again, with which to read ahead on threads of their own.
     background: Option<Arc<Store>>,
-    /// Whether to find plans on a thread of their own, going on meanwhile,
-    /// as the writer does, rather than then and there. What's done stays
-    /// hidden for [`GRACE`] only then, for the readers of a running relay.
+    /// Whether to find slow plans on threads of their own, going on
+    /// meanwhile, as the writer does, rather than then and there. What's
+    /// done stays hidden for [`GRACE`] only then, for the readers of a
+    /// running relay.
     aside: bool,
-    planning: Option<(u64, mpsc::Receiver<anyhow::Result<RoaringTreemap>>)>,
+    /// The plans being found on threads of their own: one of each
+    /// [`Lane`]'s at most.
+    planning: Vec<Planning>,
     /// Deletions done, to unhide once their grace is up.
     finished: VecDeque<(Instant, u64)>,
     chunk: usize,
@@ -189,6 +194,36 @@ pub struct Purger {
     sweep_at: u64,
     /// In tests, how many index entries each chunk of a sweep visits.
     fixed_chunk: Option<usize>,
+}
+
+/// A plan being found on a thread of its own.
+struct Planning {
+    id: u64,
+    lane: Lane,
+    found: mpsc::Receiver<anyhow::Result<RoaringTreemap>>,
+}
+
+/// The deletions whose plans may take a while to find, each found on a
+/// thread of its own, oldest first, one at a time of each lane. A filter's
+/// may take hours, as a search of every event's text does, and a request to
+/// vanish's reads all its author published; neither waits on the other.
+/// The rest, NIP-09 deletions and events already picked, are a lookup or
+/// two each, found then and there, never waiting on either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Filter,
+    Vanish,
+}
+
+impl Lane {
+    /// The lane of a deletion of `target`, if its plan may be slow to find.
+    fn of(target: &Target) -> Option<Lane> {
+        match target {
+            Target::Filter { .. } => Some(Lane::Filter),
+            Target::Vanish { .. } => Some(Lane::Vanish),
+            Target::Seqs(_) | Target::Deletion(_) => None,
+        }
+    }
 }
 
 struct Job {
@@ -222,7 +257,7 @@ impl Purger {
             jobs: Vec::new(),
             background,
             aside,
-            planning: None,
+            planning: Vec::new(),
             finished: VecDeque::new(),
             chunk: FIRST_CHUNK,
             sweep_chunk: FIRST_SWEEP_CHUNK,
@@ -287,8 +322,8 @@ impl Purger {
         let queued = store.pending().len() > self.jobs.len() + self.finished.len();
         let working = if self.jobs.is_empty() && !queued {
             None
-        } else if self.planning.is_some() && !self.can_work() {
-            // Looked at every so often until the plan's found.
+        } else if !queued && !self.planning.is_empty() && !self.can_work() {
+            // Looked at every so often until a plan's found.
             Some(Instant::now() + PLAN_POLL)
         } else {
             Some(self.resume)
@@ -296,11 +331,16 @@ impl Purger {
         [finishing, working].into_iter().flatten().min()
     }
 
-    /// Whether some job has a plan to work on.
+    /// Whether some job has a plan to work on, or one quick to find, or
+    /// one slow to find that's not being found yet.
     fn can_work(&self) -> bool {
-        self.jobs
-            .iter()
-            .any(|job| !matches!(job.work, Work::Unplanned))
+        self.jobs.iter().any(|job| match job.work {
+            Work::Unplanned => match Lane::of(&job.pending.target) {
+                Some(lane) => !self.planning.iter().any(|planning| planning.lane == lane),
+                None => true,
+            },
+            _ => true,
+        })
     }
 
     /// The writer has stored something: the next chunk waits as long as the
@@ -350,7 +390,7 @@ impl Purger {
                 .position(|job| matches!(job.work, Work::Sweep(_)))
         };
         let Some(i) = each.or_else(sweep).or_else(first_sweep) else {
-            return Ok(self.planning.is_some() || !self.jobs.is_empty());
+            return Ok(!self.planning.is_empty() || !self.jobs.is_empty());
         };
         let start = Instant::now();
         let sweeping = matches!(self.jobs[i].work, Work::Sweep(_));
@@ -392,43 +432,70 @@ impl Purger {
         Ok(true)
     }
 
-    /// Find the plan of the oldest deletion without one, on a thread of its
-    /// own, or now; and once found, keep it.
+    /// Keep the plans found on threads of their own; find the quick ones
+    /// left, for about [`TARGET`]; and start finding the oldest slow one of
+    /// each [`Lane`] not being found, on a thread of its own, or with no
+    /// threads, find the oldest slow one now.
     fn plan_next(&mut self, store: &Store) -> anyhow::Result<()> {
-        if let Some((id, rx)) = &self.planning {
-            let found = match rx.try_recv() {
+        let mut i = 0;
+        while i < self.planning.len() {
+            let found = match self.planning[i].found.try_recv() {
                 Ok(found) => found,
-                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
                 Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("planning panicked")),
             };
-            let id = *id;
-            self.planning = None;
-            return self.planned(store, id, found);
+            let planning = self.planning.remove(i);
+            self.planned(store, planning.id, found)?;
         }
-        let Some(job) = self
+
+        let start = Instant::now();
+        let quick: Vec<Arc<Pending>> = self
             .jobs
             .iter()
-            .find(|job| matches!(job.work, Work::Unplanned))
-        else {
-            return Ok(());
-        };
-        let pending = job.pending.clone();
-        let id = pending.id;
-        let (true, Some(store)) = (self.aside, self.background.clone()) else {
+            .filter(|job| {
+                matches!(job.work, Work::Unplanned) && Lane::of(&job.pending.target).is_none()
+            })
+            .map(|job| job.pending.clone())
+            .collect();
+        for pending in quick {
             let found = plan(store, &pending);
-            return self.planned(store, id, found);
-        };
-        let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("deletion-plan".into())
-            .spawn(move || {
-                let _ = tx.send(plan(&store, &pending));
-            })?;
-        self.planning = Some((id, rx));
+            self.planned(store, pending.id, found)?;
+            if start.elapsed() >= TARGET {
+                break;
+            }
+        }
+
+        for lane in [Lane::Filter, Lane::Vanish] {
+            if self.planning.iter().any(|planning| planning.lane == lane) {
+                continue;
+            }
+            let Some(job) = self.jobs.iter().find(|job| {
+                matches!(job.work, Work::Unplanned) && Lane::of(&job.pending.target) == Some(lane)
+            }) else {
+                continue;
+            };
+            let pending = job.pending.clone();
+            let id = pending.id;
+            let (true, Some(store)) = (self.aside, self.background.clone()) else {
+                let found = plan(store, &pending);
+                return self.planned(store, id, found);
+            };
+            let (tx, found) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("deletion-plan".into())
+                .spawn(move || {
+                    let _ = tx.send(plan(&store, &pending));
+                })?;
+            self.planning.push(Planning { id, lane, found });
+        }
         Ok(())
     }
 
-    /// Keep the plan found for deletion `id`, and how it's to be removed.
+    /// Keep the plan found for deletion `id`, and how it's to be removed,
+    /// unless it's been cancelled meanwhile.
     fn planned(
         &mut self,
         store: &Store,
@@ -436,6 +503,9 @@ impl Purger {
         found: anyhow::Result<RoaringTreemap>,
     ) -> anyhow::Result<()> {
         let plan = found?;
+        if !self.jobs.iter().any(|job| job.pending.id == id) {
+            return Ok(());
+        }
         let progress = match plan.len() >= self.sweep_at {
             true => Progress::Records { after: None },
             false => Progress::Each { after: None },
@@ -1205,6 +1275,25 @@ mod tests {
         assert_eq!(everything(&swept), everything(&each));
         let left = swept.len(&swept.read().unwrap()).unwrap();
         assert!(left > 1000 && left < 2000, "{left}");
+    }
+
+    /// A filter's plan, which may take hours to find, holds up no deletion
+    /// queued after it whose plan is quick to find: they're found, and
+    /// removed, while it's still being found.
+    #[test]
+    fn a_slow_plan_holds_up_no_quick_one() {
+        let events = events(60);
+        let picked = json!({"kinds": [1], "limit": 3});
+        let (_dir, store) = store_with(&events, &[json!({"#t": ["spam"]}), picked]);
+        let store = Arc::new(store);
+        let ids: Vec<u64> = store.pending().iter().map(|pending| pending.id).collect();
+        let mut purger = Purger::new(&store, Some(store.clone()), true).unwrap();
+        assert!(purger.work(&store, &|_| {}).unwrap());
+        assert_eq!(purger.planning.len(), 1);
+        assert_eq!(purger.planning[0].id, ids[0]);
+        assert!(purger.jobs.iter().all(|job| job.pending.id == ids[0]));
+        assert_eq!(purger.finished.len(), 1);
+        assert_eq!(purger.finished[0].1, ids[1]);
     }
 
     /// However often the writer writes, a chunk waits only as long as the
