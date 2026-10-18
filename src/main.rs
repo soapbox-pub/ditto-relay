@@ -10,10 +10,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing_subscriber::EnvFilter;
 
 use ditto_relay::config::{Config, Environment};
+use ditto_relay::import::{Importer, Tally};
 use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
-use ditto_relay::store::{BODIES_DIR, History, IndexedTags, Store};
+use ditto_relay::store::{BODIES_DIR, History, IndexedTags, Store, Writer};
 use ditto_relay::tls::{self, Tls};
 use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
@@ -49,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         } => delete(&config, filter.as_deref(), age, dry_run),
         Command::Deletions { json } => deletions(&config, json),
         Command::Export { filter } => export(&config, filter.as_deref()),
+        Command::Import { file, no_verify } => import(&config, file, !no_verify).await,
         Command::Compact {
             from,
             into,
@@ -282,6 +284,94 @@ fn export(config: &Config, json: Option<&str>) -> anyhow::Result<()> {
             Ok(())
         }
         Err(err) => Err(err),
+    }
+}
+
+/// `ditto-relay import`: see [`import`]. The running relay is asked to
+/// store the events, if there is one; else they're stored here, holding
+/// the [`control::Lock`] so that no relay starts meanwhile.
+async fn import(config: &Config, file: Option<PathBuf>, verify: bool) -> anyhow::Result<()> {
+    let file = file.filter(|file| file.as_os_str() != "-");
+    let socket = control::socket_path(&config.db_path);
+    let asked = {
+        let (socket, file) = (socket.clone(), file.clone());
+        tokio::task::spawn_blocking(move || {
+            let input: Box<dyn std::io::BufRead> = match &file {
+                Some(file) => Box::new(std::io::BufReader::new(
+                    std::fs::File::open(file)
+                        .with_context(|| format!("couldn't open {}", file.display()))?,
+                )),
+                None => Box::new(std::io::BufReader::new(std::io::stdin())),
+            };
+            control::request_import(&socket, input, verify, |sent| {
+                eprintln!("sent the relay {sent} events so far")
+            })
+        })
+        .await??
+    };
+    if let Some(tally) = asked {
+        say_imported(&tally);
+        return Ok(());
+    }
+
+    let Some(_lock) = control::Lock::try_acquire(&config.db_path)? else {
+        bail!(
+            "the relay is using the database but isn't answering on {}: it may be starting or stopping, so try again",
+            socket.display()
+        );
+    };
+    let input: Box<dyn tokio::io::AsyncBufRead + Unpin> = match &file {
+        Some(file) => Box::new(tokio::io::BufReader::new(
+            tokio::fs::File::open(file)
+                .await
+                .with_context(|| format!("couldn't open {}", file.display()))?,
+        )),
+        None => Box::new(tokio::io::BufReader::new(tokio::io::stdin())),
+    };
+    let store = Arc::new(open_store(config)?);
+    // What NIP-09 deletions among them remove, for the search index. What
+    // they store, it finds itself, catching up when the relay starts.
+    let (removed, told) = std::sync::mpsc::channel();
+    let writer = Writer::spawn(store.clone(), config.search.then_some(removed), |_| {});
+    let mut importer = Importer::new(store.clone(), writer.clone(), verify);
+    let mut lines = tokio::io::AsyncBufReadExt::lines(input);
+    let mut said = Instant::now();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("couldn't read the events")?
+    {
+        importer.line(&line).await?;
+        if said.elapsed() >= Duration::from_secs(1) {
+            eprintln!("imported {} events so far", importer.tally().total());
+            said = Instant::now();
+        }
+    }
+    let tally = importer.finish().await?;
+    tokio::task::spawn_blocking(move || writer.stop()).await?;
+    let removed: Vec<u64> = told.try_iter().flatten().collect();
+    if !removed.is_empty() {
+        let (_, mut indexer) =
+            SearchIndex::open(&config.search_path, config.search_kinds.clone(), &store)?;
+        indexer.remove(&removed);
+        indexer.commit()?;
+    }
+    store.checkpoint()?;
+    say_imported(&tally);
+    Ok(())
+}
+
+fn say_imported(tally: &Tally) {
+    println!(
+        "imported {} events: {} stored, {} kept as history only, {} here already, {} refused",
+        tally.total(),
+        tally.stored,
+        tally.archived,
+        tally.duplicate,
+        tally.refused.values().sum::<u64>()
+    );
+    for (why, count) in &tally.refused {
+        println!("  {count} refused: {why}");
     }
 }
 
@@ -618,12 +708,45 @@ It only reads the database, so it's safe to run while the relay runs. \
 How it's going is said on stderr.",
         after_help = "Examples:
   ditto-relay export > backup.jsonl
-  ditto-relay export --filter '{\"authors\":[\"<hex pubkey>\"]}' | gzip > alice.jsonl.gz"
+  ditto-relay export --filter '{\"authors\":[\"<hex pubkey>\"]}' | gzip > alice.jsonl.gz
+  ditto-relay -c old.toml export | ditto-relay -c new.toml import"
     )]
     Export {
         /// Only what this NIP-01 filter matches, as JSON
         #[arg(long, value_name = "JSON")]
         filter: Option<String>,
+    },
+
+    /// Store events read as JSON lines, from a file or stdin
+    #[command(
+        long_about = "Store events read as JSON, an event a line, from a \
+file or stdin, as `ditto-relay export` writes them.
+
+They're stored as a client's would be, in the order they're read, so \
+that a replaceable event's versions, and NIP-09 deletions and what they \
+delete, come out as they would have. Each event's id and signature are \
+checked, unless it's stored already. Unlike a client's, they aren't put \
+to the write policy plugin. Ephemeral events aren't stored.
+
+While the relay runs, it's sent the events and stores them itself, and \
+its subscribers see them as they're stored. With the relay stopped, \
+`import` stores them there and then, and a relay started meanwhile waits \
+for it. Run it with the relay's own config, as the relay's user.
+
+It says, at the end, how many were stored, and why any were refused.",
+        after_help = "Examples:
+  ditto-relay import backup.jsonl
+  zcat alice.jsonl.gz | ditto-relay import
+  ditto-relay -c old.toml export | ditto-relay -c new.toml import"
+    )]
+    Import {
+        /// The file to read, or - for stdin [default: stdin]
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Don't check events' ids and signatures. Only for events from a
+        /// source you trust, as your own export
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// List the deletions queued and not yet done
@@ -714,6 +837,12 @@ mod tests {
             args.command,
             Some(Command::Export { filter: Some(_) })
         ));
+        let Some(Command::Import { file, no_verify }) =
+            parse("import --no-verify a.jsonl").unwrap().command
+        else {
+            panic!("not import");
+        };
+        assert_eq!((file, no_verify), (Some("a.jsonl".into()), true));
         let args = parse("check -c a.toml").unwrap();
         assert!(matches!(args.command, Some(Command::Check)) && args.config.is_some());
 

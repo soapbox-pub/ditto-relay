@@ -3,17 +3,25 @@
 //! The running relay holds an exclusive `flock` on [`LOCK_FILE`] in the
 //! database's directory, and answers on the Unix socket [`SOCKET_FILE`]
 //! beside it, which only its own user may connect to. `ditto-relay delete`
-//! asks it there to delete, so that the relay's own writer does it (see
-//! [`crate::delete`]). When nothing answers, `delete` takes the lock itself,
-//! and a relay starting meanwhile waits for it.
+//! and `ditto-relay import` ask it there to delete and to store, so that the
+//! relay's own writer does it (see [`crate::delete`] and [`crate::import`]).
+//! When nothing answers, they take the lock themselves, and a relay starting
+//! meanwhile waits for them.
 //!
 //! A request is a line of JSON, answered with a line of JSON. A deletion is
 //! answered once it's [queued](crate::pending), and what it covers hidden,
-//! with its id; the relay removes it after, in the background.
+//! with its id; the relay removes it after, in the background. An import's
+//! request is followed by its events, a line each, until the client shuts
+//! its side down; it's answered once they're all stored.
 //!
 //! ```text
 //! → {"delete":{"filter":"{\"kinds\":[1]}","age":86400}}
 //! ← {"queued":12}    or    {"error":"..."}
+//!
+//! → {"import":{"verify":true}}
+//! → {"id":"...","pubkey":"...",...}
+//! → ...
+//! ← {"imported":{"stored":2,"archived":0,"duplicate":1,"refused":{}}}
 //! ```
 
 use std::io::{BufRead, Write};
@@ -24,12 +32,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::delete;
+use crate::import::{Importer, Tally};
 use crate::store::{Store, Writer};
 
 /// Held by the running relay, in the database's directory.
@@ -39,6 +48,8 @@ pub const SOCKET_FILE: &str = "control.sock";
 
 /// The longest request read.
 const MAX_REQUEST: u64 = 1 << 20;
+/// The longest event imported.
+const MAX_EVENT: u64 = 64 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,6 +59,8 @@ enum Request {
         filter: Option<String>,
         age: Option<u64>,
     },
+    /// Store the events that follow, a line each: see [`crate::import`].
+    Import { verify: bool },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +68,8 @@ enum Request {
 enum Reply {
     /// The deletion's queued, under this id.
     Queued(u64),
+    /// The import's done, and this is what became of it.
+    Imported(Tally),
     Error(String),
 }
 
@@ -153,19 +168,37 @@ pub fn serve(
 async fn answer(stream: UnixStream, store: Arc<Store>, writer: Writer) {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
-    let mut read = BufReader::new(read.take(MAX_REQUEST));
-    let outcome = match read.read_line(&mut line).await {
+    let mut read = BufReader::new(read);
+    let outcome = match read_line(&mut read, &mut line, MAX_REQUEST).await {
         Ok(_) => match serde_json::from_str(&line) {
             Ok(Request::Delete { filter, age }) => {
                 delete(filter, age, store, writer, &mut write).await
             }
+            Ok(Request::Import { verify }) => {
+                import(&mut read, verify, store, writer, &mut write).await
+            }
             Err(err) => Err(anyhow::anyhow!("not a request: {err}")),
         },
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err),
     };
     if let Err(err) = outcome {
         let _ = send(&mut write, &Reply::Error(format!("{err:#}"))).await;
     }
+}
+
+/// Read a line of at most `max` bytes into `line`, returning how many, 0
+/// at the end.
+async fn read_line(
+    read: &mut (impl AsyncBufRead + Unpin),
+    line: &mut String,
+    max: u64,
+) -> anyhow::Result<usize> {
+    line.clear();
+    let n = (&mut *read).take(max).read_line(line).await?;
+    if n as u64 == max && !line.ends_with('\n') {
+        bail!("a line is longer than {max} bytes");
+    }
+    Ok(n)
 }
 
 async fn send(write: &mut (impl AsyncWriteExt + Unpin), reply: &Reply) -> std::io::Result<()> {
@@ -198,6 +231,106 @@ async fn delete(
     Ok(())
 }
 
+/// Have the writer store the events that follow, a line each, and say
+/// what became of them once they're stored.
+async fn import(
+    read: &mut (impl AsyncBufRead + Unpin),
+    verify: bool,
+    store: Arc<Store>,
+    writer: Writer,
+    write: &mut (impl AsyncWriteExt + Unpin),
+) -> anyhow::Result<()> {
+    tracing::info!("importing events");
+    let mut importer = Importer::new(store, writer, verify);
+    let mut line = String::new();
+    while read_line(read, &mut line, MAX_EVENT).await? > 0 {
+        importer.line(&line).await?;
+    }
+    let tally = importer.finish().await?;
+    tracing::info!(
+        "imported {} events: {} stored, {} as history, {} here already, {} refused",
+        tally.total(),
+        tally.stored,
+        tally.archived,
+        tally.duplicate,
+        tally.refused.values().sum::<u64>()
+    );
+    send(write, &Reply::Imported(tally)).await?;
+    Ok(())
+}
+
+/// Connect to the relay answering at `path`, or None if no relay is
+/// answering there.
+fn connect(path: &Path) -> anyhow::Result<Option<std::os::unix::net::UnixStream>> {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(stream) => Ok(Some(stream)),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "couldn't reach the relay at {}; run this as the relay's user",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// The relay's answer, read from `stream`.
+fn reply(stream: std::os::unix::net::UnixStream) -> anyhow::Result<Reply> {
+    match std::io::BufReader::new(stream).lines().next() {
+        Some(line) => serde_json::from_str(&line?).context("the relay answered nonsense"),
+        None => bail!("the relay hung up before answering"),
+    }
+}
+
+/// Have the relay answering at `path` store the events in `input`, a line
+/// each, telling `progress` how many lines it's been sent, every so often.
+/// Returns what became of them, or None if no relay is answering there.
+pub fn request_import(
+    path: &Path,
+    input: impl BufRead,
+    verify: bool,
+    mut progress: impl FnMut(u64),
+) -> anyhow::Result<Option<Tally>> {
+    let Some(stream) = connect(path)? else {
+        return Ok(None);
+    };
+    let mut line = serde_json::to_vec(&Request::Import { verify }).expect("a request serializes");
+    line.push(b'\n');
+    // Whatever goes wrong sending, the relay may have said why.
+    let sent = (|| -> anyhow::Result<()> {
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, &stream);
+        out.write_all(&line)?;
+        let mut sent = 0u64;
+        for line in input.lines() {
+            let line = line.context("couldn't read the events")?;
+            out.write_all(line.as_bytes())?;
+            out.write_all(b"\n")?;
+            sent += 1;
+            if sent.is_multiple_of(10_000) {
+                progress(sent);
+            }
+        }
+        out.flush()?;
+        Ok(())
+    })();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let reply = reply(stream);
+    match (reply, sent) {
+        (Ok(Reply::Imported(tally)), Ok(())) => Ok(Some(tally)),
+        (Ok(Reply::Error(err)), _) => bail!("the relay couldn't import: {err}"),
+        (_, Err(err)) => Err(err),
+        (Ok(_), Ok(())) => bail!("the relay answered something else"),
+        (Err(err), Ok(())) => Err(err),
+    }
+}
+
 /// Ask the relay answering at `path` to delete what the filter matches.
 /// Returns the id it's queued under, or None if no relay is answering
 /// there.
@@ -206,24 +339,8 @@ pub fn request_delete(
     filter: Option<&str>,
     age: Option<u64>,
 ) -> anyhow::Result<Option<u64>> {
-    let mut stream = match std::os::unix::net::UnixStream::connect(path) {
-        Ok(stream) => stream,
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "couldn't reach the relay at {}; run delete as the relay's user",
-                    path.display()
-                )
-            });
-        }
+    let Some(mut stream) = connect(path)? else {
+        return Ok(None);
     };
     let request = Request::Delete {
         filter: filter.map(String::from),
@@ -232,13 +349,11 @@ pub fn request_delete(
     let mut line = serde_json::to_vec(&request).expect("a request serializes");
     line.push(b'\n');
     stream.write_all(&line)?;
-    if let Some(line) = std::io::BufReader::new(stream).lines().next() {
-        match serde_json::from_str(&line?).context("the relay answered nonsense")? {
-            Reply::Queued(id) => return Ok(Some(id)),
-            Reply::Error(err) => bail!("the relay couldn't delete: {err}"),
-        }
+    match reply(stream)? {
+        Reply::Queued(id) => Ok(Some(id)),
+        Reply::Error(err) => bail!("the relay couldn't delete: {err}"),
+        Reply::Imported(_) => bail!("the relay answered something else"),
     }
-    bail!("the relay hung up before answering")
 }
 
 #[cfg(test)]
@@ -316,6 +431,41 @@ mod tests {
                 .to_string()
                 .starts_with("the relay couldn't delete")
         );
+
+        shutdown.cancel();
+        serving.await.unwrap();
+        tokio::task::spawn_blocking(move || writer.stop())
+            .await
+            .unwrap();
+    }
+
+    /// The relay's writer stores what's sent, and says what became of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_imports_what_its_sent() {
+        use crate::event::tests::signed;
+        use crate::store::tests::open;
+
+        let (dir, store) = open();
+        let store = Arc::new(store);
+        let writer = Writer::spawn(store.clone(), None, |_| {});
+        let path = socket_path(dir.path());
+        let shutdown = CancellationToken::new();
+        let serving = serve(&path, store.clone(), writer.clone(), shutdown.clone()).unwrap();
+
+        let events: String = (0..3)
+            .map(|i| serde_json::to_string(&signed(1, 100 + i, 1, vec![], "x")).unwrap() + "\n")
+            .chain(["nonsense\n".to_string()])
+            .collect();
+        let asked = path.clone();
+        let tally = tokio::task::spawn_blocking(move || {
+            request_import(&asked, events.as_bytes(), true, |_| {})
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!((tally.stored, tally.total()), (3, 4));
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), 3);
 
         shutdown.cancel();
         serving.await.unwrap();

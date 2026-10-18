@@ -13,6 +13,7 @@ pub mod export;
 pub mod facets;
 pub mod filter;
 pub mod hll;
+pub mod import;
 pub mod key;
 pub mod landing;
 pub mod lmdb;

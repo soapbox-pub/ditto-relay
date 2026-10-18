@@ -39,7 +39,7 @@ serde_ignored = "0.1"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 tantivy = "0.26"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "process", "io-util", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "process", "io-util", "io-std", "fs", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "1"

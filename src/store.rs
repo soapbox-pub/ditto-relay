@@ -2332,17 +2332,29 @@ impl Writer {
         if let Ok(Err(err)) = prefetch.await {
             tracing::debug!("prefetching failed: {err}");
         }
+        let outcome = self
+            .queue(record)?
+            .await
+            .map_err(|_| anyhow!("writer thread dropped the request"))?;
+        METRICS.writes.since(start);
+        outcome
+    }
+
+    /// Queue a record to be stored, now, without prefetching what storing it
+    /// reads, and return where its outcome will be said. Records queued
+    /// one after another are stored in that order, however many are queued
+    /// before the first is stored.
+    pub fn queue(
+        &self,
+        record: Arc<Vec<u8>>,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<Outcome>>> {
         let (reply, rx) = oneshot::channel();
         METRICS.write_queue.inc();
         if self.tx.send(Request::Write((record, reply))).is_err() {
             METRICS.write_queue.dec();
             bail!("writer thread is gone");
         }
-        let outcome = rx
-            .await
-            .map_err(|_| anyhow!("writer thread dropped the request"))?;
-        METRICS.writes.since(start);
-        outcome
+        Ok(rx)
     }
 }
 
