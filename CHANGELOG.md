@@ -41,7 +41,9 @@ it is tagged.
   on ZFS (2.4.4 here) takes locks in the opposite order to a write: the
   writer and the indexer each waited on the other, and with them every
   commit to the pool, until the host was rebooted. The bytes are now read
-  with `pread` on a thread of their own.
+  with `pread` on a thread of their own. Keeping up with new events, a few
+  at a time, the indexer no longer reads ahead at all: it read 64 MB past
+  them on every commit.
 - HTTPS without a reverse proxy. With `[tls] enabled = true`, the relay serves
   `wss://` on `[::]:443` itself, with a certificate for `public_url`'s domain
   from Let's Encrypt (or any ACME CA, by `directory`). It renews the

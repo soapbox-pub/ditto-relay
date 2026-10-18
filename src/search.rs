@@ -1242,15 +1242,18 @@ fn index_range(
     let txn = store.read()?;
     let mut cursor = txn.cursor(store.tables.events)?;
     let mut entry = cursor.set_range(&start.to_ne_bytes())?;
-    // Where in memory records were last read ahead from.
+    // Where in memory records were last read ahead from. Keeping up reads
+    // a few records at a time, mostly in memory: reading on past them
+    // would read what isn't to be indexed, every commit.
     let mut read_ahead = 0usize;
+    let reads_ahead = stop - start >= CATCH_UP_SPLIT;
     while let Some((key, record)) = entry {
         let seq = u64::from_ne_bytes(key.try_into()?);
         if seq >= stop {
             break;
         }
         let at = record.as_ptr() as usize;
-        if at.abs_diff(read_ahead) > READ_AHEAD / 2 {
+        if reads_ahead && at.abs_diff(read_ahead) > READ_AHEAD / 2 {
             store.will_need_records(record, READ_AHEAD);
             read_ahead = at;
         }
