@@ -6,6 +6,23 @@ it is tagged.
 
 ## [Unreleased]
 
+- A better command line. Every command and option has help: `-h` for a
+  summary, `--help` or `ditto-relay help <command>` for the whole story, with
+  examples. `--version` works, a mistyped command is told what it may have
+  meant, and `ditto-relay serve` names running the relay, which is still the
+  default. New commands:
+  - `ditto-relay deletions` lists the deletions queued and not yet done, from
+    `delete`, NIP-09 and NIP-62, with how far removing each has got.
+  - `ditto-relay export` writes stored events as JSON lines, every one or what
+    a filter matches, in the order they were stored, while the relay runs or
+    not.
+  - `ditto-relay import` stores events read as JSON lines, from a file or
+    stdin, checking their signatures and storing them in order. A running
+    relay is sent them, and stores them itself.
+  - `ditto-relay config path` says which config file is in use, and
+    `ditto-relay config show` prints the settings in effect, defaults filled
+    in.
+  - `ditto-relay check --json` and `ditto-relay deletions --json`, for scripts.
 - HTTPS without a reverse proxy. With `[tls] enabled = true`, the relay serves
   `wss://` on `[::]:443` itself, with a certificate for `public_url`'s domain
   from Let's Encrypt (or any ACME CA, by `directory`). It renews the

@@ -66,7 +66,25 @@ default; only `url` is required. Data is stored in `data_dir`, by default
 `~/.local/share/ditto-relay` (`/var/lib/ditto-relay` as root), along with the relay's
 own key, `secret.key`, which is made the first time it starts. `ditto-relay check`
 says whether a configuration is valid, and what it would serve, without starting the
-relay or opening its database.
+relay or opening its database. `ditto-relay config path` says which file is in use,
+and `ditto-relay config show` prints the settings in effect, defaults filled in.
+
+## Commands
+
+With no command, `ditto-relay` runs the relay, as `ditto-relay serve` does. The rest
+manage it, and are run with the relay's own config, as its user:
+
+| Command | What it does |
+| --- | --- |
+| `check` | Says whether the config is valid, and what it would serve |
+| `config path`, `config show` | The config file in use, and the settings in effect |
+| `delete` | Deletes the events a filter matches ([below](#deleting-events)) |
+| `deletions` | Lists the deletions queued, and how far each has got |
+| `export`, `import` | Events out and in, as JSON lines ([below](#exporting-and-importing)) |
+| `compact` | Compacts the database, with the relay stopped ([below](#compacting-the-database)) |
+
+`ditto-relay help <command>` says more about each, with examples. `check` and
+`deletions` take `--json`, for scripts.
 
 ## HTTPS
 
@@ -121,6 +139,35 @@ With the relay stopped, `delete` removes the events itself, then and there, and 
 relay started meanwhile waits for it to finish. Removing an address's current version
 also removes its older versions that the filter matches, and the newest version left
 becomes current. Nothing stops deleted events from being published again.
+
+`ditto-relay deletions` lists the deletions queued and not yet done, of every kind,
+with how far removing each has got. It only reads, so it's safe while the relay runs.
+
+## Exporting and importing
+
+```sh
+ditto-relay export > backup.jsonl
+ditto-relay export --filter '{"authors":["<hex pubkey>"]}' | gzip > alice.jsonl.gz
+ditto-relay -c old.toml export | ditto-relay -c new.toml import
+ditto-relay import backup.jsonl
+```
+
+`export` writes stored events to stdout, an event a line, as clients would see them:
+not those expired, nor those a pending deletion covers. Without `--filter`, it writes
+every event, old versions of replaceable events kept as history too; with one, what
+the filter matches, as `delete` would find it. Events come out in the order they were
+stored. It only reads, a transaction of 10,000 events at a time, so it's safe while
+the relay runs, and doesn't keep its writer from reusing pages.
+
+`import` stores events read as JSON lines, from a file or stdin, as a client's would be
+stored, in the order they're read, so a replaceable event's versions, and NIP-09
+deletions and what they delete, come out as they first did. Each event's id and
+signature are checked, unless it's stored already (`--no-verify` skips that, for
+events you trust), but they aren't put to the write policy plugin. Ephemeral events
+aren't stored. While the relay runs, it's sent the events and stores them itself, and
+its subscribers see them; with it stopped, `import` stores them there and then, and a
+relay started meanwhile waits for it. At the end, it says how many were stored, and
+why any were refused.
 
 ## Compacting the database
 
