@@ -15,6 +15,7 @@ arc-swap = "1"
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-cli-extra", "ephemeral-keystore", "vanguards", "hs-pow-full", "static-sqlite"] }
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 futures-util = "0.3.34"
 getrandom = "0.4"
 hex = "0.4.3"

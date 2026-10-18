@@ -1,11 +1,11 @@
-use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use axum::serve::ListenerExt;
+use clap::{Parser, Subcommand};
 use tokio::net::{TcpListener, TcpStream};
 use tracing_subscriber::EnvFilter;
 
@@ -19,23 +19,19 @@ use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
 use ditto_relay::{compact, control, delete, facets, key, metrics, relay, trends};
 
-const USAGE: &str = "usage: ditto-relay [--config <path>] \
-                     [check | delete [--filter <json>] [--age <seconds>] [--dry-run] \
-                     | compact [--from <dir> --into <dir>] [--threads <n>]]";
-
 /// How many threads `compact` reads ahead on, unless told.
 const COMPACT_THREADS: usize = 32;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse(std::env::args_os().skip(1))?;
+    let args = Args::parse();
     let config = Config::load(args.config.as_deref(), &Environment::current())?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&config.log).context("invalid log directives")?)
         .init();
 
     facets::set_nsfw_hashtags(config.nsfw_hashtags.clone());
-    match args.command {
+    match args.command.unwrap_or(Command::Serve) {
         Command::Serve => {
             let _lock = control::Lock::acquire(&config.db_path)?;
             let store = open_store(&config)?;
@@ -251,7 +247,7 @@ fn compact(
         (Some(from), Some(into)) => {
             compact::copy(&from, &into, config.map_size, threads, &mut progress)?
         }
-        (None, None) => {
+        _ => {
             let db = &config.db_path;
             let Some(_lock) = control::Lock::try_acquire(db)? else {
                 bail!("the relay is using the database: stop it first");
@@ -287,7 +283,6 @@ fn compact(
             }
             copied
         }
-        _ => bail!("--from and --into go together"),
     };
     for (table, entries) in &copied.tables {
         println!("{table}: {entries} entries");
@@ -450,109 +445,121 @@ fn nodelay(tcp: &TcpStream) {
 }
 
 /// The command line.
+#[derive(Parser)]
+#[command(
+    name = "ditto-relay",
+    version,
+    about = "A high-performance Nostr relay on LMDB, with search and a web of trust",
+    long_about = "A high-performance Nostr relay on LMDB, with search and a web of trust.
+
+With no command, it runs the relay, as `serve` does. The other commands \
+manage it: most of them work whether or not the relay is running, and run \
+as the relay's own user, with its config.",
+    after_help = CONFIG_HELP,
+    after_long_help = CONFIG_HELP,
+    subcommand_value_name = "COMMAND",
+)]
 struct Args {
-    /// The file `--config` (`-c`) names, if any.
+    /// The config file [default: ~/.config/ditto-relay/ditto-relay.toml,
+    /// else /etc/ditto-relay/ditto-relay.toml]
+    #[arg(short, long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
-    command: Command,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
+const CONFIG_HELP: &str = "\
+The config file is TOML, and only `url` must be set. \
+ditto-relay.example.toml lists every setting with its default.
+
+Run `ditto-relay help <COMMAND>` for more on each command.";
+
+#[derive(Subcommand)]
 enum Command {
-    /// Run the relay.
+    /// Run the relay (the default)
+    #[command(long_about = "Run the relay, until SIGTERM or Ctrl-C.
+
+The relay's key is made in `secret_key_file` the first time it starts. \
+With [tls] or [tor] turned on, it gets its certificate, or makes its onion \
+key, before serving anything.")]
     Serve,
-    /// Check the configuration.
+
+    /// Say whether the config is valid, and what it would serve
+    #[command(long_about = "Say whether the config is valid, and what it \
+would serve: its URL, database, key, storage, NIP-85, TLS and Tor.
+
+It doesn't start the relay or open its database, so it's safe to run \
+beside a running relay, before restarting it with a changed config.")]
     Check,
-    /// Remove what a filter matches: see [`delete`].
+
+    /// Delete the events a filter matches
+    #[command(
+        long_about = "Delete every stored event a NIP-01 filter matches, as \
+`strfry delete` does.
+
+The filter matches as a REQ's would, NIP-50 search text and extensions \
+included, so {\"search\":\"protocol:atproto\"} deletes every bridged \
+Bluesky event. A filter with a `limit` or `distinct:author` deletes the \
+events it picks as of now: with `sort:top` and a limit, the most engaged \
+with.
+
+While the relay runs, `delete` returns as soon as the relay has queued \
+the deletion. From then on no client sees what it matches, and the relay \
+removes it in the background, saying how it goes in its log. With the relay stopped, `delete` removes the \
+events itself, there and then, and a relay started meanwhile waits for \
+it.
+
+Only events stored before the deletion was asked for are deleted, and \
+nothing stops them from being published again.",
+        after_help = "Examples:
+  ditto-relay delete --filter '{\"#t\":[\"spam\"]}' --dry-run
+  ditto-relay delete --filter '{\"kinds\":[1]}' --age 7776000
+  ditto-relay delete --filter '{\"kinds\":[1],\"search\":\"sort:top\",\"limit\":100}'"
+    )]
     Delete {
+        /// A NIP-01 filter, as JSON
+        #[arg(long, value_name = "JSON", required_unless_present = "age")]
         filter: Option<String>,
+        /// Only events at least this many seconds old
+        #[arg(long, value_name = "SECONDS")]
         age: Option<u64>,
+        /// Only count what would be deleted. It only reads, so it never
+        /// holds up the relay
+        #[arg(long)]
         dry_run: bool,
     },
-    /// Compact the database: see [`compact`].
+
+    /// Compact the database, with the relay stopped
+    #[command(
+        long_about = "Compact the database: write its indexes anew into a \
+new file, packed in order, and put it in place.
+
+LMDB never shrinks its file, so after deleting much of the database, \
+what's left is spread thinly through it, less of it stays in memory, and \
+the relay reads the disk more. Compacting needs the relay stopped, and \
+room for the new file, about the size of what's live. The old file is \
+kept beside it, as db/data.mdb.old: remove it once the relay runs well \
+on the new one. Event records are left as they are, unless a file \
+written anew would suit ZFS better.
+
+With --from and --into, it only copies the database in --from, which \
+must be stopped or a snapshot, into --into, to see how long it takes.",
+        after_help = "Example:
+  systemctl stop ditto-relay
+  sudo -u ditto-relay ditto-relay compact
+  systemctl start ditto-relay"
+    )]
     Compact {
+        /// Copy the database in this directory, rather than the relay's
+        #[arg(long, value_name = "DIR", requires = "into")]
         from: Option<PathBuf>,
+        /// Into this directory
+        #[arg(long, value_name = "DIR", requires = "from")]
         into: Option<PathBuf>,
+        /// How many threads read ahead
+        #[arg(long, value_name = "N", default_value_t = COMPACT_THREADS)]
         threads: usize,
     },
-}
-
-impl Args {
-    /// Options are `--name value` or `--name=value`, before the command
-    /// or after.
-    fn parse(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Args> {
-        let mut parsed = Args {
-            config: None,
-            command: Command::Serve,
-        };
-        let (mut filter, mut age, mut dry_run) = (None, None, false);
-        let (mut from, mut into, mut threads) = (None, None, None);
-        while let Some(arg) = args.next() {
-            let arg = arg.into_string().map_err(|_| anyhow!(USAGE))?;
-            let (name, inline) = match arg.split_once('=') {
-                Some((name, value)) if name.starts_with("--") => (name, Some(value.to_string())),
-                _ => (arg.as_str(), None),
-            };
-            let mut value = || match &inline {
-                Some(value) => Ok(value.clone()),
-                None => args
-                    .next()
-                    .and_then(|value| value.into_string().ok())
-                    .with_context(|| format!("{name} needs a value")),
-            };
-            match name {
-                "-c" | "--config" => parsed.config = Some(value()?.into()),
-                "check" if matches!(parsed.command, Command::Serve) => {
-                    parsed.command = Command::Check
-                }
-                "delete" if matches!(parsed.command, Command::Serve) => {
-                    parsed.command = Command::Delete {
-                        filter: None,
-                        age: None,
-                        dry_run: false,
-                    }
-                }
-                "compact" if matches!(parsed.command, Command::Serve) => {
-                    parsed.command = Command::Compact {
-                        from: None,
-                        into: None,
-                        threads: COMPACT_THREADS,
-                    }
-                }
-                "--from" => from = Some(PathBuf::from(value()?)),
-                "--into" => into = Some(PathBuf::from(value()?)),
-                "--threads" => {
-                    threads = Some(value()?.parse().context("--threads must be a number")?)
-                }
-                "--filter" => filter = Some(value()?),
-                "--age" => age = Some(value()?.parse().context("--age must be seconds")?),
-                "--dry-run" if inline.is_none() => dry_run = true,
-                _ => bail!(USAGE),
-            }
-        }
-        let deleting = filter.is_some() || age.is_some() || dry_run;
-        let compacting = from.is_some() || into.is_some() || threads.is_some();
-        if (deleting && !matches!(parsed.command, Command::Delete { .. }))
-            || (compacting && !matches!(parsed.command, Command::Compact { .. }))
-        {
-            bail!(USAGE)
-        }
-        match &mut parsed.command {
-            Command::Delete {
-                filter: f,
-                age: a,
-                dry_run: d,
-            } => (*f, *a, *d) = (filter, age, dry_run),
-            Command::Compact {
-                from: f,
-                into: i,
-                threads: t,
-            } => {
-                (*f, *i) = (from, into);
-                *t = threads.unwrap_or(COMPACT_THREADS);
-            }
-            Command::Serve | Command::Check => {}
-        }
-        Ok(parsed)
-    }
 }
 
 /// Ctrl-C, or SIGTERM from a service manager.
@@ -568,27 +575,35 @@ async fn signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
-    fn parse(args: &str) -> anyhow::Result<Args> {
-        Args::parse(args.split_whitespace().map(OsString::from))
+    fn parse(args: &str) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("ditto-relay").chain(args.split_whitespace()))
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Args::command().debug_assert();
     }
 
     #[test]
     fn parses_the_command_line() {
         let args = parse("").unwrap();
-        assert!(args.config.is_none() && matches!(args.command, Command::Serve));
+        assert!(args.config.is_none() && args.command.is_none());
         let args = parse("--config=a.toml").unwrap();
         assert_eq!(args.config, Some(PathBuf::from("a.toml")));
+        let args = parse("serve").unwrap();
+        assert!(matches!(args.command, Some(Command::Serve)));
         let args = parse("check -c a.toml").unwrap();
-        assert!(matches!(args.command, Command::Check) && args.config.is_some());
+        assert!(matches!(args.command, Some(Command::Check)) && args.config.is_some());
 
         let args = parse("delete --filter {\"kinds\":[1]} -c a.toml --age 60 --dry-run").unwrap();
         assert_eq!(args.config, Some(PathBuf::from("a.toml")));
-        let Command::Delete {
+        let Some(Command::Delete {
             filter,
             age,
             dry_run,
-        } = args.command
+        }) = args.command
         else {
             panic!("not delete");
         };
@@ -596,18 +611,18 @@ mod tests {
             (filter.as_deref(), age, dry_run),
             (Some("{\"kinds\":[1]}"), Some(60), true)
         );
-        let Command::Delete { filter, .. } =
-            parse("--filter={\"a\":\"=\"} delete").unwrap().command
+        let Some(Command::Delete { filter, .. }) =
+            parse("delete --filter={\"a\":\"=\"}").unwrap().command
         else {
             panic!("not delete");
         };
         assert_eq!(filter.as_deref(), Some("{\"a\":\"=\"}"));
 
-        let Command::Compact {
+        let Some(Command::Compact {
             from,
             into,
             threads,
-        } = parse("compact --from /a --into=/b --threads 8")
+        }) = parse("compact --from /a --into=/b --threads 8")
             .unwrap()
             .command
         else {
@@ -617,7 +632,7 @@ mod tests {
             (from, into, threads),
             (Some("/a".into()), Some("/b".into()), 8)
         );
-        let Command::Compact { threads, .. } = parse("compact").unwrap().command else {
+        let Some(Command::Compact { threads, .. }) = parse("compact").unwrap().command else {
             panic!("not compact");
         };
         assert_eq!(threads, COMPACT_THREADS);
@@ -625,15 +640,16 @@ mod tests {
         for bad in [
             "--dry-run",
             "--age 5",
+            "delete",
             "delete delete",
             "delete --age x",
             "delete --filter",
-            "delete --dry-run=yes",
-            "serve",
+            "delete --dry-run",
+            "delete --dry-run=yes --age 5",
             "check delete",
-            "delete check",
             "check --dry-run",
             "compact --dry-run",
+            "compact --from x",
             "delete --threads 4",
             "--from x",
             "compact --threads x",
