@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use ditto_relay::config::{Config, Environment};
 use ditto_relay::import::{Importer, Tally};
+use ditto_relay::pending::Target;
 use ditto_relay::purge::Purger;
 use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
@@ -67,6 +68,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Delete {
             filter,
             age,
+            ids: Some(file),
+            dry_run,
+        } => {
+            debug_assert!(filter.is_none() && age.is_none());
+            delete_ids(&config, file, dry_run)
+        }
+        Command::Delete {
+            filter,
+            age,
+            ids: None,
             dry_run,
         } => delete(&config, filter.as_deref(), age, dry_run),
         Command::Deletions { json } => deletions(&config, json),
@@ -265,6 +276,12 @@ fn delete(
     };
     let store = Arc::new(open_store(config)?);
     let target = delete::target(&store, filter, json, age)?;
+    delete_now(config, &store, target)
+}
+
+/// Delete what `target` covers here and now, with no relay running,
+/// holding the [`control::Lock`].
+fn delete_now(config: &Config, store: &Arc<Store>, target: Target) -> anyhow::Result<()> {
     let mut said = Instant::now();
     let progress = |deleted| {
         if said.elapsed() >= Duration::from_secs(1) {
@@ -277,14 +294,14 @@ fn delete(
             SearchIndex::open(
                 &config.search_path,
                 config.search_excluded_kinds.clone(),
-                &store,
+                store,
             )?
             .1,
         ),
         false => None,
     };
     let deleted = delete::delete(
-        &store,
+        store,
         Some(store.clone()),
         target,
         indexer.as_mut(),
@@ -293,6 +310,43 @@ fn delete(
     store.checkpoint()?;
     println!("deleted {deleted} events");
     Ok(())
+}
+
+/// `ditto-relay delete --ids`: as [`delete`], of the events whose ids are
+/// read from `file`, or stdin, picked as they're stored now.
+fn delete_ids(config: &Config, file: PathBuf, dry_run: bool) -> anyhow::Result<()> {
+    let ids = match file.as_os_str() == "-" {
+        true => delete::read_ids(std::io::stdin().lock())?,
+        false => delete::read_ids(std::io::BufReader::new(
+            std::fs::File::open(&file)
+                .with_context(|| format!("couldn't open {}", file.display()))?,
+        ))?,
+    };
+    if dry_run {
+        let store = open_read_only(config)?;
+        println!(
+            "would delete {} events",
+            delete::pick_ids(&store, &ids)?.len()
+        );
+        return Ok(());
+    }
+
+    let socket = control::socket_path(&config.db_path);
+    if let Some(id) = control::request_delete_ids(&socket, &ids)? {
+        println!(
+            "queued deletion {id}: what it picked is hidden now, and the relay removes it in the background, saying how it goes in its log"
+        );
+        return Ok(());
+    }
+    let Some(_lock) = control::Lock::try_acquire(&config.db_path)? else {
+        bail!(
+            "the relay is using the database but isn't answering on {}: it may be starting or stopping, so try again",
+            socket.display()
+        );
+    };
+    let store = Arc::new(open_store(config)?);
+    let target = Target::Seqs(Arc::new(delete::pick_ids(&store, &ids)?));
+    delete_now(config, &store, target)
 }
 
 /// `ditto-relay deletions`: what's pending, as kept, which the relay
@@ -752,7 +806,7 @@ invalid config is said on stderr, and exits with status 1.")]
         command: ConfigCommand,
     },
 
-    /// Delete the events a filter matches
+    /// Delete the events a filter matches, or those of a list of ids
     #[command(
         long_about = "Delete every stored event a NIP-01 filter matches, as \
 `strfry delete` does.
@@ -770,20 +824,30 @@ removes it in the background, saying how it goes in its log and in \
 events itself, there and then, and a relay started meanwhile waits for \
 it.
 
+With --ids, it deletes the events whose ids are listed, in hex, a line \
+each, in a file or on stdin, however many: as one deletion, which with \
+hundreds of thousands or more sweeps each index once, rather than taking \
+each event out of every index in turn.
+
 Only events stored before the deletion was asked for are deleted, and \
 nothing stops them from being published again.",
         after_help = "Examples:
   ditto-relay delete --filter '{\"#t\":[\"spam\"]}' --dry-run
   ditto-relay delete --filter '{\"kinds\":[1]}' --age 7776000
-  ditto-relay delete --filter '{\"kinds\":[1],\"search\":\"sort:top\",\"limit\":100}'"
+  ditto-relay delete --filter '{\"kinds\":[1],\"search\":\"sort:top\",\"limit\":100}'
+  ditto-relay delete --ids spam.txt"
     )]
     Delete {
         /// A NIP-01 filter, as JSON
-        #[arg(long, value_name = "JSON", required_unless_present = "age")]
+        #[arg(long, value_name = "JSON", required_unless_present_any = ["age", "ids"])]
         filter: Option<String>,
         /// Only events at least this many seconds old
         #[arg(long, value_name = "SECONDS")]
         age: Option<u64>,
+        /// The events whose ids are in this file, a line each, or - for
+        /// stdin
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["filter", "age"])]
+        ids: Option<PathBuf>,
         /// Only count what would be deleted. It only reads, so it never
         /// holds up the relay
         #[arg(long)]
@@ -999,6 +1063,7 @@ mod tests {
         let Some(Command::Delete {
             filter,
             age,
+            ids: None,
             dry_run,
         }) = args.command
         else {
@@ -1014,6 +1079,17 @@ mod tests {
             panic!("not delete");
         };
         assert_eq!(filter.as_deref(), Some("{\"a\":\"=\"}"));
+        let Some(Command::Delete { ids, .. }) = parse("delete --ids -").unwrap().command else {
+            panic!("not delete");
+        };
+        assert_eq!(ids, Some("-".into()));
+        assert!(parse("delete").is_err());
+        assert!(parse("delete --ids a.txt --filter {}").is_err());
+        assert!(parse("delete --ids a.txt --age 60").is_err());
+        let Some(Command::Cancel { id }) = parse("cancel 12").unwrap().command else {
+            panic!("not cancel");
+        };
+        assert_eq!(id, 12);
 
         let Some(Command::Compact {
             from,

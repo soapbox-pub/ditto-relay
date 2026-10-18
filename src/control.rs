@@ -10,13 +10,19 @@
 //!
 //! A request is a line of JSON, answered with a line of JSON. A deletion is
 //! answered once it's [queued](crate::pending), and what it covers hidden,
-//! with its id; the relay removes it after, in the background. An import's
-//! request is followed by its events, a line each, until the client shuts
-//! its side down; it's answered once they're all stored.
+//! with its id; the relay removes it after, in the background. A deletion
+//! by ids, and an import, are followed by the ids or the events, a line
+//! each, until the client shuts its side down: a deletion's is answered
+//! once it's queued, an import's once they're all stored.
 //!
 //! ```text
 //! → {"delete":{"filter":"{\"kinds\":[1]}","age":86400}}
 //! ← {"queued":12}    or    {"error":"..."}
+//!
+//! → {"delete":{"ids":true}}
+//! → <hex id>
+//! → ...
+//! ← {"queued":13}    or    {"error":"..."}
 //!
 //! → {"cancel":{"id":12}}
 //! ← {"cancelled":12}    or    {"error":"..."}
@@ -42,6 +48,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::delete;
 use crate::import::{Importer, Tally};
+use crate::pending::Target;
 use crate::store::{Store, Writer};
 
 /// Held by the running relay, in the database's directory.
@@ -57,10 +64,13 @@ const MAX_EVENT: u64 = 64 << 20;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Request {
-    /// Delete what a filter matches, as [`delete::filter`] takes it.
+    /// Delete what a filter matches, as [`delete::filter`] takes it, or
+    /// with `ids`, the events whose ids follow.
     Delete {
         filter: Option<String>,
         age: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ids: bool,
     },
     /// Cancel a pending deletion: see [`crate::purge::Purger::cancel`].
     Cancel { id: u64 },
@@ -178,7 +188,10 @@ async fn answer(stream: UnixStream, store: Arc<Store>, writer: Writer) {
     let mut read = BufReader::new(read);
     let outcome = match read_line(&mut read, &mut line, MAX_REQUEST).await {
         Ok(_) => match serde_json::from_str(&line) {
-            Ok(Request::Delete { filter, age }) => {
+            Ok(Request::Delete { ids: true, .. }) => {
+                delete_ids(&mut read, store, writer, &mut write).await
+            }
+            Ok(Request::Delete { filter, age, .. }) => {
                 delete(filter, age, store, writer, &mut write).await
             }
             Ok(Request::Cancel { id }) => match writer.cancel(id).await {
@@ -240,6 +253,28 @@ async fn delete(
         tokio::task::spawn_blocking(move || delete::target(&store, filter, json.as_deref(), age))
             .await??;
     let pending = writer.delete(target).await?;
+    send(write, &Reply::Queued(pending.id)).await?;
+    Ok(())
+}
+
+/// Have the writer queue a deletion of the events whose ids follow, a line
+/// each, as picked, and say it's queued.
+async fn delete_ids(
+    read: &mut (impl AsyncBufRead + Unpin),
+    store: Arc<Store>,
+    writer: Writer,
+    write: &mut (impl AsyncWriteExt + Unpin),
+) -> anyhow::Result<()> {
+    let mut ids = Vec::new();
+    let mut line = String::new();
+    while read_line(read, &mut line, MAX_REQUEST).await? > 0 {
+        let id = line.trim();
+        if !id.is_empty() {
+            ids.push(delete::parse_id(id)?);
+        }
+    }
+    let seqs = tokio::task::spawn_blocking(move || delete::pick_ids(&store, &ids)).await??;
+    let pending = writer.delete(Target::Seqs(Arc::new(seqs))).await?;
     send(write, &Reply::Queued(pending.id)).await?;
     Ok(())
 }
@@ -358,6 +393,7 @@ pub fn request_delete(
     let request = Request::Delete {
         filter: filter.map(String::from),
         age,
+        ids: false,
     };
     let mut line = serde_json::to_vec(&request).expect("a request serializes");
     line.push(b'\n');
@@ -366,6 +402,40 @@ pub fn request_delete(
         Reply::Queued(id) => Ok(Some(id)),
         Reply::Error(err) => bail!("the relay couldn't delete: {err}"),
         _ => bail!("the relay answered something else"),
+    }
+}
+
+/// Ask the relay answering at `path` to delete the events of `ids`.
+/// Returns the id it's queued under, or None if no relay is answering
+/// there.
+pub fn request_delete_ids(path: &Path, ids: &[[u8; 32]]) -> anyhow::Result<Option<u64>> {
+    let Some(stream) = connect(path)? else {
+        return Ok(None);
+    };
+    let request = Request::Delete {
+        filter: None,
+        age: None,
+        ids: true,
+    };
+    let mut line = serde_json::to_vec(&request).expect("a request serializes");
+    line.push(b'\n');
+    // Whatever goes wrong sending, the relay may have said why.
+    let sent = (|| -> std::io::Result<()> {
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, &stream);
+        out.write_all(&line)?;
+        for id in ids {
+            out.write_all(hex::encode(id).as_bytes())?;
+            out.write_all(b"\n")?;
+        }
+        out.flush()
+    })();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    match (reply(stream), sent) {
+        (Ok(Reply::Queued(id)), Ok(())) => Ok(Some(id)),
+        (Ok(Reply::Error(err)), _) => bail!("the relay couldn't delete: {err}"),
+        (_, Err(err)) => Err(err.into()),
+        (Ok(_), Ok(())) => bail!("the relay answered something else"),
+        (Err(err), Ok(())) => Err(err),
     }
 }
 
@@ -470,6 +540,67 @@ mod tests {
             refused.unwrap_err().to_string(),
             "no deletion 99 is pending"
         );
+
+        shutdown.cancel();
+        serving.await.unwrap();
+        tokio::task::spawn_blocking(move || writer.stop())
+            .await
+            .unwrap();
+    }
+
+    /// Sent ids, the relay deletes the events of those stored, as one
+    /// deletion; and says why it won't, sent something that isn't an id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_deletes_by_ids() {
+        use crate::event::tests::signed;
+        use crate::store::tests::{open, put};
+
+        let (dir, store) = open();
+        let store = Arc::new(store);
+        let events: Vec<_> = (0..5).map(|i| signed(1, 100 + i, 1, vec![], "")).collect();
+        for event in &events {
+            put(&store, event);
+        }
+        let writer = Writer::spawn(store.clone(), None, |_| {});
+        let path = socket_path(dir.path());
+        let shutdown = CancellationToken::new();
+        let serving = serve(&path, store.clone(), writer.clone(), shutdown.clone()).unwrap();
+
+        let mut ids: Vec<[u8; 32]> = events[..3]
+            .iter()
+            .map(|event| delete::parse_id(&event.id).unwrap())
+            .collect();
+        ids.push([7; 32]);
+        let asked = path.clone();
+        let id = tokio::task::spawn_blocking(move || request_delete_ids(&asked, &ids))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, Some(1));
+        let visible = |store: &Store| {
+            let txn = store.read().unwrap();
+            (1..=5)
+                .filter(|&seq| store.load(&txn, seq).unwrap().is_some())
+                .count()
+        };
+        assert_eq!(visible(&store), 2);
+
+        let asked = path.clone();
+        let refused = tokio::task::spawn_blocking(move || {
+            let Some(mut stream) = connect(&asked)? else {
+                bail!("no relay");
+            };
+            stream.write_all(b"{\"delete\":{\"ids\":true}}\nnope\n")?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            match reply(stream)? {
+                Reply::Error(err) => Ok(err),
+                _ => bail!("not refused"),
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(refused, "\"nope\" isn't an event id: 64 hex digits");
 
         shutdown.cancel();
         serving.await.unwrap();

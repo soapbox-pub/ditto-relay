@@ -18,6 +18,10 @@ it is tagged.
 - `ditto-relay cancel <id>` cancels a queued deletion, leaving the rest
   queued. What it's removed stays removed, and the rest is shown again. One
   sweeping the indexes can't be stopped partway, and says so.
+- `ditto-relay delete --ids <file>` deletes the events whose ids are listed,
+  a line each, or on stdin with `-`, however many, as one deletion: millions
+  of them are swept from each index once, rather than removed one at a time
+  in batches small enough for a filter on the command line.
 
 ## [2.4.0]
 

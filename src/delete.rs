@@ -126,6 +126,40 @@ pub fn pick(store: &Store, filter: &Filter) -> anyhow::Result<RoaringTreemap> {
     Ok(picked.into_iter().map(|(_, seq)| seq).collect())
 }
 
+/// Event ids, in hex, a line each, as `--ids` reads them. Blank lines are
+/// passed over.
+pub fn read_ids(input: impl std::io::BufRead) -> anyhow::Result<Vec<[u8; 32]>> {
+    let mut ids = Vec::new();
+    for (n, line) in input.lines().enumerate() {
+        let line = line.context("couldn't read the ids")?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        ids.push(parse_id(line).with_context(|| format!("line {}", n + 1))?);
+    }
+    Ok(ids)
+}
+
+/// An event id, in hex.
+pub fn parse_id(text: &str) -> anyhow::Result<[u8; 32]> {
+    crate::event::decode_hex::<32>(&text.to_ascii_lowercase())
+        .with_context(|| format!("{text:?} isn't an event id: 64 hex digits"))
+}
+
+/// The events of `ids` stored now, to be deleted as picked; an id of one
+/// that isn't stored is passed over.
+pub fn pick_ids(store: &Store, ids: &[[u8; 32]]) -> anyhow::Result<RoaringTreemap> {
+    let txn = store.read()?;
+    let mut seqs = RoaringTreemap::new();
+    for id in ids {
+        if let Some(seq) = store.seq_of(&txn, id)? {
+            seqs.insert(seq);
+        }
+    }
+    Ok(seqs)
+}
+
 /// How many events deleting by `filter` would remove, as of now. Only
 /// matches that may have old versions to take along are read: those of
 /// kinds without them, as the index says, count once each.
@@ -371,6 +405,36 @@ mod tests {
         );
         assert!(seen.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(seen.last(), Some(&(n as usize)));
+    }
+
+    /// By ids, read a line each, those stored are picked, and deleted.
+    #[test]
+    fn deletes_by_ids() {
+        let (_dir, store) = open();
+        let events: Vec<Event> = (0..4).map(|i| signed(1, 100 + i, 1, vec![], "")).collect();
+        for event in &events[..3] {
+            put(&store, event);
+        }
+        let list = format!(
+            "{}\n\n  {}\n{}\n",
+            events[0].id,
+            events[1].id.to_uppercase(),
+            events[3].id
+        );
+        let ids = read_ids(list.as_bytes()).unwrap();
+        assert_eq!(ids.len(), 3);
+        let picked = pick_ids(&store, &ids).unwrap();
+        assert_eq!(picked.len(), 2);
+        let target = Target::Seqs(Arc::new(picked));
+        assert_eq!(delete(&store, None, target, None, |_| {}).unwrap(), 2);
+        let left: Vec<bool> = events.iter().map(|event| has(&store, event)).collect();
+        assert_eq!(left, [false, false, true, false]);
+
+        let err = read_ids(format!("{}\nnope\n", events[0].id).as_bytes()).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "line 2: \"nope\" isn't an event id: 64 hex digits"
+        );
     }
 
     #[test]

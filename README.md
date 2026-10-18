@@ -78,7 +78,7 @@ manage it, and are run with the relay's own config, as its user:
 | --- | --- |
 | `check` | Says whether the config is valid, and what it would serve |
 | `config path`, `config show` | The config file in use, and the settings in effect |
-| `delete` | Deletes the events a filter matches ([below](#deleting-events)) |
+| `delete` | Deletes the events a filter matches, or a list of ids ([below](#deleting-events)) |
 | `deletions` | Lists the deletions queued, and how far each has got |
 | `cancel` | Cancels a queued deletion ([below](#deleting-events)) |
 | `export`, `import` | Events out and in, as JSON lines ([below](#exporting-and-importing)) |
@@ -122,6 +122,12 @@ The filter matches as a REQ's would, NIP-50 search text and extensions included,
 and a limit, the most engaged with. `--age` only removes events at least that many
 seconds old. `--dry-run` only counts them, and only reads, so it never holds up the
 relay. Run it with the relay's own config, as the relay's user.
+
+`delete --ids <file>` deletes the events whose ids are listed in the file, in hex, a
+line each, or with `-`, on stdin, however many there are, as one deletion. Deleting
+millions of events found some other way, as by putting each to a write policy
+plugin, is best done so: as one deletion, it sweeps each index once, where many
+smaller ones would each remove their events one at a time.
 
 While the relay is running, `delete` returns as soon as the relay has queued the
 deletion, and from then on, no client sees what it matches, however many events that
