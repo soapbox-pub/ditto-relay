@@ -4,6 +4,18 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [Unreleased]
+
+- A slow deletion no longer holds up the rest. What a deletion removes was
+  found one at a time, oldest first, so a deletion by search, which can take
+  hours to find its events in a big database, held up every deletion queued
+  after it, NIP-09 deletions included. Those of NIP-09 deletions and of
+  events a filter picked are found at once now, and a filter's and a
+  request to vanish's on threads of their own, neither waiting on the other.
+- Of the deletions removed one event at a time, the one with the fewest
+  events left goes first, so a NIP-09 deletion of a note never waits behind
+  a deletion of thousands.
+
 ## [2.4.0]
 
 - A better command line. Every command and option has help: `-h` for a
