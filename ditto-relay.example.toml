@@ -141,8 +141,10 @@ url = "wss://relay.example.com/"
 
 #search = true
 
-# The kinds whose text is searchable. Autocomplete covers every kind.
-#search_kinds = [0, 1, 20, 1111, 9802, 30023]
+# Every kind's text is searchable but these, whose content isn't text:
+# reposts, encrypted kinds, lists and sets, and zap receipts. Autocomplete
+# covers every kind.
+#search_excluded_kinds = [3, 4, 6, 13, 16, 1059, 9735, 10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10009, 10012, 10013, 10015, 10020, 10030, 10050, 10101, 10102, 30000, 30002, 30003, 30004, 30005, 30006, 30007, 30015, 30030, 31234, 31924, 39089, 39092]
 
 # How often, at most, new events become searchable.
 #search_commit_ms = 1000

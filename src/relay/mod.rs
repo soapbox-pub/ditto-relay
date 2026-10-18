@@ -961,8 +961,8 @@ impl Connection {
         if filters.len() > self.state.config.max_filters {
             return Err("invalid: too many filters".into());
         }
-        // Before a search is restricted to the kinds indexed, so that it
-        // isn't to hidden ones.
+        // Before a search is kept from the excluded kinds, which adds to
+        // the hidden ones.
         for filter in &mut filters {
             self.state.access.hide(filter);
         }

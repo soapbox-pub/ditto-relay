@@ -1,8 +1,8 @@
 //! NIP-50 search, in a tantivy index kept beside the LMDB.
 //!
-//! The LMDB stays the source of truth. The index holds, for each event of a
-//! searchable kind, its sequence number, kind, author, `created_at`, and
-//! text; a search finds sequence numbers there and loads the events from
+//! The LMDB stays the source of truth. The index holds, for each event with
+//! text or names, its sequence number, kind, author, `created_at`, and
+//! those; a search finds sequence numbers there and loads the events from
 //! the LMDB. Sequence numbers are never reused, so a hit whose event is no
 //! longer stored, or has been replaced and kept only as history, is simply
 //! skipped: deleting those from the index keeps it small, but nothing
@@ -17,6 +17,12 @@
 //! Events stored since the last commit aren't searchable yet, so a search
 //! also checks the newest of them by hand. Everything a search's LMDB
 //! snapshot holds is therefore visible to it, as with any other query.
+//!
+//! Every kind's text is searchable but the excluded kinds', whose content
+//! isn't text: reposts, ciphertext, lists. What [`text`] takes of a kind it
+//! doesn't know is guessed from the content, so a new kind is searchable
+//! without the relay knowing it: JSON gives the fields named like a
+//! profile's, base64 nothing, and anything else is taken as it is.
 //!
 //! Text is split on anything not alphanumeric, lowercased, and folded to
 //! ASCII, both when indexing and searching, and in [`matches`], which checks
@@ -33,13 +39,14 @@
 //! [conditions]: crate::facets
 //!
 //! An autocomplete search looks instead at the names people look things up
-//! by — a profile's name, display name, and NIP-05, and any event's title —
-//! and its terms, and those it excludes, are prefixes. A search of only
-//! kind 0 autocompletes unless it says `autocomplete:false`; any other with
+//! by — a profile's name, display name, and NIP-05, the name in any other
+//! JSON content, and any event's title, name, subject, and `d` tags — and
+//! its terms, and those it excludes, are prefixes. A search of only kind 0
+//! autocompletes unless it says `autocomplete:false`; any other with
 //! `autocomplete:true`. Names are indexed in a field of their own as every
 //! prefix of every word, up to [`MAX_PREFIX`] characters, so a prefix is
 //! looked up like any term. Names are indexed whatever the kind: the
-//! searchable kinds only limit ordinary search.
+//! excluded kinds only limit ordinary search.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -86,14 +93,46 @@ const ANALYZER: &str = "nostr";
 /// Longer tokens aren't words anyone searches for.
 const MAX_TOKEN: usize = 40;
 
+/// The kinds whose content isn't text, by default: reposts (NIP-18),
+/// encrypted messages, seals and gift wraps (NIP-04, NIP-59), private
+/// relays and drafts (NIP-37), NIP-51 lists and sets, and zap receipts.
+pub const EXCLUDED_KINDS: &[u16] = &[
+    3, 4, 6, 13, 16, 1059, 9735, 10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10009,
+    10012, 10013, 10015, 10020, 10030, 10050, 10101, 10102, 30000, 30002, 30003, 30004, 30005,
+    30006, 30007, 30015, 30030, 31234, 31924, 39089, 39092,
+];
+
 /// Tags whose values are searchable text.
-const TEXT_TAGS: &[&str] = &["title", "summary", "subject", "alt"];
+const TEXT_TAGS: &[&str] = &[
+    "title",
+    "summary",
+    "subject",
+    "alt",
+    "name",
+    "description",
+    "location",
+    "about",
+];
 
 /// The kind 0 fields that are searchable.
 const PROFILE_FIELDS: &[&str] = &["name", "display_name", "about", "nip05", "website"];
 
+/// The fields searchable of other JSON content: channels' (NIP-28) and
+/// stalls' and products' (NIP-15), and whatever else is named alike.
+const JSON_FIELDS: &[&str] = &["name", "about", "description", "display_name"];
+
+/// Content as long as this that's all base64 is taken for ciphertext.
+const MIN_BASE64: usize = 32;
+
 /// The kind 0 fields autocomplete matches.
 const NAME_FIELDS: &[&str] = &["name", "display_name", "nip05"];
+
+/// Tags whose values autocomplete matches, whatever the kind.
+const NAME_TAGS: &[&str] = &["title", "name", "subject", "d"];
+
+/// The most of an event's names autocomplete matches, in bytes: each word
+/// is indexed as up to [`MAX_PREFIX`] prefixes.
+const MAX_NAMES: usize = 512;
 
 /// The longest prefix of a word indexed for autocomplete. Longer search
 /// terms are looked up by their first this many characters, then checked.
@@ -161,8 +200,9 @@ pub fn tokens(text: &str) -> Vec<String> {
     })
 }
 
-/// An event's searchable text: its content (for a profile, the fields
-/// people search by) and its text tags.
+/// An event's searchable text: its content and its text tags. Of a
+/// profile, or other JSON content, that's the fields people search by, and
+/// of ciphertext, nothing.
 pub fn text(view: &EventView) -> String {
     let mut out = String::new();
     let mut push = |text: &str| {
@@ -171,25 +211,31 @@ pub fn text(view: &EventView) -> String {
         }
         out.push_str(text);
     };
-    // Short words can be base64 too, and kept as the bytes they spell.
-    let content = view.content().to_text();
-    if view.kind() == 0 {
-        if let Ok(Value::Object(profile)) = serde_json::from_str(&content) {
-            for field in PROFILE_FIELDS {
-                if let Some(Value::String(value)) = profile.get(*field) {
+    let fields = match view.kind() {
+        0 => PROFILE_FIELDS,
+        _ => JSON_FIELDS,
+    };
+    match json_object(view.content()) {
+        Some(object) => {
+            for field in fields {
+                if let Some(Value::String(value)) = object.get(*field) {
                     push(value);
                 }
             }
         }
-    } else {
-        // Media links aren't what a note says: a search for a domain
-        // shouldn't find every picture hosted there.
-        let attached = facets::attached_urls(view);
-        let words: Vec<&str> = content
-            .split_ascii_whitespace()
-            .filter(|word| !facets::is_media_link(word, &attached))
-            .collect();
-        push(&words.join(" "));
+        None if view.kind() == 0 || is_ciphertext(view.content()) => {}
+        None => {
+            // Short words can be base64 too, and kept as the bytes they spell.
+            let content = view.content().to_text();
+            // Media links aren't what a note says: a search for a domain
+            // shouldn't find every picture hosted there.
+            let attached = facets::attached_urls(view);
+            let words: Vec<&str> = content
+                .split_ascii_whitespace()
+                .filter(|word| !facets::is_media_link(word, &attached))
+                .collect();
+            push(&words.join(" "));
+        }
     }
     for mut tag in view.tags() {
         if let (Some(Element::Text(name)), Some(Element::Text(value))) = (tag.next(), tag.next())
@@ -199,6 +245,28 @@ pub fn text(view: &EventView) -> String {
         }
     }
     out
+}
+
+/// Content that's a JSON object, as a profile's is.
+fn json_object(content: Content) -> Option<serde_json::Map<String, Value>> {
+    match content {
+        Content::Text(text) if text.trim_start().starts_with('{') => {
+            match serde_json::from_str(text) {
+                Ok(Value::Object(object)) => Some(object),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether content is base64 too long to be words, or NIP-04's.
+fn is_ciphertext(content: Content) -> bool {
+    match content {
+        Content::Text(_) => false,
+        Content::Base64(bytes) => bytes.len().div_ceil(3) * 4 >= MIN_BASE64,
+        Content::Nip04 { .. } => true,
+    }
 }
 
 /// Whether an event has every term of a search, and not every term of any
@@ -242,7 +310,8 @@ pub fn matches(terms: &[String], excluded: &[Vec<String>], view: &EventView) -> 
             .any(|group| group.iter().all(|&have| have))
 }
 
-/// What autocomplete matches: a profile's names and any event's title.
+/// What autocomplete matches: a profile's names, the name in other JSON
+/// content, and any event's name tags, up to [`MAX_NAMES`] bytes of them.
 pub fn names(view: &EventView) -> String {
     let mut out = String::new();
     let mut push = |text: &str| {
@@ -251,19 +320,25 @@ pub fn names(view: &EventView) -> String {
         }
         out.push_str(text);
     };
-    if view.kind() == 0
-        && let Content::Text(content) = view.content()
-        && let Ok(Value::Object(profile)) = serde_json::from_str(content)
-    {
-        for field in NAME_FIELDS {
-            if let Some(Value::String(value)) = profile.get(*field) {
+    let fields: &[&str] = match view.kind() {
+        0 => NAME_FIELDS,
+        _ => &["name"],
+    };
+    if let Some(object) = json_object(view.content()) {
+        for field in fields {
+            if let Some(Value::String(value)) = object.get(*field) {
                 push(value);
             }
         }
     }
-    if let Some(Element::Text(title)) = view.tag("title") {
-        push(title);
+    for mut tag in view.tags() {
+        if let (Some(Element::Text(name)), Some(Element::Text(value))) = (tag.next(), tag.next())
+            && NAME_TAGS.contains(&name)
+        {
+            push(value);
+        }
     }
+    out.truncate(out.floor_char_boundary(MAX_NAMES));
     out
 }
 
@@ -306,8 +381,9 @@ fn prefix(term: &str) -> &str {
 }
 
 /// What's indexed of an event, by [`text`] and [`names`]. An index built
-/// with another is rebuilt. 1: media links left out of the text.
-const VERSION: u32 = 1;
+/// with another is rebuilt. 1: media links left out of the text. 2: every
+/// kind's text but the excluded kinds', and more names.
+const VERSION: u32 = 2;
 
 /// What a commit records.
 #[derive(Serialize, Deserialize)]
@@ -320,6 +396,9 @@ struct Payload {
     /// The [id](Store::id) of the store it was indexed from.
     #[serde(default)]
     store: Option<String>,
+    /// The kinds whose text it left out. Sorted.
+    #[serde(default)]
+    excluded_kinds: Vec<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -354,8 +433,8 @@ fn schema() -> Schema {
 pub struct SearchIndex {
     reader: IndexReader,
     fields: Fields,
-    /// The kinds indexed. Sorted.
-    kinds: Vec<u16>,
+    /// The kinds whose text isn't indexed. Sorted.
+    excluded_kinds: Vec<u16>,
     /// Every event stored below this sequence number is visible to the
     /// reader (or no longer stored).
     indexed: AtomicU64,
@@ -368,14 +447,15 @@ pub struct SearchIndex {
 
 impl SearchIndex {
     /// Open the index at `dir`, or create it, rebuilding it if it doesn't
-    /// belong with `store`. The indexer catches it up once spawned.
+    /// belong with `store` and `excluded_kinds`. The indexer catches it up
+    /// once spawned.
     pub fn open(
         dir: &Path,
-        mut kinds: Vec<u16>,
+        mut excluded_kinds: Vec<u16>,
         store: &Store,
     ) -> anyhow::Result<(Arc<SearchIndex>, Indexer)> {
-        kinds.sort_unstable();
-        kinds.dedup();
+        excluded_kinds.sort_unstable();
+        excluded_kinds.dedup();
         let schema = schema();
         let (store_next_seq, store_id) = {
             let txn = store.read()?;
@@ -396,6 +476,7 @@ impl SearchIndex {
                 // further along lost commits in a crash of the machine.
                 Some(p)
                     if p.version == VERSION
+                        && p.excluded_kinds == excluded_kinds
                         && index.schema() == schema
                         && p.store
                             .as_ref()
@@ -447,7 +528,7 @@ impl SearchIndex {
         let search = Arc::new(SearchIndex {
             reader,
             fields,
-            kinds,
+            excluded_kinds,
             indexed: AtomicU64::new(next_seq),
             columns: Mutex::default(),
             indexed_tags: store.indexed_tags.clone(),
@@ -467,7 +548,7 @@ impl SearchIndex {
         self.indexed.load(Ordering::Acquire)
     }
 
-    /// Limit a search filter to the kinds indexed, so it matches the same
+    /// Keep a search filter from the excluded kinds, so it matches the same
     /// events live as it finds stored. Autocomplete has every kind, and so
     /// does a search with only extensions, which the LMDB answers.
     pub fn restrict(&self, filter: &mut Filter) {
@@ -478,29 +559,32 @@ impl SearchIndex {
         {
             return;
         }
-        let kinds: Vec<u16> = match filter.kinds.take() {
-            Some(kinds) => kinds
-                .into_iter()
-                .filter(|kind| self.kinds.binary_search(kind).is_ok())
-                .collect(),
-            None => self
-                .kinds
-                .iter()
-                .copied()
-                .filter(|&kind| filter.wants_kind(kind))
-                .collect(),
-        };
-        filter.never |= kinds.is_empty();
-        filter.kinds = Some(kinds);
+        match &mut filter.kinds {
+            Some(kinds) => {
+                kinds.retain(|&kind| !self.is_excluded(kind));
+                filter.never |= kinds.is_empty();
+            }
+            None => {
+                filter.hidden_kinds.extend(&self.excluded_kinds);
+                filter.hidden_kinds.sort_unstable();
+                filter.hidden_kinds.dedup();
+            }
+        }
+    }
+
+    fn is_excluded(&self, kind: u16) -> bool {
+        self.excluded_kinds.binary_search(&kind).is_ok()
     }
 
     fn document(&self, seq: u64, view: &EventView) -> Option<TantivyDocument> {
-        let text = match self.kinds.binary_search(&view.kind()) {
-            Ok(_) => text(view),
-            Err(_) => String::new(),
+        let text = match self.is_excluded(view.kind()) {
+            true => String::new(),
+            false => text(view),
         };
         let names = names(view);
-        if text.is_empty() && names.is_empty() {
+        // A reaction's `+` has no words to find it by.
+        let words = |text: &str| text.chars().any(char::is_alphanumeric);
+        if !words(&text) && !words(&names) {
             return None;
         }
         let f = self.fields;
@@ -564,16 +648,21 @@ impl SearchIndex {
             };
             clauses.push((Occur::MustNot, query));
         }
-        // Only indexed kinds are in the index, so asking for all is moot.
-        if let Some(kinds) = filter.kinds.as_ref().filter(|&k| kinds && *k != self.kinds) {
+        if let Some(kinds) = filter.kinds.as_ref().filter(|_| kinds) {
             let terms = kinds
                 .iter()
                 .map(|&k| Term::from_field_u64(f.kind, k.into()));
             clauses.push((Occur::Must, any_of(terms.collect())));
         }
-        if !filter.hidden_kinds.is_empty() {
-            let terms = filter
-                .hidden_kinds
+        // The excluded kinds have no text to find, so hiding them is moot.
+        let hidden: Vec<u16> = filter
+            .hidden_kinds
+            .iter()
+            .copied()
+            .filter(|&k| search.autocomplete || !self.is_excluded(k))
+            .collect();
+        if !hidden.is_empty() {
+            let terms = hidden
                 .iter()
                 .map(|&k| Term::from_field_u64(f.kind, k.into()));
             clauses.push((Occur::MustNot, any_of(terms.collect())));
@@ -865,7 +954,7 @@ impl SearchIndex {
         filter: &Filter,
         search: &Search,
     ) -> anyhow::Result<Option<HashSet<u64>>> {
-        let Some(kinds) = filter.kinds.as_ref().filter(|&k| *k != self.kinds) else {
+        let Some(kinds) = &filter.kinds else {
             return Ok(None);
         };
         if search.autocomplete && kinds.contains(&0) {
@@ -1314,6 +1403,7 @@ impl Indexer {
             next_seq: self.next_seq,
             version: VERSION,
             store: self.store_id.clone(),
+            excluded_kinds: self.search.excluded_kinds.clone(),
         };
         let mut commit = self.writer.prepare_commit()?;
         commit.set_payload(&serde_json::to_string(&payload)?);
@@ -1410,6 +1500,93 @@ mod tests {
     }
 
     #[test]
+    fn guesses_the_text_of_any_kind() {
+        // A custom NIP, which the relay knows nothing of.
+        let nip = signed(
+            1,
+            100,
+            30817,
+            vec![vec!["d", "nips-on-nostr"], vec!["title", "NIPs on Nostr"]],
+            "# Kind 30817\n\nPublish *NIPs* as events.",
+        );
+        assert_eq!(
+            view_text(&nip),
+            [
+                "kind", "30817", "publish", "nips", "as", "events", "nips", "on", "nostr"
+            ]
+        );
+        // JSON content gives its fields named like a profile's, or nothing.
+        let channel = json!({"name": "Rustaceans", "about": "Rust talk", "picture": "x"});
+        let channel = signed(1, 100, 40, vec![], &channel.to_string());
+        assert_eq!(view_text(&channel), ["rustaceans", "rust", "talk"]);
+        let settings = signed(1, 100, 30078, vec![], r#"{"theme": "dark"}"#);
+        assert!(view_text(&settings).is_empty());
+        // Braces that aren't JSON are text.
+        let note = signed(1, 100, 1, vec![], "{curly} braces");
+        assert_eq!(view_text(&note), ["curly", "braces"]);
+        // Ciphertext is nothing, but a short word that spells base64 is.
+        let sealed = signed(1, 100, 30078, vec![], &"QUJD".repeat(10));
+        assert!(view_text(&sealed).is_empty());
+        let nip04 = signed(
+            1,
+            100,
+            30078,
+            vec![],
+            "QUJDREVGR0g=?iv=QUJDREVGR0hJSktMTU5PUA==",
+        );
+        assert!(view_text(&nip04).is_empty());
+        let word = signed(1, 100, 1, vec![], "test");
+        assert_eq!(view_text(&word), ["test"]);
+        // Every text tag.
+        let event = signed(
+            1,
+            100,
+            31923,
+            vec![
+                vec!["name", "Meetup"],
+                vec!["location", "Austin"],
+                vec!["description", "Monthly"],
+            ],
+            "",
+        );
+        assert_eq!(view_text(&event), ["meetup", "austin", "monthly"]);
+    }
+
+    #[test]
+    fn names_any_kind() {
+        let names_of = |event: &Event| {
+            let record = record::encode(event);
+            tokens(&names(&EventView::new(&record).unwrap()))
+        };
+        let profile = json!({"name": "Alice", "nip05": "a@b.c", "about": "bio"});
+        let profile = signed(1, 100, 0, vec![], &profile.to_string());
+        assert_eq!(names_of(&profile), ["alice", "a", "b", "c"]);
+        let channel = json!({"name": "Rustaceans", "about": "Rust talk"});
+        let channel = signed(1, 100, 41, vec![], &channel.to_string());
+        assert_eq!(names_of(&channel), ["rustaceans"]);
+        let nip = signed(
+            1,
+            100,
+            30817,
+            vec![
+                vec!["d", "nips-on-nostr"],
+                vec!["title", "Custom"],
+                vec!["subject", "Topic"],
+                vec!["name", "Named"],
+                vec!["title", "Second"],
+            ],
+            "body",
+        );
+        assert_eq!(
+            names_of(&nip),
+            ["nips", "on", "nostr", "custom", "topic", "named", "second"]
+        );
+        let long = signed(1, 100, 1, vec![vec!["title", &"aé".repeat(MAX_NAMES)]], "");
+        let record = record::encode(&long);
+        assert!(names(&EventView::new(&record).unwrap()).len() <= MAX_NAMES);
+    }
+
+    #[test]
     fn leaves_out_media_links() {
         let pic = signed(
             1,
@@ -1431,7 +1608,8 @@ mod tests {
     fn fixture() -> Fixture {
         let (db, store) = open();
         let dir = tempfile::tempdir().unwrap();
-        let (index, indexer) = SearchIndex::open(dir.path(), vec![0, 1, 30023], &store).unwrap();
+        let (index, indexer) =
+            SearchIndex::open(dir.path(), EXCLUDED_KINDS.into(), &store).unwrap();
         Fixture {
             _dirs: (db, dir),
             store,
@@ -1485,7 +1663,10 @@ mod tests {
         let cash = signed(1, 400, 1, vec![], "cash only");
         let article = signed(2, 500, 30023, vec![vec!["d", "a"]], "long read");
         let reaction = signed(3, 600, 7, vec![], "+");
-        for event in [&plain, &bitcoin, &ecash, &cash, &article, &reaction] {
+        let repost = signed(1, 650, 6, vec![], "nostr repost");
+        for event in [
+            &plain, &bitcoin, &ecash, &cash, &article, &reaction, &repost,
+        ] {
             put(&f.store, event);
         }
         f.index_all();
@@ -1504,14 +1685,18 @@ mod tests {
             f.search(json!({"search": "nostr -e-cash"})),
             ids(&[&plain, &bitcoin])
         );
-        // Only exclusions: newest first, among the searchable kinds.
+        // Only exclusions: newest first, of every kind but the excluded.
         assert_eq!(
             f.search(json!({"search": "-bitcoin"})),
-            ids(&[&article, &cash, &ecash, &plain])
+            ids(&[&reaction, &article, &cash, &ecash, &plain])
+        );
+        assert!(
+            f.search(json!({"search": "-bitcoin", "kinds": [6]}))
+                .is_empty()
         );
         assert_eq!(
-            f.search(json!({"search": "-bitcoin -cash", "kinds": [1, 7]})),
-            ids(&[&plain])
+            f.search(json!({"search": "-bitcoin -cash", "kinds": [1, 6, 7]})),
+            ids(&[&reaction, &plain])
         );
         assert_eq!(
             f.search(json!({"search": "-bitcoin", "kinds": [1], "limit": 2})),
@@ -1653,8 +1838,8 @@ mod tests {
         let mut f = fixture();
         let hello = signed(1, 100, 1, vec![vec!["t", "x"]], "hello world");
         let bitcoin = signed(2, 200, 1, vec![], "hello bitcoin");
-        let reaction = signed(2, 200, 7, vec![], "hello");
-        for event in [&hello, &bitcoin, &reaction] {
+        let repost = signed(2, 200, 6, vec![], "hello");
+        for event in [&hello, &bitcoin, &repost] {
             put(&f.store, event);
         }
         f.index_all();
@@ -1672,7 +1857,7 @@ mod tests {
             .unwrap()
             .count
         };
-        // Indexed or not yet, but only the searchable kinds.
+        // Indexed or not yet, but not the excluded kinds.
         assert_eq!(count(json!({"search": "hello"})), 3);
         assert_eq!(count(json!({"search": "hello -bitcoin"})), 2);
         assert_eq!(count(json!({"search": "hello", "#t": ["x"]})), 1);
@@ -1718,8 +1903,8 @@ mod tests {
         let once = signed(1, 300, 1, vec![], "rust and other things besides");
         let twice = signed(2, 100, 1, vec![], "rust rust");
         let neither = signed(3, 200, 1, vec![], "go");
-        let reaction = signed(3, 200, 7, vec![], "rust");
-        for event in [&once, &twice, &neither, &reaction] {
+        let repost = signed(3, 200, 6, vec![], "rust");
+        for event in [&once, &twice, &neither, &repost] {
             put(&f.store, event);
         }
         f.index_all();
@@ -1860,21 +2045,33 @@ mod tests {
         let note = signed(1, 100, 1, vec![], "persisted");
         put(&store, &note);
         {
-            let (_, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+            let (_, mut indexer) =
+                SearchIndex::open(dir.path(), EXCLUDED_KINDS.into(), &store).unwrap();
             indexer.catch_up_all(&store).unwrap();
         }
         let later = signed(1, 200, 1, vec![], "persisted later");
         put(&store, &later);
 
-        let (index, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+        let (index, mut indexer) =
+            SearchIndex::open(dir.path(), EXCLUDED_KINDS.into(), &store).unwrap();
         assert_eq!(index.indexed.load(Ordering::Relaxed), 2);
         indexer.catch_up_all(&store).unwrap();
         assert_eq!(index.reader.searcher().num_docs(), 2);
         drop((index, indexer));
 
+        // Excluding other kinds leaves other text out: rebuilt.
+        let (index, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+        assert_eq!(index.reader.searcher().num_docs(), 0);
+        indexer.catch_up_all(&store).unwrap();
+        assert_eq!(index.reader.searcher().num_docs(), 0);
+        drop((index, indexer));
+        let (index, _) = SearchIndex::open(dir.path(), EXCLUDED_KINDS.into(), &store).unwrap();
+        assert_eq!(index.reader.searcher().num_docs(), 0);
+        drop(index);
+
         // An index further along than the LMDB isn't this LMDB's: rebuilt.
         let (_db2, other) = open();
-        let (index, _) = SearchIndex::open(dir.path(), vec![1], &other).unwrap();
+        let (index, _) = SearchIndex::open(dir.path(), EXCLUDED_KINDS.into(), &other).unwrap();
         assert_eq!(index.reader.searcher().num_docs(), 0);
         drop((index, db));
     }
@@ -1893,13 +2090,15 @@ mod tests {
         put(&store, &signed(1, 200, 1, vec![], "lost"));
         let dir = tempfile::tempdir().unwrap();
         {
-            let (_, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+            let (_, mut indexer) =
+                SearchIndex::open(dir.path(), EXCLUDED_KINDS.into(), &store).unwrap();
             indexer.catch_up_all(&store).unwrap();
         }
         drop((store, db));
 
         let store = open_in(behind.path());
-        let (index, mut indexer) = SearchIndex::open(dir.path(), vec![1], &store).unwrap();
+        let (index, mut indexer) =
+            SearchIndex::open(dir.path(), EXCLUDED_KINDS.into(), &store).unwrap();
         assert_eq!(index.reader.searcher().num_docs(), 2);
         assert_eq!(store.next_seq(&store.read().unwrap()).unwrap(), 3);
         let fresh = signed(1, 300, 1, vec![], "fresh");
@@ -1955,7 +2154,7 @@ mod tests {
         assert_eq!(f.search(profiles("bitcoin autocomplete:false")).len(), 3);
         assert!(f.search(profiles("jac autocomplete:false")).is_empty());
 
-        // Any kind with a title, searchable or not; but only its title.
+        // Any kind with a title, its text searchable too.
         let listing = signed(
             5,
             100,
@@ -1968,11 +2167,26 @@ mod tests {
         assert_eq!(f.search(autocomplete("bicy")), [listing.id.as_str()]);
         let kinds = json!({"search": "bicy autocomplete:true", "kinds": [30402]});
         assert_eq!(f.search(kinds), [listing.id.as_str()]);
-        assert!(f.search(json!({"search": "bicycle"})).is_empty());
-        assert!(
-            f.search(json!({"search": "red", "kinds": [30402]}))
-                .is_empty()
+        assert_eq!(
+            f.search(json!({"search": "bicycle"})),
+            [listing.id.as_str()]
         );
+        let red = json!({"search": "red", "kinds": [30402]});
+        assert_eq!(f.search(red), [listing.id.as_str()]);
+        // An excluded kind has only its names.
+        let set = signed(
+            7,
+            100,
+            30000,
+            vec![vec!["d", "t"], vec!["title", "Tandem riders"]],
+            "",
+        );
+        put(&f.store, &set);
+        f.index_all();
+        assert_eq!(f.search(autocomplete("tand")), [set.id.as_str()]);
+        assert!(f.search(json!({"search": "tandem"})).is_empty());
+        let tandem = json!({"search": "tandem", "kinds": [30000]});
+        assert!(f.search(tandem).is_empty());
 
         // Past what's indexed, a term is still checked in full.
         let long = profile(4, "Supercalifragilisticexpialidocious");

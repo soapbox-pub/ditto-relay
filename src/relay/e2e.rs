@@ -57,7 +57,7 @@ fn config() -> Config {
         auth_kinds: vec![],
         search: false,
         search_path: PathBuf::new(),
-        search_kinds: vec![],
+        search_excluded_kinds: vec![],
         search_commit_ms: 1000,
         nsfw_hashtags: vec![],
         negentropy: true,

@@ -27,7 +27,8 @@ pub struct Filter {
     pub limit: Option<u64>,
     pub search: Option<Search>,
     /// Kinds the filter doesn't match though it doesn't name its kinds:
-    /// those the connection may not read (see [`crate::auth`]). Sorted.
+    /// those the connection may not read (see [`crate::auth`]), and for a
+    /// search, those whose text isn't searchable. Sorted.
     pub hidden_kinds: Vec<u16>,
     /// Some field can match nothing (an empty list, say), so neither can
     /// the filter.

@@ -23,6 +23,19 @@ it is tagged.
     `ditto-relay config show` prints the settings in effect, defaults filled
     in.
   - `ditto-relay check --json` and `ditto-relay deletions --json`, for scripts.
+- Every kind's text is searchable again, as it was before the rewrite, so a
+  kind the relay knows nothing of, like a custom NIP (kind 30817), is found
+  by its words. Only kinds whose content isn't text are left out: reposts,
+  ciphertext, NIP-51 lists and sets, and zap receipts. Of a kind it doesn't
+  know, JSON content gives its `name`, `about`, `description` and
+  `display_name`, base64 nothing, and anything else its words. `name`,
+  `description`, `location` and `about` tags are searchable too.
+  **`search_kinds` is gone**, and a config that sets it no longer loads; its
+  opposite, `search_excluded_kinds`, lists the kinds left out. The search
+  index is rebuilt on upgrade, and whenever `search_excluded_kinds` changes.
+- Autocomplete matches every `title`, `name`, `subject` and `d` tag of any
+  kind, not only an event's first title, and the `name` in any JSON content,
+  such as a NIP-28 channel's.
 - HTTPS without a reverse proxy. With `[tls] enabled = true`, the relay serves
   `wss://` on `[::]:443` itself, with a certificate for `public_url`'s domain
   from Let's Encrypt (or any ACME CA, by `directory`). It renews the

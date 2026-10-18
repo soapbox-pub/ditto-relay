@@ -271,9 +271,14 @@ fn delete(
         }
     };
     let mut indexer = match config.search {
-        true => {
-            Some(SearchIndex::open(&config.search_path, config.search_kinds.clone(), &store)?.1)
-        }
+        true => Some(
+            SearchIndex::open(
+                &config.search_path,
+                config.search_excluded_kinds.clone(),
+                &store,
+            )?
+            .1,
+        ),
         false => None,
     };
     let deleted = delete::delete(
@@ -408,8 +413,11 @@ async fn import(config: &Config, file: Option<PathBuf>, verify: bool) -> anyhow:
     tokio::task::spawn_blocking(move || writer.stop()).await?;
     let removed: Vec<u64> = told.try_iter().flatten().collect();
     if !removed.is_empty() {
-        let (_, mut indexer) =
-            SearchIndex::open(&config.search_path, config.search_kinds.clone(), &store)?;
+        let (_, mut indexer) = SearchIndex::open(
+            &config.search_path,
+            config.search_excluded_kinds.clone(),
+            &store,
+        )?;
         indexer.remove(&removed);
         indexer.commit()?;
     }
@@ -517,8 +525,11 @@ fn compact(
 
 async fn serve(config: Config, store: Arc<Store>) -> anyhow::Result<()> {
     let search = if config.search {
-        let (index, indexer) =
-            SearchIndex::open(&config.search_path, config.search_kinds.clone(), &store)?;
+        let (index, indexer) = SearchIndex::open(
+            &config.search_path,
+            config.search_excluded_kinds.clone(),
+            &store,
+        )?;
         tracing::info!(
             "opened the search index at {}",
             config.search_path.display()

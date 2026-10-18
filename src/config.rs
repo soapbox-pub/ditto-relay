@@ -12,7 +12,7 @@ use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
 use crate::event::decode_hex;
-use crate::{facets, landing};
+use crate::{facets, landing, search};
 
 /// Where a system-wide relay's configuration is.
 pub const SYSTEM_PATH: &str = "/etc/ditto-relay/ditto-relay.toml";
@@ -84,8 +84,9 @@ pub struct Config {
     /// Whether NIP-50 search is on.
     pub search: bool,
     pub search_path: PathBuf,
-    /// The kinds whose text is searchable. Autocomplete covers every kind.
-    pub search_kinds: Vec<u16>,
+    /// Kinds whose text isn't searchable, since it isn't text. Autocomplete
+    /// covers every kind.
+    pub search_excluded_kinds: Vec<u16>,
     /// How often, at most, new events become searchable.
     pub search_commit_ms: u64,
     /// Hashtags that mark media as adult, for the `nsfw:` search extension.
@@ -236,7 +237,7 @@ struct File {
     history_max_versions: Option<usize>,
     auth_kinds: Option<Vec<u16>>,
     search: Option<bool>,
-    search_kinds: Option<Vec<u16>>,
+    search_excluded_kinds: Option<Vec<u16>>,
     search_commit_ms: Option<u64>,
     nsfw_hashtags: Option<Vec<String>>,
     negentropy: Option<bool>,
@@ -547,9 +548,9 @@ impl Config {
             auth_kinds: file.auth_kinds.unwrap_or_default(),
             search: file.search.unwrap_or(true),
             search_path: data_dir.join("search"),
-            search_kinds: file
-                .search_kinds
-                .unwrap_or_else(|| vec![0, 1, 20, 1111, 9802, 30023]),
+            search_excluded_kinds: file
+                .search_excluded_kinds
+                .unwrap_or_else(|| search::EXCLUDED_KINDS.into()),
             search_commit_ms: file.search_commit_ms.unwrap_or(1000),
             nsfw_hashtags: file.nsfw_hashtags.unwrap_or_else(|| {
                 facets::DEFAULT_NSFW_HASHTAGS
@@ -642,7 +643,10 @@ impl Config {
             Some(int(self.history_max_versions as u64)),
         );
         set("search", Some(Value::Boolean(self.search)));
-        set("search_kinds", Some(kinds(&self.search_kinds)));
+        set(
+            "search_excluded_kinds",
+            Some(kinds(&self.search_excluded_kinds)),
+        );
         set("search_commit_ms", Some(int(self.search_commit_ms)));
         set("nsfw_hashtags", Some(texts(&self.nsfw_hashtags)));
         set("negentropy", Some(Value::Boolean(self.negentropy)));
@@ -938,7 +942,8 @@ mod tests {
         assert!(config("url = \"ws://x\"\nwot_seeds = [\"npub1\"]").is_err());
         assert!(config("url = \"ws://x\"\npubkey = \"x\"").is_err());
         assert!(config("url = \"ws://x\"\nmax_limit = \"1000\"").is_err());
-        assert!(config("url = \"ws://x\"\nsearch_kinds = \"1,2\"").is_err());
+        assert!(config("url = \"ws://x\"\nsearch_excluded_kinds = \"1,2\"").is_err());
+        assert!(config("url = \"ws://x\"\nsearch_kinds = [1]").is_err());
         // Unknown keys, and the old environment variables' names.
         assert!(config("url = \"ws://x\"\nmax_limt = 1000").is_err());
         assert!(config("RELAY_URL = \"ws://x\"").is_err());
@@ -1008,7 +1013,7 @@ mod tests {
                 history_excluded_kinds = []
                 history_max_versions = 2
                 search = false
-                search_kinds = [1]
+                search_excluded_kinds = [1]
                 search_commit_ms = 11
                 nsfw_hashtags = ["x"]
                 negentropy = false
