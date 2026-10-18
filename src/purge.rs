@@ -443,6 +443,46 @@ impl Purger {
         Ok(true)
     }
 
+    /// Cancel deletion `id`: what it's removed stays removed, and what it
+    /// hasn't is shown again. A sweep under way can't be stopped: it's
+    /// taken some of its events out of some indexes and not others, and
+    /// only finishing puts that right.
+    pub fn cancel(&mut self, store: &Store, id: u64) -> anyhow::Result<()> {
+        self.sync(store)?;
+        let Some(i) = self.jobs.iter().position(|job| job.pending.id == id) else {
+            if self.finished.iter().any(|&(_, done)| done == id) {
+                anyhow::bail!("deletion {id} is done already");
+            }
+            anyhow::bail!("no deletion {id} is pending");
+        };
+        if let Work::Sweep(sweep) = &self.jobs[i].work
+            && sweep.is_started()
+        {
+            anyhow::bail!(
+                "deletion {id} is partway through sweeping the indexes, and can't be stopped until it's done: {}",
+                sweep.progress_text()
+            );
+        }
+        let mut txn = store.write()?;
+        store.drop_pending(&mut txn, id)?;
+        txn.commit()?;
+        let job = self.jobs.remove(i);
+        // Its plan, if it's being found, is let go of when it is.
+        self.planning.retain(|planning| planning.id != id);
+        store.unhide(id);
+        let how = match &job.work {
+            Work::Each {
+                plan,
+                after: Some(after),
+            } => format!("{} of {} events removed", plan.rank(*after), plan.len()),
+            Work::Each { plan, .. } => format!("none of {} events removed", plan.len()),
+            Work::Sweep(sweep) => format!("none of {} events removed", sweep.plan.len()),
+            Work::Unplanned => "before finding what it removes".into(),
+        };
+        tracing::info!("{}: cancelled, {how}", job.pending.describe());
+        Ok(())
+    }
+
     /// Keep the plans found on threads of their own; find the quick ones
     /// left, for about [`TARGET`]; and start finding the oldest slow one of
     /// each [`Lane`] not being found, on a thread of its own, or with no
@@ -1325,6 +1365,65 @@ mod tests {
         assert_eq!(purger.finished[0].1, ids[1]);
         assert_eq!(purger.jobs.len(), 1);
         assert_eq!(purger.jobs[0].removed, 0);
+    }
+
+    /// Cancelled partway, what a deletion removed stays removed, the rest
+    /// is shown again, and the others go on; one that's begun sweeping is
+    /// refused, and goes on.
+    #[test]
+    fn cancels_one_deletion() {
+        let events = events(60);
+        let picked = json!({"kinds": [1], "limit": 10});
+        let (dir, store) = store_with(&events, &[filters()[1].clone(), picked]);
+        let ids: Vec<u64> = store.pending().iter().map(|pending| pending.id).collect();
+        let visible = |store: &Store| {
+            let txn = store.read().unwrap();
+            (1..=events.len() as u64)
+                .filter(|&seq| store.load(&txn, seq).unwrap().is_some())
+                .count()
+        };
+        let stored = |store: &Store| store.len(&store.read().unwrap()).unwrap();
+        let hidden = visible(&store);
+        let mut purger = Purger::new(&store, None, false).unwrap();
+        purger.sweep_at = u64::MAX;
+        purger.chunk = 4;
+        // Both planned, and four of the picked removed: the fewest left.
+        assert!(purger.work(&store, &|_| {}).unwrap());
+        purger.chunk = 4;
+        let before = stored(&store);
+        purger.cancel(&store, ids[1]).unwrap();
+        assert!(purger.jobs.iter().all(|job| job.pending.id == ids[0]));
+        assert_eq!(store.pending().len(), 1);
+        // The six left of the picked are shown again, unless the filter
+        // covers them too.
+        assert!(visible(&store) > hidden);
+        assert_eq!(stored(&store), before);
+        let err = purger.cancel(&store, ids[1]).unwrap_err().to_string();
+        assert_eq!(err, format!("no deletion {} is pending", ids[1]));
+        // Gone from what's kept, so not taken up again after a restart.
+        drop(purger);
+        drop(store);
+        let store = open_in(dir.path());
+        assert_eq!(store.pending().len(), 1);
+    }
+
+    /// Begun sweeping, a deletion can't be cancelled until it's done.
+    #[test]
+    fn wont_cancel_a_sweep_under_way() {
+        let (_dir, store) = store_with(&events(60), &filters()[1..]);
+        let id = store.pending()[0].id;
+        let mut purger = Purger::new(&store, None, false).unwrap();
+        purger.sweep_at = 0;
+        purger.fixed_chunk = Some(2);
+        for _ in 0..3 {
+            assert!(purger.work(&store, &|_| {}).unwrap());
+        }
+        let err = purger.cancel(&store, id).unwrap_err().to_string();
+        assert!(err.contains("can't be stopped until it's done"), "{err}");
+        assert_eq!(store.pending().len(), 1);
+        drop(purger);
+        assert!(purge(&store, 0, Some(2), None));
+        assert!(store.pending().is_empty());
     }
 
     /// However often the writer writes, a chunk waits only as long as the

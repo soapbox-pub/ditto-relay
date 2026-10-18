@@ -15,6 +15,9 @@ it is tagged.
 - Of the deletions removed one event at a time, the one with the fewest
   events left goes first, so a NIP-09 deletion of a note never waits behind
   a deletion of thousands.
+- `ditto-relay cancel <id>` cancels a queued deletion, leaving the rest
+  queued. What it's removed stays removed, and the rest is shown again. One
+  sweeping the indexes can't be stopped partway, and says so.
 
 ## [2.4.0]
 

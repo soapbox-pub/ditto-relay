@@ -80,6 +80,7 @@ manage it, and are run with the relay's own config, as its user:
 | `config path`, `config show` | The config file in use, and the settings in effect |
 | `delete` | Deletes the events a filter matches ([below](#deleting-events)) |
 | `deletions` | Lists the deletions queued, and how far each has got |
+| `cancel` | Cancels a queued deletion ([below](#deleting-events)) |
 | `export`, `import` | Events out and in, as JSON lines ([below](#exporting-and-importing)) |
 | `compact` | Compacts the database, with the relay stopped ([below](#compacting-the-database)) |
 
@@ -142,6 +143,12 @@ becomes current. Nothing stops deleted events from being published again.
 
 `ditto-relay deletions` lists the deletions queued and not yet done, of every kind,
 with how far removing each has got. It only reads, so it's safe while the relay runs.
+
+`ditto-relay cancel <id>` cancels one of them, by the id `deletions` lists it under,
+and leaves the rest queued. What it's removed already stays removed, and what it
+hasn't is shown again. A NIP-09 deletion or a request to vanish can be cancelled too,
+though the relay goes on refusing what it names if it's published again. A deletion
+sweeping the indexes can't be stopped partway, since only finishing leaves them whole.
 
 ## Exporting and importing
 

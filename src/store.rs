@@ -2067,6 +2067,7 @@ pub struct Writer {
 enum Request {
     Write(WriteJob),
     Delete(Box<DeleteJob>),
+    Cancel(CancelJob),
     /// Store what's queued before this, then stop.
     Stop,
 }
@@ -2076,6 +2077,9 @@ type DeleteJob = (
     Target,
     oneshot::Sender<anyhow::Result<Arc<pending::Pending>>>,
 );
+
+/// A deletion `ditto-relay cancel` cancels, and where to say it's done.
+type CancelJob = (u64, oneshot::Sender<anyhow::Result<()>>);
 
 /// Queue a deletion of what `target` covers of what's stored now.
 fn queue(store: &Store, target: Target) -> anyhow::Result<Arc<pending::Pending>> {
@@ -2223,6 +2227,10 @@ impl Writer {
                             let _ = reply.send(queue(&store, target));
                             continue;
                         }
+                        Ok(Request::Cancel((id, reply))) => {
+                            let _ = reply.send(purger.cancel(&store, id));
+                            continue;
+                        }
                         Ok(Request::Stop) => break,
                         Err(RecvTimeoutError::Timeout) => {
                             purger.step(&store, &tell);
@@ -2236,6 +2244,7 @@ impl Writer {
                     let mut batch = vec![first];
                     let mut stop = false;
                     let mut deletes = Vec::new();
+                    let mut cancels = Vec::new();
                     while batch.len() < MAX_WRITE_BATCH {
                         match rx.try_recv() {
                             Ok(Request::Write(job)) => {
@@ -2243,6 +2252,7 @@ impl Writer {
                                 batch.push(job);
                             }
                             Ok(Request::Delete(job)) => deletes.push(job),
+                            Ok(Request::Cancel(job)) => cancels.push(job),
                             Ok(Request::Stop) => {
                                 stop = true;
                                 break;
@@ -2255,6 +2265,9 @@ impl Writer {
                     for job in deletes {
                         let (target, reply) = *job;
                         let _ = reply.send(queue(&store, target));
+                    }
+                    for (id, reply) in cancels {
+                        let _ = reply.send(purger.cancel(&store, id));
                     }
                     if stop {
                         break;
@@ -2314,6 +2327,17 @@ impl Writer {
             .send(Request::Delete(Box::new((target, reply))))
             .is_err()
         {
+            bail!("writer thread is gone");
+        }
+        rx.await
+            .map_err(|_| anyhow!("writer thread dropped the request"))?
+    }
+
+    /// Cancel deletion `id`, as `ditto-relay cancel` asks: see
+    /// [`Purger::cancel`].
+    pub async fn cancel(&self, id: u64) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Request::Cancel((id, reply))).is_err() {
             bail!("writer thread is gone");
         }
         rx.await

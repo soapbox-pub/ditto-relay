@@ -18,6 +18,9 @@
 //! → {"delete":{"filter":"{\"kinds\":[1]}","age":86400}}
 //! ← {"queued":12}    or    {"error":"..."}
 //!
+//! → {"cancel":{"id":12}}
+//! ← {"cancelled":12}    or    {"error":"..."}
+//!
 //! → {"import":{"verify":true}}
 //! → {"id":"...","pubkey":"...",...}
 //! → ...
@@ -59,6 +62,8 @@ enum Request {
         filter: Option<String>,
         age: Option<u64>,
     },
+    /// Cancel a pending deletion: see [`crate::purge::Purger::cancel`].
+    Cancel { id: u64 },
     /// Store the events that follow, a line each: see [`crate::import`].
     Import { verify: bool },
 }
@@ -68,6 +73,8 @@ enum Request {
 enum Reply {
     /// The deletion's queued, under this id.
     Queued(u64),
+    /// The deletion with this id is cancelled.
+    Cancelled(u64),
     /// The import's done, and this is what became of it.
     Imported(Tally),
     Error(String),
@@ -174,6 +181,12 @@ async fn answer(stream: UnixStream, store: Arc<Store>, writer: Writer) {
             Ok(Request::Delete { filter, age }) => {
                 delete(filter, age, store, writer, &mut write).await
             }
+            Ok(Request::Cancel { id }) => match writer.cancel(id).await {
+                Ok(()) => send(&mut write, &Reply::Cancelled(id))
+                    .await
+                    .map_err(Into::into),
+                Err(err) => Err(err),
+            },
             Ok(Request::Import { verify }) => {
                 import(&mut read, verify, store, writer, &mut write).await
             }
@@ -352,7 +365,23 @@ pub fn request_delete(
     match reply(stream)? {
         Reply::Queued(id) => Ok(Some(id)),
         Reply::Error(err) => bail!("the relay couldn't delete: {err}"),
-        Reply::Imported(_) => bail!("the relay answered something else"),
+        _ => bail!("the relay answered something else"),
+    }
+}
+
+/// Ask the relay answering at `path` to cancel deletion `id`. Returns
+/// whether a relay answered there; one that can't cancel it says why.
+pub fn request_cancel(path: &Path, id: u64) -> anyhow::Result<bool> {
+    let Some(mut stream) = connect(path)? else {
+        return Ok(false);
+    };
+    let mut line = serde_json::to_vec(&Request::Cancel { id }).expect("a request serializes");
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    match reply(stream)? {
+        Reply::Cancelled(_) => Ok(true),
+        Reply::Error(err) => bail!("{err}"),
+        _ => bail!("the relay answered something else"),
     }
 }
 
@@ -430,6 +459,16 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .starts_with("the relay couldn't delete")
+        );
+
+        // As is cancelling what isn't pending.
+        let asked = path.clone();
+        let refused = tokio::task::spawn_blocking(move || request_cancel(&asked, 99))
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "no deletion 99 is pending"
         );
 
         shutdown.cancel();

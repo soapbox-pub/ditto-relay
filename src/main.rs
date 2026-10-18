@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use ditto_relay::config::{Config, Environment};
 use ditto_relay::import::{Importer, Tally};
+use ditto_relay::purge::Purger;
 use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
@@ -69,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
         } => delete(&config, filter.as_deref(), age, dry_run),
         Command::Deletions { json } => deletions(&config, json),
+        Command::Cancel { id } => cancel(&config, id),
         Command::Export { filter } => export(&config, filter.as_deref()),
         Command::Import { file, no_verify } => import(&config, file, !no_verify).await,
         Command::Compact {
@@ -308,6 +310,24 @@ fn deletions(config: &Config, json: bool) -> anyhow::Result<()> {
         println!("{}: {}", listed.id, listed.covers);
         println!("  {}", listed.progress());
     }
+    Ok(())
+}
+
+/// `ditto-relay cancel`: the running relay is asked to cancel it, if there
+/// is one; else it's done here, holding the [`control::Lock`].
+fn cancel(config: &Config, id: u64) -> anyhow::Result<()> {
+    let socket = control::socket_path(&config.db_path);
+    if !control::request_cancel(&socket, id)? {
+        let Some(_lock) = control::Lock::try_acquire(&config.db_path)? else {
+            bail!(
+                "the relay is using the database but isn't answering on {}: it may be starting or stopping, so try again",
+                socket.display()
+            );
+        };
+        let store = open_store(config)?;
+        Purger::new(&store, None, false)?.cancel(&store, id)?;
+    }
+    println!("cancelled deletion {id}: what it hadn't removed yet is shown again");
     Ok(())
 }
 
@@ -839,6 +859,29 @@ reads the database, so it's safe to run while the relay runs.")]
         /// Print them as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Cancel a queued deletion
+    #[command(
+        long_about = "Cancel a queued deletion, by the id `ditto-relay \
+deletions` lists it under, leaving the rest queued.
+
+What it's removed already stays removed, and what it hasn't is shown to \
+clients again. A NIP-09 deletion or a request to vanish can be cancelled \
+too, though the relay goes on refusing what it names if it's published \
+again. A deletion sweeping the indexes can't be stopped partway, since \
+only finishing leaves them whole: `deletions` says when one is.
+
+While the relay runs, it's asked to cancel it. With the relay stopped, \
+it's done here, and a relay started meanwhile waits.",
+        after_help = "Example:
+  ditto-relay deletions
+  ditto-relay cancel 32253"
+    )]
+    Cancel {
+        /// The deletion's id, as `ditto-relay deletions` lists it
+        #[arg(value_name = "ID")]
+        id: u64,
     },
 
     /// Compact the database, with the relay stopped
