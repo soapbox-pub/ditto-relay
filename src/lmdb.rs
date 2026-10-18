@@ -22,9 +22,12 @@
 
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::os::fd::FromRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::ptr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lmdb_master_sys as ffi;
 
@@ -165,6 +168,16 @@ pub struct Db {
 
 /// The most environments an [`Env`] holds.
 const MAX_ENVS: usize = 2;
+
+/// How much of a [`will_need`](Env::will_need) is read at a time.
+const READ_AHEAD_CHUNK: usize = 1 << 20;
+
+/// The most reads ahead at once: more than the disk keeps up with are left
+/// undone, as advice the kernel couldn't take would be.
+const MAX_READS_AHEAD: usize = 16;
+
+/// How many reads ahead are going.
+static READS_AHEAD: AtomicUsize = AtomicUsize::new(0);
 
 /// See [`Env::usage`].
 pub struct Usage {
@@ -474,6 +487,14 @@ impl Env {
     /// on from there in order doesn't wait on the disk a page at a time:
     /// environments are opened without the kernel's readahead, which
     /// random lookups have no use for. Only a hint, so failing is no error.
+    ///
+    /// The bytes are read with `pread`, on a thread of its own, rather than
+    /// advised with `POSIX_FADV_WILLNEED`. On ZFS, the kernel's readahead
+    /// locks the pages it fills, then the file's range lock, while a write
+    /// holds the range lock and waits on those pages: the writer and reader
+    /// deadlock, and the pool's commits stop behind them. A read takes the
+    /// range lock without holding pages, and leaves what it read in the ARC,
+    /// where faulting the map in finds it.
     pub fn will_need(&self, env: usize, at: &[u8], len: usize) {
         let mut fd = -1;
         // SAFETY: the env is open.
@@ -483,15 +504,38 @@ impl Env {
         let Some(offset) = self.offset_of(env, at) else {
             return;
         };
-        // SAFETY: advice on a file LMDB holds open; nothing is read or
-        // written through any pointer.
-        unsafe {
-            libc::posix_fadvise(
-                fd,
-                offset as libc::off_t,
-                len as libc::off_t,
-                libc::POSIX_FADV_WILLNEED,
-            );
+        if READS_AHEAD.fetch_add(1, Ordering::AcqRel) >= MAX_READS_AHEAD {
+            READS_AHEAD.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        // Its own, so that the env closing doesn't leave it reading another.
+        // SAFETY: a file LMDB holds open.
+        let fd = unsafe { libc::dup(fd) };
+        if fd < 0 {
+            READS_AHEAD.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        // SAFETY: just made, and only this owns it.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let read = move || {
+            let mut buf = vec![0; READ_AHEAD_CHUNK];
+            let mut at = offset as u64;
+            let end = at + len as u64;
+            while at < end {
+                let want = (end - at).min(READ_AHEAD_CHUNK as u64) as usize;
+                match file.read_at(&mut buf[..want], at) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => at += n as u64,
+                }
+            }
+            READS_AHEAD.fetch_sub(1, Ordering::AcqRel);
+        };
+        if std::thread::Builder::new()
+            .name("read-ahead".into())
+            .spawn(read)
+            .is_err()
+        {
+            READS_AHEAD.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
