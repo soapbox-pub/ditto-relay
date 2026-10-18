@@ -9,6 +9,7 @@ pub mod control;
 pub mod delete;
 pub mod deletions;
 pub mod event;
+pub mod export;
 pub mod facets;
 pub mod filter;
 pub mod hll;

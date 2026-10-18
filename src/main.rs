@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
         } => delete(&config, filter.as_deref(), age, dry_run),
         Command::Deletions { json } => deletions(&config, json),
+        Command::Export { filter } => export(&config, filter.as_deref()),
         Command::Compact {
             from,
             into,
@@ -244,6 +245,44 @@ fn deletions(config: &Config, json: bool) -> anyhow::Result<()> {
         println!("  {}", listed.progress());
     }
     Ok(())
+}
+
+/// `ditto-relay export`: see [`export`].
+fn export(config: &Config, json: Option<&str>) -> anyhow::Result<()> {
+    let store = open_read_only(config)?;
+    let filter = match json {
+        Some(json) => Some(delete::filter(
+            Some(json),
+            None,
+            ditto_relay::event::now(),
+            &store.indexed_tags,
+        )?),
+        None => None,
+    };
+    store.hide_pending()?;
+    let mut said = Instant::now();
+    let progress = |written| {
+        if said.elapsed() >= Duration::from_secs(1) {
+            eprintln!("exported {written} events so far");
+            said = Instant::now();
+        }
+    };
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
+    match ditto_relay::export::export(&store, filter.as_ref(), &mut out, progress) {
+        Ok(written) => {
+            eprintln!("exported {written} events");
+            Ok(())
+        }
+        // Read by something that's had enough, as `head`.
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// `ditto-relay compact`: see [`compact`]. With `--from` and `--into`, the
@@ -562,6 +601,31 @@ nothing stops them from being published again.",
         dry_run: bool,
     },
 
+    /// Write stored events to stdout, as JSON lines
+    #[command(
+        long_about = "Write stored events to stdout, as JSON, an event a \
+line, as clients would see them: not those expired, nor those a pending \
+deletion covers.
+
+They're written in the order they were stored, so that `ditto-relay \
+import`, or another relay, stores them in the order they first were. \
+Without --filter, that's every event, old versions of replaceable events \
+kept as history too. With it, it's what the filter matches, as \
+`ditto-relay delete` would find it: search text and extensions too, and \
+with a `limit`, the events it picks.
+
+It only reads the database, so it's safe to run while the relay runs. \
+How it's going is said on stderr.",
+        after_help = "Examples:
+  ditto-relay export > backup.jsonl
+  ditto-relay export --filter '{\"authors\":[\"<hex pubkey>\"]}' | gzip > alice.jsonl.gz"
+    )]
+    Export {
+        /// Only what this NIP-01 filter matches, as JSON
+        #[arg(long, value_name = "JSON")]
+        filter: Option<String>,
+    },
+
     /// List the deletions queued and not yet done
     #[command(long_about = "List the deletions queued and not yet done, \
 with how far removing each has got: those `ditto-relay delete` asked \
@@ -644,6 +708,11 @@ mod tests {
         assert!(matches!(
             args.command,
             Some(Command::Deletions { json: true })
+        ));
+        let args = parse("export --filter {}").unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Export { filter: Some(_) })
         ));
         let args = parse("check -c a.toml").unwrap();
         assert!(matches!(args.command, Some(Command::Check)) && args.config.is_some());
