@@ -888,7 +888,8 @@ impl Sweep {
     }
 }
 
-fn swept_name(n: usize) -> &'static str {
+/// The name of index table `n` of a sweep.
+pub fn swept_name(n: usize) -> &'static str {
     [
         "ids",
         "created",

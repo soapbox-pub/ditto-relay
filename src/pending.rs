@@ -298,6 +298,124 @@ pub enum Progress {
     Forget { after: Option<u64> },
 }
 
+/// A pending deletion as `ditto-relay deletions` lists it.
+#[derive(Debug, Serialize)]
+pub struct Listed {
+    pub id: u64,
+    /// `filter`, `picked`, `nip09` or `vanish`.
+    pub kind: &'static str,
+    /// What it covers, to say.
+    pub covers: String,
+    /// It covers only events stored under lower sequence numbers.
+    pub watermark: u64,
+    /// How many events it removes, once that's been found.
+    pub events: Option<u64>,
+    #[serde(flatten)]
+    pub stage: Stage,
+    /// How many of `events` the stage is done with.
+    pub done: u64,
+}
+
+/// How far removing what a deletion covers has got.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "stage", rename_all = "lowercase")]
+pub enum Stage {
+    /// What it removes is still to be found.
+    Finding,
+    /// Found, and waiting its turn.
+    Queued,
+    /// Being removed one at a time.
+    Removing,
+    /// Being swept (see [`crate::purge`]): undoing what the events counted
+    /// toward,
+    Undoing,
+    /// sweeping each index table in turn,
+    Sweeping { table: &'static str },
+    /// and removing their records.
+    Forgetting,
+    /// What it covers can't be read, as with a tag no longer indexed.
+    Unreadable,
+}
+
+impl Listed {
+    fn new(pending: &Pending, plan: Option<&RoaringTreemap>, progress: Option<Progress>) -> Listed {
+        let (kind, covers) = match &pending.target {
+            Target::Filter { json, until, .. } => (
+                "filter",
+                match until {
+                    Some(until) => format!("what {json} matches, up to {until}"),
+                    None => format!("what {json} matches"),
+                },
+            ),
+            Target::Seqs(seqs) => ("picked", format!("{} events picked", seqs.len())),
+            Target::Deletion(deletion) => (
+                "nip09",
+                format!(
+                    "a NIP-09 deletion by {} of {} ids and {} addresses",
+                    hex::encode(deletion.author),
+                    deletion.ids.len(),
+                    deletion.addresses.len()
+                ),
+            ),
+            Target::Vanish { author, until } => (
+                "vanish",
+                format!(
+                    "a request to vanish by {}, up to {until}",
+                    hex::encode(author)
+                ),
+            ),
+        };
+        let rank = |after: Option<u64>| match (plan, after) {
+            (Some(plan), Some(after)) => plan.rank(after),
+            _ => 0,
+        };
+        let (stage, done) = match (plan, progress) {
+            (None, _) => (Stage::Finding, 0),
+            (Some(_), None) => (Stage::Queued, 0),
+            (Some(_), Some(Progress::Each { after })) => (Stage::Removing, rank(after)),
+            (Some(_), Some(Progress::Records { after })) => (Stage::Undoing, rank(after)),
+            (Some(_), Some(Progress::Table { table, .. })) => (
+                Stage::Sweeping {
+                    table: crate::purge::swept_name(table),
+                },
+                0,
+            ),
+            (Some(_), Some(Progress::Forget { after })) => (Stage::Forgetting, rank(after)),
+        };
+        Listed {
+            id: pending.id,
+            kind,
+            covers,
+            watermark: pending.watermark,
+            events: plan.map(RoaringTreemap::len),
+            stage,
+            done,
+        }
+    }
+
+    /// How far it's got, to say.
+    pub fn progress(&self) -> String {
+        let events = self.events.unwrap_or(0);
+        match &self.stage {
+            Stage::Finding => "finding what it removes".into(),
+            Stage::Queued => format!("{events} events to remove, waiting its turn"),
+            Stage::Removing => format!("removed {} of {events} events", self.done),
+            Stage::Undoing => format!(
+                "sweeping {events} events: undoing what {} of them counted toward",
+                self.done
+            ),
+            Stage::Sweeping { table } => {
+                format!("sweeping {events} events: walking the {table} index")
+            }
+            Stage::Forgetting => format!(
+                "sweeping {events} events: removed {} of their records",
+                self.done
+            ),
+            Stage::Unreadable => "unreadable: the relay drops it when it starts".into(),
+        }
+    }
+}
+
 /// A filter as kept: as `ditto-relay delete` would take it, with `until`
 /// from its `--age`, if it had one.
 pub fn parse_filter(
@@ -415,25 +533,12 @@ impl Store {
     /// dropped, saying so.
     pub(crate) fn load_pending(&self) -> anyhow::Result<()> {
         let txn = self.read()?;
-        let mut all = Vec::new();
-        let mut cursor = txn.cursor(self.tables.pending)?;
-        let mut entry = cursor.first()?;
-        let mut unreadable = Vec::new();
-        while let Some((key, value)) = entry {
-            if key.len() == 9 && key[8] == SPEC {
-                let id = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
-                match self.parse_spec(&txn, id, value) {
-                    Ok(pending) => all.push(Arc::new(pending)),
-                    Err(err) => {
-                        tracing::error!("dropping pending deletion {id}, unreadable: {err:#}");
-                        unreadable.push(id);
-                    }
-                }
-            }
-            entry = cursor.next()?;
-        }
-        drop(cursor);
+        let (all, unreadable) = self.read_pending(&txn)?;
         drop(txn);
+        for (id, err) in &unreadable {
+            tracing::error!("dropping pending deletion {id}, unreadable: {err:#}");
+        }
+        let unreadable: Vec<u64> = unreadable.into_iter().map(|(id, _)| id).collect();
         if !unreadable.is_empty() {
             let mut txn = self.write()?;
             for id in unreadable {
@@ -446,6 +551,66 @@ impl Store {
         }
         self.hidden.store(Arc::new(Hidden::new(all)));
         Ok(())
+    }
+
+    /// Hide what the pending deletions kept cover, in a store opened [only
+    /// to read](Store::open_read_only), as the relay hides it: the relay
+    /// drops one that's unreadable, and here it's left out.
+    pub fn hide_pending(&self) -> anyhow::Result<()> {
+        let txn = self.read()?;
+        let (all, _) = self.read_pending(&txn)?;
+        self.hidden.store(Arc::new(Hidden::new(all)));
+        Ok(())
+    }
+
+    /// The pending deletions kept, oldest first, and the ids of those that
+    /// can't be read, with why.
+    #[allow(clippy::type_complexity)]
+    fn read_pending(
+        &self,
+        txn: &Txn,
+    ) -> anyhow::Result<(Vec<Arc<Pending>>, Vec<(u64, anyhow::Error)>)> {
+        let mut all = Vec::new();
+        let mut unreadable = Vec::new();
+        let mut cursor = txn.cursor(self.tables.pending)?;
+        let mut entry = cursor.first()?;
+        while let Some((key, value)) = entry {
+            if key.len() == 9 && key[8] == SPEC {
+                let id = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
+                match self.parse_spec(txn, id, value) {
+                    Ok(pending) => all.push(Arc::new(pending)),
+                    Err(err) => unreadable.push((id, err)),
+                }
+            }
+            entry = cursor.next()?;
+        }
+        Ok((all, unreadable))
+    }
+
+    /// The pending deletions kept, oldest first, and how far each has got,
+    /// for `ditto-relay deletions`.
+    pub fn list_pending(&self) -> anyhow::Result<Vec<Listed>> {
+        let txn = self.read()?;
+        let (all, unreadable) = self.read_pending(&txn)?;
+        let mut listed = Vec::new();
+        for pending in all {
+            let plan = self.plan_of(&txn, pending.id)?;
+            let progress = self.progress_of(&txn, pending.id)?;
+            listed.push(Listed::new(&pending, plan.as_ref(), progress));
+        }
+        for (id, err) in unreadable {
+            listed.push(Listed {
+                id,
+                kind: "unreadable",
+                covers: format!("{err:#}"),
+                watermark: 0,
+                events: None,
+                stage: Stage::Unreadable,
+                done: 0,
+            });
+        }
+        listed.sort_by_key(|listed| listed.id);
+        Ok(listed)
     }
 
     fn parse_spec(&self, txn: &Txn, id: u64, value: &[u8]) -> anyhow::Result<Pending> {
@@ -603,6 +768,76 @@ mod tests {
         queue(&store, json!({"kinds": [1], "limit": 2}));
         store_only(&store, &signed(1, 400, 1, vec![], "x"));
         assert_eq!(found(&store, json!({"kinds": [1]})), [4, 1]);
+    }
+
+    /// Listed, with how far each has got, from a store opened only to
+    /// read, as `ditto-relay deletions` does beside the relay; which hides
+    /// what they cover once asked to.
+    #[test]
+    fn lists_what_is_pending() {
+        let (dir, store) = open();
+        for at in [100, 200, 300] {
+            put(&store, &signed(1, at, 1, vec![vec!["t", "spam"]], "x"));
+        }
+        let filter = queue(&store, json!({"#t": ["spam"]}));
+        let picked = queue(&store, json!({"kinds": [1], "limit": 2}));
+        let read_only = || {
+            Store::open_read_only(
+                dir.path(),
+                1 << 30,
+                test_tags(),
+                crate::store::History::new(true, vec![], 20),
+                None,
+                crate::rank::Rank::default(),
+            )
+            .unwrap()
+        };
+        let listed = read_only().list_pending().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            (
+                listed[0].id,
+                listed[0].kind,
+                &listed[0].stage,
+                listed[0].events
+            ),
+            (filter.id, "filter", &Stage::Finding, None)
+        );
+        assert_eq!(listed[0].covers, r##"what {"#t":["spam"]} matches"##);
+        assert_eq!(
+            (listed[1].kind, &listed[1].stage, listed[1].events),
+            ("picked", &Stage::Queued, Some(2))
+        );
+
+        let mut txn = store.write().unwrap();
+        let plan: RoaringTreemap = [1, 2, 3].into_iter().collect();
+        store.put_plan(&mut txn, filter.id, &plan).unwrap();
+        let after = Some(2);
+        store
+            .put_progress(&mut txn, filter.id, &Progress::Each { after })
+            .unwrap();
+        let table = Progress::Table { table: 5, at: None };
+        store.put_progress(&mut txn, picked.id, &table).unwrap();
+        txn.commit().unwrap();
+        let listed = read_only().list_pending().unwrap();
+        assert_eq!(listed[0].progress(), "removed 2 of 3 events");
+        assert_eq!(
+            listed[1].progress(),
+            "sweeping 2 events: walking the tags index"
+        );
+        let json = serde_json::to_value(&listed[1]).unwrap();
+        assert_eq!(
+            (&json["stage"], &json["table"]),
+            (&json!("sweeping"), &json!("tags"))
+        );
+
+        let read_only = read_only();
+        let txn = read_only.read().unwrap();
+        assert!(read_only.load(&txn, 1).unwrap().is_some());
+        drop(txn);
+        read_only.hide_pending().unwrap();
+        let txn = read_only.read().unwrap();
+        assert!(read_only.load(&txn, 1).unwrap().is_none());
     }
 
     /// Queued in a write that doesn't commit, nothing's hidden.

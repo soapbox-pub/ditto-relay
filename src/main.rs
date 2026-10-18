@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
             age,
             dry_run,
         } => delete(&config, filter.as_deref(), age, dry_run),
+        Command::Deletions { json } => deletions(&config, json),
         Command::Compact {
             from,
             into,
@@ -68,6 +69,26 @@ fn open_store(config: &Config) -> anyhow::Result<Store> {
     )?;
     tracing::info!("opened LMDB at {}", config.db_path.display());
     Ok(store)
+}
+
+/// Open the store only to read, as it is, whether or not the relay is
+/// running: see [`Store::open_read_only`].
+fn open_read_only(config: &Config) -> anyhow::Result<Store> {
+    if !config.db_path.join("data.mdb").exists() {
+        bail!(
+            "there's no database in {} yet: the relay makes it when it first starts",
+            config.db_path.display()
+        );
+    }
+    let (indexed_tags, history, wot, rank) = store_settings(config)?;
+    Store::open_read_only(
+        &config.db_path,
+        config.map_size,
+        indexed_tags,
+        history,
+        wot,
+        rank,
+    )
 }
 
 /// What the store is opened with.
@@ -158,18 +179,11 @@ fn delete(
     age: Option<u64>,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let (indexed_tags, history, wot, rank) = store_settings(config)?;
+    let indexed_tags = IndexedTags::new(config.indexed_tags.clone())?;
     // Checked here, so a mistake is told before anything's asked.
     let filter = delete::filter(json, age, ditto_relay::event::now(), &indexed_tags)?;
     if dry_run {
-        let store = Store::open_read_only(
-            &config.db_path,
-            config.map_size,
-            indexed_tags,
-            history,
-            wot,
-            rank,
-        )?;
+        let store = open_read_only(config)?;
         println!("would delete {} events", delete::count(&store, &filter)?);
         return Ok(());
     }
@@ -211,6 +225,24 @@ fn delete(
     )?;
     store.checkpoint()?;
     println!("deleted {deleted} events");
+    Ok(())
+}
+
+/// `ditto-relay deletions`: what's pending, as kept, which the relay
+/// commits as it goes, so that it's read as well with the relay running.
+fn deletions(config: &Config, json: bool) -> anyhow::Result<()> {
+    let listed = open_read_only(config)?.list_pending()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&listed)?);
+        return Ok(());
+    }
+    if listed.is_empty() {
+        println!("no deletions pending");
+    }
+    for listed in listed {
+        println!("{}: {}", listed.id, listed.covers);
+        println!("  {}", listed.progress());
+    }
     Ok(())
 }
 
@@ -505,7 +537,8 @@ with.
 
 While the relay runs, `delete` returns as soon as the relay has queued \
 the deletion. From then on no client sees what it matches, and the relay \
-removes it in the background, saying how it goes in its log. With the relay stopped, `delete` removes the \
+removes it in the background, saying how it goes in its log and in \
+`ditto-relay deletions`. With the relay stopped, `delete` removes the \
 events itself, there and then, and a relay started meanwhile waits for \
 it.
 
@@ -527,6 +560,19 @@ nothing stops them from being published again.",
         /// holds up the relay
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// List the deletions queued and not yet done
+    #[command(long_about = "List the deletions queued and not yet done, \
+with how far removing each has got: those `ditto-relay delete` asked \
+for, NIP-09 deletions, and NIP-62 requests to vanish.
+
+What a queued deletion covers is hidden from clients already. This only \
+reads the database, so it's safe to run while the relay runs.")]
+    Deletions {
+        /// Print them as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Compact the database, with the relay stopped
@@ -594,6 +640,11 @@ mod tests {
         assert_eq!(args.config, Some(PathBuf::from("a.toml")));
         let args = parse("serve").unwrap();
         assert!(matches!(args.command, Some(Command::Serve)));
+        let args = parse("deletions --json").unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Deletions { json: true })
+        ));
         let args = parse("check -c a.toml").unwrap();
         assert!(matches!(args.command, Some(Command::Check)) && args.config.is_some());
 
