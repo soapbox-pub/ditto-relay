@@ -374,10 +374,21 @@ impl Purger {
         self.sync(store)?;
         self.plan_next(store)?;
         // One at a time first: they're small, and a sweep can take an hour.
+        // The fewest left first, so a NIP-09 deletion of a note or two never
+        // waits on a deletion of a hundred thousand events one at a time.
         let each = self
             .jobs
             .iter()
-            .position(|job| matches!(job.work, Work::Each { .. }));
+            .enumerate()
+            .filter_map(|(i, job)| match &job.work {
+                Work::Each { plan, after } => {
+                    let done = after.map_or(0, |after| plan.rank(after));
+                    Some((plan.len() - done, i))
+                }
+                _ => None,
+            })
+            .min()
+            .map(|(_, i)| i);
         let sweep = || {
             self.jobs.iter().position(|job| match &job.work {
                 Work::Sweep(sweep) => sweep.is_started(),
@@ -1294,6 +1305,26 @@ mod tests {
         assert!(purger.jobs.iter().all(|job| job.pending.id == ids[0]));
         assert_eq!(purger.finished.len(), 1);
         assert_eq!(purger.finished[0].1, ids[1]);
+    }
+
+    /// Of the deletions removed one at a time, the one with the fewest
+    /// events left goes first, however long the others have waited.
+    #[test]
+    fn removes_the_smallest_first() {
+        let events = events(60);
+        let big = json!({"kinds": [1], "limit": 30});
+        let small = json!({"kinds": [7], "limit": 1});
+        let (_dir, store) = store_with(&events, &[big, small]);
+        let ids: Vec<u64> = store.pending().iter().map(|pending| pending.id).collect();
+        let mut purger = Purger::new(&store, None, false).unwrap();
+        purger.chunk = 1;
+        while purger.finished.is_empty() {
+            assert!(purger.work(&store, &|_| {}).unwrap());
+            purger.chunk = 1;
+        }
+        assert_eq!(purger.finished[0].1, ids[1]);
+        assert_eq!(purger.jobs.len(), 1);
+        assert_eq!(purger.jobs[0].removed, 0);
     }
 
     /// However often the writer writes, a chunk waits only as long as the
