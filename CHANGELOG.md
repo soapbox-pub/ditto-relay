@@ -4,7 +4,7 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
-## [Unreleased]
+## [2.4.0]
 
 - A better command line. Every command and option has help: `-h` for a
   summary, `--help` or `ditto-relay help <command>` for the whole story, with
