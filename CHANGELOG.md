@@ -4,7 +4,7 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
-## [Unreleased]
+## [2.5.0]
 
 - A slow deletion no longer holds up the rest. What a deletion removes was
   found one at a time, oldest first, so a deletion by search, which can take
