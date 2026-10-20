@@ -11,6 +11,13 @@
 //! to vanish's, are found on threads of their own (see [`Lane`]), so that a
 //! search of every event's text holds up no other deletion.
 //!
+//! NIP-09 deletions are taken together. What each removes is a lookup of
+//! its ids and addresses, so a chunk finds and removes as many as fit,
+//! oldest first, in one transaction, and drops them, keeping no plan: one
+//! cut short is found again, whole. They and the rest take chunks by
+//! turns, so a stream of them holds up no other deletion. One that removes
+//! more than [`MAX_CHUNK`] events is kept a plan, as the rest are.
+//!
 //! A plan of fewer than [`SWEEP_AT`] events is removed an event at a time,
 //! as removing always was: each event out of the twenty or so index entries
 //! it's filed under, a page of each table wherever its keys fall. A bigger
@@ -38,7 +45,7 @@
 //! with nothing to store, it deletes flat out. Once a deletion is done, what
 //! it covered stays hidden for [`GRACE`], for readers that began before.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -50,7 +57,7 @@ use crate::compact::TableAhead;
 use crate::event::KindClass;
 use crate::filter::Filter;
 use crate::lmdb::{Db, DbFlags, Result, RwTxn, Txn};
-use crate::pending::{Pending, Progress, Target};
+use crate::pending::{Pending, Progress, Target, counted};
 use crate::query;
 use crate::record::EventView;
 use crate::store::{EXPIRING, STAMP_LEN, Store, Written, address_of, stamp, stamp_seq};
@@ -194,6 +201,11 @@ pub struct Purger {
     sweep_at: u64,
     /// In tests, how many index entries each chunk of a sweep visits.
     fixed_chunk: Option<usize>,
+    /// Whether the next chunk is the NIP-09 deletions' turn.
+    nip09_turn: bool,
+    /// How many events make a NIP-09 deletion kept a plan: [`MAX_CHUNK`],
+    /// but in tests.
+    nip09_at: u64,
 }
 
 /// A plan being found on a thread of its own.
@@ -207,8 +219,8 @@ struct Planning {
 /// thread of its own, oldest first, one at a time of each lane. A filter's
 /// may take hours, as a search of every event's text does, and a request to
 /// vanish's reads all its author published; neither waits on the other.
-/// The rest, NIP-09 deletions and events already picked, are a lookup or
-/// two each, found then and there, never waiting on either.
+/// The rest are never waiting on either: events already picked are found
+/// then and there, and NIP-09 deletions are found and removed together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
     Filter,
@@ -232,6 +244,14 @@ struct Job {
     /// How many events it's removed, here.
     removed: u64,
     began: Instant,
+}
+
+impl Job {
+    /// Whether it's a NIP-09 deletion to be taken with the others, as one
+    /// is unless it's been kept a plan.
+    fn is_nip09(&self) -> bool {
+        matches!(self.work, Work::Unplanned) && matches!(self.pending.target, Target::Deletion(_))
+    }
 }
 
 enum Work {
@@ -268,6 +288,8 @@ impl Purger {
             total: 0,
             sweep_at: SWEEP_AT,
             fixed_chunk: None,
+            nip09_turn: true,
+            nip09_at: MAX_CHUNK as u64,
         };
         purger.sync(store)?;
         Ok(purger)
@@ -374,8 +396,8 @@ impl Purger {
         self.sync(store)?;
         self.plan_next(store)?;
         // One at a time first: they're small, and a sweep can take an hour.
-        // The fewest left first, so a NIP-09 deletion of a note or two never
-        // waits on a deletion of a hundred thousand events one at a time.
+        // The fewest left first, so a deletion of a few events never waits
+        // on a deletion of a hundred thousand events one at a time.
         let each = self
             .jobs
             .iter()
@@ -400,12 +422,48 @@ impl Purger {
                 .iter()
                 .position(|job| matches!(job.work, Work::Sweep(_)))
         };
-        let Some(i) = each.or_else(sweep).or_else(first_sweep) else {
+        let other = each.or_else(sweep).or_else(first_sweep);
+        let nip09 = self.jobs.iter().any(Job::is_nip09);
+        if nip09 && (self.nip09_turn || other.is_none()) {
+            self.nip09_turn = false;
+            let start = Instant::now();
+            self.nip09_chunk(store, tell)?;
+            self.timed(start, false);
+            return Ok(true);
+        }
+        self.nip09_turn = true;
+        let Some(i) = other else {
             return Ok(!self.planning.is_empty() || !self.jobs.is_empty());
         };
         let start = Instant::now();
         let sweeping = matches!(self.jobs[i].work, Work::Sweep(_));
         let done = self.chunk_of(store, i, tell)?;
+        self.timed(start, sweeping);
+        let job = &self.jobs[i];
+        if done {
+            tracing::info!(
+                "{}: removed {} events in {:.0?}",
+                job.pending.describe(),
+                job.removed,
+                job.began.elapsed()
+            );
+            let job = self.jobs.remove(i);
+            self.finished
+                .push_back((Instant::now() + self.grace(), job.pending.id));
+        } else if self.said.elapsed() >= SAY_EVERY {
+            let how = match &job.work {
+                Work::Sweep(sweep) => sweep.progress_text(),
+                _ => format!("{} events removed so far", job.removed),
+            };
+            tracing::info!("{}: {how}", job.pending.describe());
+            self.said = Instant::now();
+        }
+        Ok(true)
+    }
+
+    /// Note how long a chunk begun at `start` took, sizing the next one
+    /// by it.
+    fn timed(&mut self, start: Instant, sweeping: bool) {
         self.took = start.elapsed();
         match sweeping {
             true => self.sweep_chunk = next_chunk(self.sweep_chunk, self.took, MAX_SWEEP_CHUNK),
@@ -417,30 +475,78 @@ impl Purger {
         // Only once something's written: see `wrote`.
         self.ended = Instant::now();
         self.resume = self.ended;
-        let job = &self.jobs[i];
-        if done {
-            tracing::info!(
-                "{}: removed {} events in {:.0?}",
-                job.pending.describe(),
-                job.removed,
-                job.began.elapsed()
-            );
-            let job = self.jobs.remove(i);
-            let grace = match self.aside {
-                true => GRACE,
-                false => Duration::ZERO,
-            };
-            self.finished
-                .push_back((Instant::now() + grace, job.pending.id));
-        } else if self.said.elapsed() >= SAY_EVERY {
-            let how = match &job.work {
-                Work::Sweep(sweep) => sweep.progress_text(),
-                _ => format!("{} events removed so far", job.removed),
-            };
-            tracing::info!("{}: {how}", job.pending.describe());
-            self.said = Instant::now();
+    }
+
+    /// How long what a deletion covered stays hidden once it's gone.
+    fn grace(&self) -> Duration {
+        match self.aside {
+            true => GRACE,
+            false => Duration::ZERO,
         }
-        Ok(true)
+    }
+
+    /// Find and remove what the NIP-09 deletions waiting remove, oldest
+    /// first, as many as fit a chunk, and drop them, in one transaction.
+    /// The first, if it removes more than [`MAX_CHUNK`] events, is kept a
+    /// plan instead, and removed as the rest are.
+    fn nip09_chunk(&mut self, store: &Store, tell: &impl Fn(Written)) -> anyhow::Result<()> {
+        let now = crate::event::now();
+        let mut removed = Vec::new();
+        let mut done = HashSet::new();
+        let mut big = None;
+        let mut count = 0;
+        // A lookup each, and the events each removes.
+        let mut cost = 0;
+        let mut txn = store.write()?;
+        let outcome = (|| -> anyhow::Result<()> {
+            for job in self.jobs.iter().filter(|job| job.is_nip09()) {
+                let Target::Deletion(deletion) = &job.pending.target else {
+                    continue;
+                };
+                if cost >= self.chunk {
+                    break;
+                }
+                let plan = store.deleting(&txn, deletion, job.pending.watermark)?;
+                if plan.len() > self.nip09_at {
+                    if done.is_empty() {
+                        big = Some((job.pending.id, plan));
+                    }
+                    break;
+                }
+                for seq in &plan {
+                    count += u64::from(store.remove_version(&mut txn, seq, now, &mut removed)?);
+                }
+                store.drop_pending(&mut txn, job.pending.id)?;
+                cost += 1 + plan.len() as usize;
+                done.insert(job.pending.id);
+            }
+            Ok(())
+        })();
+        if let (Ok(()), Some((id, plan))) = (&outcome, big) {
+            drop(txn);
+            return self.planned(store, id, Ok(plan));
+        }
+        if let Err(err) = outcome.and_then(|()| Ok(txn.commit()?)) {
+            store.forget_uncommitted();
+            return Err(err);
+        }
+        store.committed_queued();
+        self.total += count;
+        let finish = Instant::now() + self.grace();
+        self.jobs.retain(|job| !done.contains(&job.pending.id));
+        // Oldest first, as the rest are.
+        let mut done: Vec<u64> = done.into_iter().collect();
+        done.sort_unstable();
+        self.finished.extend(done.iter().map(|&id| (finish, id)));
+        tracing::info!(
+            "{}: removed {}",
+            counted(done.len(), "NIP-09 deletion", "NIP-09 deletions"),
+            counted(count as usize, "event", "events")
+        );
+        if !removed.is_empty() {
+            tell((Vec::new(), removed));
+        }
+        Ok(())
     }
 
     /// Cancel deletion `id`: what it's removed stays removed, and what it
@@ -507,7 +613,9 @@ impl Purger {
             .jobs
             .iter()
             .filter(|job| {
-                matches!(job.work, Work::Unplanned) && Lane::of(&job.pending.target).is_none()
+                matches!(job.work, Work::Unplanned)
+                    && Lane::of(&job.pending.target).is_none()
+                    && !job.is_nip09()
             })
             .map(|job| job.pending.clone())
             .collect();
@@ -1365,6 +1473,138 @@ mod tests {
         assert_eq!(purger.finished[0].1, ids[1]);
         assert_eq!(purger.jobs.len(), 1);
         assert_eq!(purger.jobs[0].removed, 0);
+    }
+
+    /// A store of a note by each of `notes` authors, each deleted by its
+    /// author, and `missing` NIP-09 deletions of events it doesn't have,
+    /// all queued and none carried out.
+    fn with_nip09(notes: u8, missing: u8) -> (tempfile::TempDir, Store, Vec<Event>) {
+        let (dir, store) = open();
+        let notes: Vec<Event> = (1..=notes)
+            .map(|seed| signed(seed, 100, 1, vec![], "note"))
+            .collect();
+        for note in &notes {
+            put(&store, note);
+        }
+        let mut deletions: Vec<Event> = notes
+            .iter()
+            .enumerate()
+            .map(|(n, note)| signed(n as u8 + 1, 200, 5, vec![vec!["e", &note.id]], ""))
+            .collect();
+        for n in 0..missing {
+            let id = format!("{n:064x}");
+            deletions.push(signed(1, 200, 5, vec![vec!["e", &id]], ""));
+        }
+        for deletion in &deletions {
+            let record = crate::record::encode(deletion);
+            store.write_batch([record.as_slice()], 0).unwrap();
+        }
+        (dir, store, notes)
+    }
+
+    /// NIP-09 deletions are found and removed together, in a chunk, those
+    /// of what's not stored too, and after a restart, with nothing kept but
+    /// what they name.
+    #[test]
+    fn takes_nip09_deletions_together() {
+        let (dir, store, notes) = with_nip09(10, 5);
+        assert_eq!(store.pending().len(), 15);
+        drop(store);
+        let store = open_in(dir.path());
+        let mut purger = Purger::new(&store, None, false).unwrap();
+        assert!(purger.work(&store, &|_| {}).unwrap());
+        assert!(purger.jobs.is_empty());
+        assert_eq!(purger.finished.len(), 15);
+        assert_eq!(purger.total, 10);
+        assert!(store.list_pending().unwrap().is_empty());
+        let txn = store.read().unwrap();
+        for note in &notes {
+            let id = crate::event::decode_hex::<32>(&note.id).unwrap();
+            assert!(store.seq_of(&txn, &id).unwrap().is_none());
+        }
+    }
+
+    /// NIP-09 deletions and the rest take chunks by turns, so however many
+    /// come, a deletion removed one at a time goes on.
+    #[test]
+    fn nip09_deletions_and_the_rest_take_turns() {
+        let picked = json!({"kinds": [1], "limit": 30});
+        let (_dir, store) = store_with(&events(60), &[picked]);
+        let big = store.pending()[0].clone();
+        for n in 0..5u8 {
+            let id = format!("{n:064x}");
+            let deletion = signed(1, 200, 5, vec![vec!["e", &id]], "");
+            store
+                .write_batch([crate::record::encode(&deletion).as_slice()], 0)
+                .unwrap();
+        }
+        let mut purger = Purger::new(&store, None, false).unwrap();
+        let mut left = Vec::new();
+        for _ in 0..4 {
+            // One NIP-09 deletion a chunk, or one event of the rest.
+            purger.chunk = 1;
+            assert!(purger.work(&store, &|_| {}).unwrap());
+            let nip09 = purger.jobs.iter().filter(|job| job.is_nip09()).count();
+            let job = purger.jobs.iter().find(|job| job.pending.id == big.id);
+            left.push((nip09, job.unwrap().removed));
+        }
+        assert_eq!(left, [(4, 0), (4, 1), (3, 1), (3, 2)]);
+    }
+
+    /// A NIP-09 deletion of more than a chunk's events is kept a plan, and
+    /// removed as the rest are.
+    #[test]
+    fn keeps_a_big_nip09_deletion_a_plan() {
+        let (_dir, store) = open();
+        let notes: Vec<Event> = (0..3)
+            .map(|n| signed(1, 100 + n, 1, vec![], "note"))
+            .collect();
+        for note in &notes {
+            put(&store, note);
+        }
+        let tags = notes
+            .iter()
+            .map(|note| vec!["e", note.id.as_str()])
+            .collect();
+        let deletion = signed(1, 200, 5, tags, "");
+        store
+            .write_batch([crate::record::encode(&deletion).as_slice()], 0)
+            .unwrap();
+        let mut purger = Purger::new(&store, None, false).unwrap();
+        purger.nip09_at = 2;
+        assert!(purger.work(&store, &|_| {}).unwrap());
+        assert!(matches!(purger.jobs[0].work, Work::Each { .. }));
+        let listed = store.list_pending().unwrap();
+        assert_eq!(listed[0].events, Some(3));
+        assert_eq!(
+            listed[0].covers,
+            format!(
+                "a NIP-09 deletion by {} of 3 ids and 0 addresses",
+                notes[0].pubkey
+            )
+        );
+        while purger.work(&store, &|_| {}).unwrap() {}
+        assert_eq!(purger.total, 3);
+        assert!(store.list_pending().unwrap().is_empty());
+    }
+
+    /// A NIP-09 deletion waiting its turn can be cancelled, showing what it
+    /// covers again.
+    #[test]
+    fn cancels_a_nip09_deletion() {
+        let (_dir, store, notes) = with_nip09(2, 0);
+        let ids: Vec<u64> = store.pending().iter().map(|pending| pending.id).collect();
+        let listed = store.list_pending().unwrap();
+        assert_eq!(listed[0].progress(), "waiting its turn");
+        assert!(listed[0].covers.ends_with(" of 1 id and 0 addresses"));
+        let mut purger = Purger::new(&store, None, false).unwrap();
+        purger.cancel(&store, ids[0]).unwrap();
+        while purger.work(&store, &|_| {}).unwrap() {}
+        assert_eq!(purger.total, 1);
+        let txn = store.read().unwrap();
+        let id = crate::event::decode_hex::<32>(&notes[0].id).unwrap();
+        let seq = store.seq_of(&txn, &id).unwrap().unwrap();
+        assert!(store.load(&txn, seq).unwrap().is_some());
     }
 
     /// Cancelled partway, what a deletion removed stays removed, the rest

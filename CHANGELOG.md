@@ -4,6 +4,17 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [2.5.1]
+
+- NIP-09 deletions are removed together. Each was found, then removed, in
+  transactions of its own, one a chunk, so a relay sent them faster than a
+  chunk a write fell behind, however few events they named; most name
+  events it doesn't have. Now a chunk finds and removes as many as fit, in
+  one transaction. They take turns with the other deletions, which a stream
+  of them used to hold up, since the smallest went first.
+- `ditto-relay deletions` says a NIP-09 deletion is waiting its turn, and
+  counts its ids and addresses in the singular when there's one.
+
 ## [2.5.0]
 
 - A slow deletion no longer holds up the rest. What a deletion removes was

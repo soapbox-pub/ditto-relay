@@ -322,7 +322,8 @@ pub struct Listed {
 pub enum Stage {
     /// What it removes is still to be found.
     Finding,
-    /// Found, and waiting its turn.
+    /// Found, and waiting its turn; or a NIP-09 deletion's, found as it's
+    /// removed.
     Queued,
     /// Being removed one at a time.
     Removing,
@@ -351,10 +352,10 @@ impl Listed {
             Target::Deletion(deletion) => (
                 "nip09",
                 format!(
-                    "a NIP-09 deletion by {} of {} ids and {} addresses",
+                    "a NIP-09 deletion by {} of {} and {}",
                     hex::encode(deletion.author),
-                    deletion.ids.len(),
-                    deletion.addresses.len()
+                    counted(deletion.ids.len(), "id", "ids"),
+                    counted(deletion.addresses.len(), "address", "addresses")
                 ),
             ),
             Target::Vanish { author, until } => (
@@ -369,7 +370,10 @@ impl Listed {
             (Some(plan), Some(after)) => plan.rank(after),
             _ => 0,
         };
+        let nip09 = matches!(pending.target, Target::Deletion(_));
         let (stage, done) = match (plan, progress) {
+            // Found as it's removed, with the others.
+            (None, _) if nip09 => (Stage::Queued, 0),
             (None, _) => (Stage::Finding, 0),
             (Some(_), None) => (Stage::Queued, 0),
             (Some(_), Some(Progress::Each { after })) => (Stage::Removing, rank(after)),
@@ -398,6 +402,7 @@ impl Listed {
         let events = self.events.unwrap_or(0);
         match &self.stage {
             Stage::Finding => "finding what it removes".into(),
+            Stage::Queued if self.events.is_none() => "waiting its turn".into(),
             Stage::Queued => format!("{events} events to remove, waiting its turn"),
             Stage::Removing => format!("removed {} of {events} events", self.done),
             Stage::Undoing => format!(
@@ -413,6 +418,14 @@ impl Listed {
             ),
             Stage::Unreadable => "unreadable: the relay drops it when it starts".into(),
         }
+    }
+}
+
+/// `n` of something, `one` or `many` of them.
+pub(crate) fn counted(n: usize, one: &str, many: &str) -> String {
+    match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
     }
 }
 
