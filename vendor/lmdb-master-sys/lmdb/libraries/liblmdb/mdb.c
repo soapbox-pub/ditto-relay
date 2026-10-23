@@ -2517,7 +2517,13 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 #else
 	enum { Paranoid = 0, Max_retries = INT_MAX /*infinite*/ };
 #endif
-	int rc, retry = num * 60;
+	/* ditto-relay: a run of pages is looked for once, in what's already
+	 * loaded, then taken from the end of the map. Upstream merged up to
+	 * num*60 more freeDB records looking for one, rescanning me_pghead
+	 * after each: in a big, fragmented freelist that took tens of seconds
+	 * per overflow page, and grew me_pghead without bound.
+	 */
+	int rc, retry = num > 1 ? 0 : num * 60;
 	MDB_txn *txn = mc->mc_txn;
 	MDB_env *env = txn->mt_env;
 	pgno_t pgno, *mop = env->me_pghead;

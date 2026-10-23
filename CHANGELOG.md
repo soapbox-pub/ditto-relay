@@ -14,6 +14,13 @@ it is tagged.
   of them used to hold up, since the smallest went first.
 - `ditto-relay deletions` says a NIP-09 deletion is waiting its turn, and
   counts its ids and addresses in the singular when there's one.
+- Writes no longer stall for tens of seconds once many events have been
+  deleted. Storing an event too big for a page, LMDB looked for a run of
+  free pages by loading up to 60 more records of its freelist a page,
+  scanning all it held after each; in a freelist of scattered single pages,
+  as deleting leaves, it never found one, and every write waited. It now
+  looks once in what it has loaded, then takes pages from the end of the
+  file. LMDB is built from a copy in `vendor/` for this.
 
 ## [2.5.0]
 

@@ -118,6 +118,13 @@ tor-rtmock               = { git = "https://git.shakespeare.diy/npub1q3sle0kvfse
 tor-socksproto           = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
 tor-units                = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
 web-time-compat          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfsehgsuexttt3ugjd8xdklxfwwkh559wxckmzddywnws6cd26p/arti.git", branch = "soapbox-v2.7.0" }
+# lmdb-master-sys 0.2.6 as published, but for mdb_page_alloc: a value that
+# needs a run of overflow pages takes them from the end of the map when the
+# freelist already loaded has none, rather than merging up to 60 freeDB
+# records a page looking for one. In a fragmented freelist that took tens of
+# seconds a record, holding up every write. See the ditto-relay comment in
+# its mdb.c.
+lmdb-master-sys          = { path = "vendor/lmdb-master-sys" }
 
 [dev-dependencies]
 rand = "0.10.3"
