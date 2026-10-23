@@ -88,7 +88,8 @@ async fn main() -> anyhow::Result<()> {
             from,
             into,
             threads,
-        } => compact(&config, from, into, threads),
+            bodies,
+        } => compact(&config, from, into, threads, bodies),
     }
 }
 
@@ -517,12 +518,13 @@ fn say_imported(tally: &Tally) {
 /// `ditto-relay compact`: see [`compact`]. With `--from` and `--into`, the
 /// database in `--from` (stopped, or a snapshot) is copied into `--into`,
 /// and nothing else is done. Else the relay's own database is compacted in
-/// place, with no relay running.
+/// place, with no relay running, and with `bodies`, its event records too.
 fn compact(
     config: &Config,
     from: Option<PathBuf>,
     into: Option<PathBuf>,
     threads: usize,
+    bodies: bool,
 ) -> anyhow::Result<()> {
     let mut progress = |p: &compact::Progress| {
         let left = match p.done {
@@ -558,7 +560,7 @@ fn compact(
             let store = open_store(config)?;
             store.checkpoint()?;
             drop(store);
-            let copied = compact::in_place(db, config.map_size, threads, &mut progress)?;
+            let copied = compact::in_place(db, config.map_size, threads, bodies, &mut progress)?;
             let mut old = vec![db.join(compact::OLD_FILE)];
             match copied.bodies {
                 compact::Bodies::Left => {}
@@ -566,6 +568,14 @@ fn compact(
                     println!(
                         "wrote bodies anew, in smaller records: {:.1} GB in {took:.0?}",
                         bytes as f64 / 1e9
+                    );
+                    old.push(db.join(BODIES_DIR).join(compact::OLD_FILE));
+                }
+                compact::Bodies::Compacted(before, after, took) => {
+                    println!(
+                        "compacted bodies, {:.1} GB into {:.1} GB in {took:.0?}",
+                        before as f64 / 1e9,
+                        after as f64 / 1e9
                     );
                     old.push(db.join(BODIES_DIR).join(compact::OLD_FILE));
                 }
@@ -959,7 +969,12 @@ the relay reads the disk more. Compacting needs the relay stopped, and \
 room for the new file, about the size of what's live. The old file is \
 kept beside it, as db/data.mdb.old: remove it once the relay runs well \
 on the new one. Event records are left as they are, unless a file \
-written anew would suit ZFS better.
+written anew would suit ZFS better, or --bodies is given.
+
+With --bodies, event records (db/bodies) are compacted too, their old \
+file kept as db/bodies/data.mdb.old. Deleting many events fragments \
+them: what's freed is scattered single pages, which records bigger than \
+a page can't use.
 
 With --from and --into, it only copies the database in --from, which \
 must be stopped or a snapshot, into --into, to see how long it takes.",
@@ -978,6 +993,9 @@ must be stopped or a snapshot, into --into, to see how long it takes.",
         /// How many threads read ahead
         #[arg(long, value_name = "N", default_value_t = COMPACT_THREADS)]
         threads: usize,
+        /// Compact the event records too
+        #[arg(long, conflicts_with = "from")]
+        bodies: bool,
     },
 }
 
@@ -1095,6 +1113,7 @@ mod tests {
             from,
             into,
             threads,
+            bodies,
         }) = parse("compact --from /a --into=/b --threads 8")
             .unwrap()
             .command
@@ -1102,13 +1121,22 @@ mod tests {
             panic!("not compact");
         };
         assert_eq!(
-            (from, into, threads),
-            (Some("/a".into()), Some("/b".into()), 8)
+            (from, into, threads, bodies),
+            (Some("/a".into()), Some("/b".into()), 8, false)
         );
-        let Some(Command::Compact { threads, .. }) = parse("compact").unwrap().command else {
+        let Some(Command::Compact {
+            threads, bodies, ..
+        }) = parse("compact").unwrap().command
+        else {
             panic!("not compact");
         };
-        assert_eq!(threads, COMPACT_THREADS);
+        assert_eq!((threads, bodies), (COMPACT_THREADS, false));
+        let Some(Command::Compact { bodies, .. }) = parse("compact --bodies").unwrap().command
+        else {
+            panic!("not compact");
+        };
+        assert!(bodies);
+        assert!(parse("compact --bodies --from /a --into /b").is_err());
 
         for bad in [
             "--dry-run",

@@ -21,6 +21,10 @@ it is tagged.
   as deleting leaves, it never found one, and every write waited. It now
   looks once in what it has loaded, then takes pages from the end of the
   file. LMDB is built from a copy in `vendor/` for this.
+- `ditto-relay compact --bodies` compacts the event records too, as it does
+  the indexes, keeping the old file as `db/bodies/data.mdb.old`. Deleting
+  many events fragments them, and a file written anew, as `compact` wrote
+  them for ZFS, kept the fragments as they were.
 
 ## [2.5.0]
 

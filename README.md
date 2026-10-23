@@ -200,6 +200,11 @@ as `db/data.mdb.old`: remove it once the relay runs well on the new one. Event r
 unless a file written anew would suit ZFS better (see below). Then they're copied as
 they are, and the old file is kept as `db/bodies/data.mdb.old`.
 
+`compact --bodies` compacts the event records too, keeping their old file the same
+way. Deleting many events fragments them: what's freed is single pages scattered
+through the file, which a record bigger than a page can't use, so the file grows
+while its freelist piles up.
+
 It reads with 32 threads at once, as the live pages of a big file are scattered, and
 waiting on them one at a time is what makes `mdb_copy -c` slow. `--threads` changes
 how many. `compact --from <dir> --into <dir>` only copies the database in `--from`,

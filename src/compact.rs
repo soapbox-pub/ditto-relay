@@ -17,10 +17,12 @@
 //! too many values to read one page at a time, as the author of millions of
 //! events has, is split into pieces of its values for the threads to read.
 //!
-//! Only the main environment is compacted: `bodies` is written in order,
-//! its freed pages filled by the records that come after them, so it stays
-//! packed. [`in_place`] writes it anew, as it is, only if a new file would
-//! suit ZFS better: see [`crate::storage`].
+//! Only the main environment is compacted unless `bodies` is asked for too.
+//! It's written in order, its freed pages filled by the records that come
+//! after them, but a record bigger than a page takes a run of them from the
+//! end of the file, so deleting many fragments it, and what's freed piles up
+//! in its freelist. Otherwise [`in_place`] writes it anew, as it is, only if
+//! a new file would suit ZFS better: see [`crate::storage`].
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -102,6 +104,9 @@ pub enum Bodies {
     Left,
     /// Written anew, in smaller records, this many bytes, taking this long.
     Rewritten(u64, Duration),
+    /// Compacted, as the main environment is, from this many bytes into
+    /// this many, taking this long.
+    Compacted(u64, u64, Duration),
     /// It'd be in smaller records written anew, but there's not the room
     /// for a copy: the bytes needed, and free.
     NoRoom(u64, u64),
@@ -298,13 +303,15 @@ pub fn copy(
 /// it to remove once the copy's known good; there mustn't be one already.
 /// The database's checkpoint, of the file replaced, is removed, so a crash
 /// of the machine before the relay makes its own leaves the copy alone.
-/// Then if the new file is kept in smaller records than `bodies`, as when
-/// its ZFS dataset's `recordsize` has been lowered, `bodies` is written
-/// anew too, and its old file kept as well.
+/// With `bodies`, `bodies` is compacted too. Else if the new file is kept
+/// in smaller records than `bodies`, as when its ZFS dataset's `recordsize`
+/// has been lowered, `bodies` is written anew, as it is. Either way its old
+/// file is kept as well.
 pub fn in_place(
     dir: &Path,
     map_size: usize,
     threads: usize,
+    bodies: bool,
     progress: &mut dyn FnMut(&Progress),
 ) -> anyhow::Result<Copied> {
     let old = dir.join(OLD_FILE);
@@ -316,6 +323,25 @@ pub fn in_place(
             );
         }
     }
+    let copied = compact_env(dir, map_size, threads, progress)?;
+    let bodies = match bodies {
+        true => {
+            let bodies = compact_env(&dir.join(BODIES_DIR), map_size, threads, progress)?;
+            Bodies::Compacted(bodies.before, bodies.after, bodies.elapsed)
+        }
+        false => rewrite_bodies(dir, map_size, false, progress)?,
+    };
+    Ok(Copied { bodies, ..copied })
+}
+
+/// Compact the environment in `dir`, keeping the file replaced as
+/// [`OLD_FILE`], and removing the database's checkpoint, if it's there.
+fn compact_env(
+    dir: &Path,
+    map_size: usize,
+    threads: usize,
+    progress: &mut dyn FnMut(&Progress),
+) -> anyhow::Result<Copied> {
     let into = dir.join(COPY_DIR);
     // Left by a compact that didn't finish, and of no use.
     match std::fs::remove_dir_all(&into) {
@@ -326,7 +352,7 @@ pub fn in_place(
     }
     let copied = copy(dir, &into, map_size, threads, progress)?;
     let swap = || -> std::io::Result<()> {
-        std::fs::rename(dir.join(DATA_FILE), &old)?;
+        std::fs::rename(dir.join(DATA_FILE), dir.join(OLD_FILE))?;
         std::fs::rename(into.join(DATA_FILE), dir.join(DATA_FILE))?;
         std::fs::File::open(dir)?.sync_all()?;
         for gone in [dir.join(crate::checkpoint::FILE), dir.join("lock.mdb")] {
@@ -339,8 +365,7 @@ pub fn in_place(
         std::fs::File::open(dir)?.sync_all()
     };
     swap().with_context(|| format!("Could not put the copy in place in {}", dir.display()))?;
-    let bodies = rewrite_bodies(dir, map_size, false, progress)?;
-    Ok(Copied { bodies, ..copied })
+    Ok(copied)
 }
 
 /// Write `bodies` of the database in `dir` anew, as it is, if the main
@@ -1134,7 +1159,7 @@ mod tests {
         drop(txn);
         drop(store);
         // Not again, until the old file's gone.
-        assert!(in_place(dir.path(), 1 << 30, 2, &mut |_| {}).is_err());
+        assert!(in_place(dir.path(), 1 << 30, 2, false, &mut |_| {}).is_err());
     }
 
     #[test]
@@ -1175,7 +1200,7 @@ mod tests {
         drop(store);
         let before = contents(dir.path());
 
-        in_place(dir.path(), 1 << 30, 4, &mut |_| {}).unwrap();
+        in_place(dir.path(), 1 << 30, 4, false, &mut |_| {}).unwrap();
         assert!(dir.path().join(OLD_FILE).exists());
         assert!(!dir.path().join(COPY_DIR).exists());
         assert!(!dir.path().join(crate::checkpoint::FILE).exists());
@@ -1188,8 +1213,51 @@ mod tests {
         drop(store);
 
         // Not again, until the old file's gone.
-        assert!(in_place(dir.path(), 1 << 30, 4, &mut |_| {}).is_err());
+        assert!(in_place(dir.path(), 1 << 30, 4, false, &mut |_| {}).is_err());
         std::fs::remove_file(dir.path().join(OLD_FILE)).unwrap();
-        in_place(dir.path(), 1 << 30, 4, &mut |_| {}).unwrap();
+        in_place(dir.path(), 1 << 30, 4, false, &mut |_| {}).unwrap();
+    }
+
+    /// `bodies` compacted holds just what it did, in less, and the store
+    /// opens with it as with the old.
+    #[test]
+    fn compacts_bodies() {
+        use crate::event::tests::signed;
+        use crate::store::tests::{open_in, put};
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_in(dir.path());
+        // Some bigger than a page.
+        let events: Vec<_> = (0..400)
+            .map(|n| signed(1, 1000 + n, 1, vec![], &"x".repeat(n as usize * 20)))
+            .collect();
+        for event in &events {
+            put(&store, event);
+        }
+        let mut txn = store.write().unwrap();
+        let mut removed = 0;
+        for seq in (0..=events.len() as u64).filter(|seq| seq % 4 != 0) {
+            removed += usize::from(store.remove(&mut txn, seq).unwrap());
+        }
+        txn.commit().unwrap();
+        store.forget().unwrap();
+        store.checkpoint().unwrap();
+        drop(store);
+        let bodies = dir.path().join(BODIES_DIR);
+        let before = contents(&bodies);
+
+        let copied = in_place(dir.path(), 1 << 30, 4, true, &mut |_| {}).unwrap();
+        let Bodies::Compacted(from, to, _) = copied.bodies else {
+            panic!("{:?}", copied.bodies);
+        };
+        assert!(to < from / 2, "{to} {from}");
+        assert!(bodies.join(OLD_FILE).exists());
+        assert!(!bodies.join(COPY_DIR).exists());
+        assert_eq!(contents(&bodies), before);
+        let store = open_in(dir.path());
+        let txn = store.read().unwrap();
+        assert_eq!(store.len(&txn).unwrap(), events.len() - removed);
+        drop(txn);
+        // And it's written to as usual.
+        put(&store, &signed(1, 5000, 1, vec![], &"y".repeat(9000)));
     }
 }
