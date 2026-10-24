@@ -95,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
             bodies,
         } => compact(&config, from, into, threads, bodies),
         Command::Repack { threads, bodies } => repack(&config, threads, bodies),
+        Command::FreeOld => free_old(&config),
     }
 }
 
@@ -574,7 +575,7 @@ fn compact(
             }
             for old in old {
                 println!(
-                    "the old file is {}: remove it once the relay runs well on the new one",
+                    "the old file is {}: once the relay runs well on the new one, free it with `ditto-relay free-old`",
                     old.display()
                 );
             }
@@ -625,6 +626,44 @@ fn repack(config: &Config, threads: usize, bodies: bool) -> anyhow::Result<()> {
         repacked.elapsed,
         repacked.paused,
     );
+    Ok(())
+}
+
+/// `ditto-relay free-old`: free the old files `compact` kept, a little at a
+/// time.
+fn free_old(config: &Config) -> anyhow::Result<()> {
+    let db = &config.db_path;
+    let olds: Vec<PathBuf> = [db.clone(), db.join(BODIES_DIR)]
+        .iter()
+        .map(|dir| dir.join(compact::OLD_FILE))
+        .filter(|old| old.exists())
+        .collect();
+    if olds.is_empty() {
+        println!("there's no old file to free");
+        return Ok(());
+    }
+    for old in olds {
+        let start = Instant::now();
+        let mut said = Instant::now();
+        let freed = repack::free_slowly(&old, |left, size| {
+            if said.elapsed() >= Duration::from_secs(5) {
+                eprintln!(
+                    "{}: {:.1} GB of {:.1} GB left",
+                    old.display(),
+                    left as f64 / 1e9,
+                    size as f64 / 1e9
+                );
+                said = Instant::now();
+            }
+        })
+        .with_context(|| format!("Could not free {}", old.display()))?;
+        println!(
+            "freed {}, {:.1} GB, in {:.0?}",
+            old.display(),
+            freed as f64 / 1e9,
+            start.elapsed()
+        );
+    }
     Ok(())
 }
 
@@ -988,8 +1027,8 @@ LMDB never shrinks its file, so after deleting much of the database, \
 what's left is spread thinly through it, less of it stays in memory, and \
 the relay reads the disk more. Compacting needs the relay stopped, and \
 room for the new file, about the size of what's live. The old file is \
-kept beside it, as db/data.mdb.old: remove it once the relay runs well \
-on the new one. Event records are left as they are, unless a file \
+kept beside it, as db/data.mdb.old: once the relay runs well on the \
+new one, free it with `ditto-relay free-old`. Event records are left as they are, unless a file \
 written anew would suit ZFS better, or --bodies is given.
 
 With --bodies, event records (db/bodies) are compacted too, their old \
@@ -1055,6 +1094,23 @@ a relay started meanwhile waits.",
         #[arg(long)]
         bodies: bool,
     },
+
+    /// Free the old files `compact` kept, a little at a time
+    #[command(
+        name = "free-old",
+        long_about = "Free the old files `compact` kept beside the new, \
+db/data.mdb.old and db/bodies/data.mdb.old, a little at a time, and \
+remove them. Run it once the relay runs well on the new ones.
+
+On ZFS, removing a file of hundreds of gigabytes at once, as `rm` does, \
+holds up every write the relay makes until its blocks are freed, which \
+can take many minutes. This cuts each file short from its end a step at \
+a time, resting between, so the relay's writes go on. It can run with \
+the relay running or stopped, and stopped partway, run again.",
+        after_help = "Example:
+  sudo -u ditto-relay ditto-relay free-old"
+    )]
+    FreeOld,
 }
 
 #[derive(Subcommand)]
@@ -1195,6 +1251,10 @@ mod tests {
         };
         assert!(bodies);
         assert!(parse("compact --bodies --from /a --into /b").is_err());
+        assert!(matches!(
+            parse("free-old").unwrap().command,
+            Some(Command::FreeOld)
+        ));
 
         for bad in [
             "--dry-run",

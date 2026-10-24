@@ -84,6 +84,7 @@ manage it, and are run with the relay's own config, as its user:
 | `export`, `import` | Events out and in, as JSON lines ([below](#exporting-and-importing)) |
 | `compact` | Compacts the database, with the relay stopped ([below](#compacting-the-database)) |
 | `repack` | Compacts the database while the relay runs ([below](#compacting-the-database)) |
+| `free-old` | Frees the old files `compact` kept, a little at a time ([below](#compacting-the-database)) |
 
 `ditto-relay help <command>` says more about each, with examples. `check` and
 `deletions` take `--json`, for scripts.
@@ -196,7 +197,10 @@ spread thinly through a file many times its size, so less of it stays in memory 
 the relay reads the disk more. `compact` rewrites the database's indexes into a new
 file, packed in order, and puts it in place. It needs the relay stopped, and room for
 the new file, which is about the size of what's live. The old file is kept beside it,
-as `db/data.mdb.old`: remove it once the relay runs well on the new one. Event records
+as `db/data.mdb.old`: once the relay runs well on the new one, free it with
+`ditto-relay free-old`, not `rm`. On ZFS, removing a file this big at once holds up
+every write until its blocks are freed, for many minutes; `free-old` cuts it short a
+little at a time, with the relay running. Event records
 (`db/bodies`) are written in order and kept packed already, so they're left alone,
 unless a file written anew would suit ZFS better (see below). Then they're copied as
 they are, and the old file is kept as `db/bodies/data.mdb.old`.

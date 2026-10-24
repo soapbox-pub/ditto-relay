@@ -6,6 +6,19 @@ it is tagged.
 
 ## [2.5.1]
 
+- The writer says where its time goes, in metrics: how long it spends on
+  each kind of work (`writer_phase_seconds_total`), its thread's CPU, in
+  user space and the kernel, and how long it's been on what it's doing now
+  (`writer_busy_seconds`). Commits and writes are histograms
+  (`commit_seconds`, `write_latency_seconds`), so the slowest show. Once the
+  writer's been on one thing for 5 seconds, every write waiting, it's
+  logged as a warning, naming what, and again every 10 seconds it lasts.
+- A NIP-09 deletion of 64 or fewer events and addresses, none of them
+  stored, as nearly all are, is done with as it's stored, rather than
+  queued and dropped in two commits of their own.
+- `ditto-relay free-old` frees the old files `compact` keeps a little at a
+  time. Removing them with `rm` held up every write on ZFS for as long as
+  freeing hundreds of gigabytes took.
 - `ditto-relay repack` compacts the database while the relay runs, the
   indexes or, with `--bodies`, the event records. The relay copies the
   database as it was when the repack began, keeps what it writes meanwhile

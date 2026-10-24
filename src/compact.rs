@@ -424,7 +424,7 @@ pub fn in_place(
     for old in [&old, &dir.join(BODIES_DIR).join(OLD_FILE)] {
         if old.exists() {
             bail!(
-                "{} is there, left by an earlier compact: remove it once the database is known good",
+                "{} is there, left by an earlier compact: once the database is known good, free it with `ditto-relay free-old`",
                 old.display()
             );
         }

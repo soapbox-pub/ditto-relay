@@ -172,7 +172,7 @@ pub fn discard(path: PathBuf, closing: Option<Closing>) {
             );
         }
         let start = Instant::now();
-        match free_slowly(&path) {
+        match free_slowly(&path, |_, _| {}) {
             Ok(0) => {}
             Ok(bytes) => tracing::info!(
                 "repack: freed {:.1} GB of {} in {:.0?}",
@@ -191,9 +191,10 @@ pub fn discard(path: PathBuf, closing: Option<Closing>) {
     }
 }
 
-/// Cut the file at `path` short a step at a time, then remove it. Returns
-/// how big it was.
-fn free_slowly(path: &Path) -> std::io::Result<u64> {
+/// Cut the file at `path` short a step at a time, then remove it, telling
+/// `progress` how much is left of how much after each step. Returns how big
+/// it was.
+pub fn free_slowly(path: &Path, mut progress: impl FnMut(u64, u64)) -> std::io::Result<u64> {
     let file = match std::fs::OpenOptions::new().write(true).open(path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         file => file?,
@@ -204,6 +205,7 @@ fn free_slowly(path: &Path) -> std::io::Result<u64> {
         let began = Instant::now();
         len = len.saturating_sub(FREE_STEP);
         file.set_len(len)?;
+        progress(len, size);
         if len > 0 {
             std::thread::sleep((began.elapsed() * FREE_REST_TIMES).max(FREE_REST));
         }
@@ -659,6 +661,20 @@ mod tests {
         assert_eq!(txn.len(store.tables.ids).unwrap(), held[1].len());
         drop(txn);
         emptied(&old);
+    }
+
+    /// A file's freed a step at a time, from its end, then removed.
+    #[test]
+    fn frees_a_step_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old");
+        std::fs::write(&path, vec![1; (FREE_STEP * 3 + 10) as usize]).unwrap();
+        let mut lefts = Vec::new();
+        let freed = free_slowly(&path, |left, _| lefts.push(left)).unwrap();
+        assert_eq!(freed, FREE_STEP * 3 + 10);
+        assert_eq!(lefts, [FREE_STEP * 2 + 10, FREE_STEP + 10, 10, 0]);
+        assert!(!path.exists());
+        assert_eq!(free_slowly(&path, |_, _| {}).unwrap(), 0);
     }
 
     /// What a repack left is cleared as the store opens: a copy put aside
