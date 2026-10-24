@@ -462,6 +462,8 @@ pub struct Store {
     /// Whether anything may be in `unlinked`, so that the writer needn't
     /// look when nothing's been removed.
     unlinking: AtomicBool,
+    /// Whether a [repack](crate::repack) is under way.
+    pub(crate) repacking: AtomicBool,
 }
 
 /// When the store's [checkpoints](crate::checkpoint) are made.
@@ -495,6 +497,8 @@ impl Store {
                 bodies.display()
             )
         })?;
+        crate::repack::clear_leftovers(dir)
+            .with_context(|| format!("Could not remove what a repack left in {}", dir.display()))?;
         let boot_id = checkpoint::boot_id();
         let files = checkpoint::files(dir, &[&bodies]);
         let recovering = || format!("Could not restore the database at {}", dir.display());
@@ -574,6 +578,7 @@ impl Store {
             uncommitted: Mutex::default(),
             sweeping: Mutex::default(),
             unlinking: AtomicBool::new(true),
+            repacking: AtomicBool::new(false),
         };
         let next = store.drop_uncommitted()?;
         store.load_pending()?;
@@ -629,12 +634,41 @@ impl Store {
             uncommitted: Mutex::default(),
             sweeping: Mutex::default(),
             unlinking: AtomicBool::new(false),
+            repacking: AtomicBool::new(false),
         })
     }
 
     /// The data files of the store's environments.
-    fn files(&self) -> Vec<PathBuf> {
+    pub(crate) fn files(&self) -> Vec<PathBuf> {
         checkpoint::files(&self.dir, &[&self.dir.join(BODIES_DIR)])
+    }
+
+    /// The database's directory.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Which of the store's environments `bodies` is.
+    pub(crate) fn bodies_env(&self) -> usize {
+        self.bodies
+    }
+
+    /// The id of the boot of the machine the store was opened in.
+    pub(crate) fn boot_id(&self) -> Option<&str> {
+        self.boot_id.as_deref()
+    }
+
+    /// Run `f` with no [checkpoint](crate::checkpoint) being made but the
+    /// one it may make itself: one finishing is waited for, and a write
+    /// [begun](Self::write) meanwhile waits for `f`.
+    pub(crate) fn without_checkpoints<T>(&self, f: impl FnOnce() -> T) -> T {
+        let mut checkpoints = self.checkpoints.lock().expect("unpoisoned");
+        if let Some(finishing) = checkpoints.finishing.take() {
+            let _ = finishing.join();
+        }
+        let out = f();
+        checkpoints.last = Instant::now();
+        out
     }
 
     /// Begin a [checkpoint](crate::checkpoint) of the latest commit if one's

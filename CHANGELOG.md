@@ -6,6 +6,12 @@ it is tagged.
 
 ## [2.5.1]
 
+- `ditto-relay repack` compacts the database while the relay runs, the
+  indexes or, with `--bodies`, the event records. The relay copies the
+  database as it was when the repack began, keeps what it writes meanwhile
+  in a journal, and catches the copy up from it. Then it puts the copy in
+  place of the old file, its writes waiting about a second, and removes the
+  old file once the reads under way are done with it.
 - NIP-09 deletions are removed together. Each was found, then removed, in
   transactions of its own, one a chunk, so a relay sent them faster than a
   chunk a write fell behind, however few events they named; most name

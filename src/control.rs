@@ -49,6 +49,7 @@ use tokio_util::sync::CancellationToken;
 use crate::delete;
 use crate::import::{Importer, Tally};
 use crate::pending::Target;
+use crate::repack::Repacked;
 use crate::store::{Store, Writer};
 
 /// Held by the running relay, in the database's directory.
@@ -76,6 +77,8 @@ enum Request {
     Cancel { id: u64 },
     /// Store the events that follow, a line each: see [`crate::import`].
     Import { verify: bool },
+    /// Compact the database as it runs: see [`crate::repack`].
+    Repack { bodies: bool, threads: usize },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +90,10 @@ enum Reply {
     Cancelled(u64),
     /// The import's done, and this is what became of it.
     Imported(Tally),
+    /// How a repack's going, a line at a time.
+    Progress(String),
+    /// The repack's done, and this is what it did.
+    Repacked(Repacked),
     Error(String),
 }
 
@@ -203,6 +210,9 @@ async fn answer(stream: UnixStream, store: Arc<Store>, writer: Writer) {
             Ok(Request::Import { verify }) => {
                 import(&mut read, verify, store, writer, &mut write).await
             }
+            Ok(Request::Repack { bodies, threads }) => {
+                repack(bodies, threads, store, &mut write).await
+            }
             Err(err) => Err(anyhow::anyhow!("not a request: {err}")),
         },
         Err(err) => Err(err),
@@ -304,6 +314,31 @@ async fn import(
         tally.refused.values().sum::<u64>()
     );
     send(write, &Reply::Imported(tally)).await?;
+    Ok(())
+}
+
+/// Repack the database, saying how it's going, then what it did. It goes
+/// on if whoever asked hangs up.
+async fn repack(
+    bodies: bool,
+    threads: usize,
+    store: Arc<Store>,
+    write: &mut (impl AsyncWriteExt + Unpin),
+) -> anyhow::Result<()> {
+    let (said, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    let repacking = tokio::task::spawn_blocking(move || {
+        crate::repack::repack(&store, bodies, threads, &mut |line| {
+            let _ = said.send(line.to_string());
+        })
+    });
+    let mut listening = true;
+    while let Some(line) = lines.recv().await {
+        if listening && send(write, &Reply::Progress(line)).await.is_err() {
+            listening = false;
+        }
+    }
+    let repacked = repacking.await??;
+    send(write, &Reply::Repacked(repacked)).await?;
     Ok(())
 }
 
@@ -453,6 +488,33 @@ pub fn request_cancel(path: &Path, id: u64) -> anyhow::Result<bool> {
         Reply::Error(err) => bail!("{err}"),
         _ => bail!("the relay answered something else"),
     }
+}
+
+/// Ask the relay answering at `path` to repack its database, or with
+/// `bodies`, its event records, handing `say` each line it says of how it's
+/// going. Returns what it did, or None if no relay is answering there.
+pub fn request_repack(
+    path: &Path,
+    bodies: bool,
+    threads: usize,
+    mut say: impl FnMut(&str),
+) -> anyhow::Result<Option<Repacked>> {
+    let Some(mut stream) = connect(path)? else {
+        return Ok(None);
+    };
+    let request = Request::Repack { bodies, threads };
+    let mut line = serde_json::to_vec(&request).expect("a request serializes");
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    for line in std::io::BufReader::new(stream).lines() {
+        match serde_json::from_str(&line?).context("the relay answered nonsense")? {
+            Reply::Progress(line) => say(&line),
+            Reply::Repacked(repacked) => return Ok(Some(repacked)),
+            Reply::Error(err) => bail!("the relay couldn't repack: {err}"),
+            _ => bail!("the relay answered something else"),
+        }
+    }
+    bail!("the relay hung up before it was done")
 }
 
 #[cfg(test)]
@@ -636,6 +698,50 @@ mod tests {
         .unwrap();
         assert_eq!((tally.stored, tally.total()), (3, 4));
         assert_eq!(store.len(&store.read().unwrap()).unwrap(), 3);
+
+        shutdown.cancel();
+        serving.await.unwrap();
+        tokio::task::spawn_blocking(move || writer.stop())
+            .await
+            .unwrap();
+    }
+
+    /// The relay repacks as it runs, saying how it's going.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_repacks_when_asked() {
+        use crate::event::tests::signed;
+        use crate::store::tests::{open, put};
+
+        let (dir, store) = open();
+        let store = Arc::new(store);
+        for i in 0..50 {
+            put(&store, &signed(1, 100 + i, 1, vec![], "x"));
+        }
+        let writer = Writer::spawn(store.clone(), None, |_| {});
+        let path = socket_path(dir.path());
+        let shutdown = CancellationToken::new();
+        let serving = serve(&path, store.clone(), writer.clone(), shutdown.clone()).unwrap();
+
+        let asked = path.clone();
+        let (repacked, said) = tokio::task::spawn_blocking(move || {
+            let mut said = Vec::new();
+            let repacked = request_repack(&asked, false, 2, |line| said.push(line.to_string()));
+            (repacked, said)
+        })
+        .await
+        .unwrap();
+        let repacked = repacked.unwrap().expect("a relay answered");
+        assert!(
+            repacked
+                .tables
+                .iter()
+                .any(|(name, n)| name == "ids" && *n == 50)
+        );
+        assert!(
+            said.iter().any(|line| line.starts_with("put the copy")),
+            "{said:?}"
+        );
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), 50);
 
         shutdown.cancel();
         serving.await.unwrap();

@@ -18,17 +18,25 @@
 //! Commits are never flushed to disk as they're made. What survives a crash
 //! of the machine is a [checkpoint](crate::checkpoint), which [`Env`] pins.
 //!
+//! One of an [`Env`]'s environments can be [replaced](Env::replace) by
+//! another while it's in use, as [`crate::repack`] does with a compacted
+//! copy. Each transaction holds the environments it began in, which are
+//! closed once the last that holds them ends. What's committed to one
+//! meanwhile can be kept in a [`Journal`], to be replayed into the copy.
+//!
 //! All the `unsafe` in the crate lives here.
 
 use std::ffi::{CStr, CString};
+use std::fs::File;
 use std::marker::PhantomData;
 use std::os::fd::FromRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::ptr;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use lmdb_master_sys as ffi;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,31 +193,61 @@ pub struct Usage {
     pub used: u64,
 }
 
+/// How much a [replay](Env::replay) writes in one transaction, about.
+const REPLAY_COMMIT_BYTES: u64 = 64 << 20;
+
+/// One LMDB environment, closed once nothing holds it.
+struct Handle {
+    ptr: *mut ffi::MDB_env,
+    /// Where its file is mapped, and how much of it, if that could be
+    /// found: LMDB doesn't say.
+    map: Option<(usize, usize)>,
+    /// What it was opened with, for one [alike](Env::create_like).
+    map_size: usize,
+    max_dbs: u32,
+    max_readers: u32,
+    /// The tables opened in it: their handles, names and flags.
+    tables: Mutex<Vec<(ffi::MDB_dbi, String, DbFlags)>>,
+}
+
+// SAFETY: an MDB_env is safe to share between threads; transactions opened
+// from it carry their own restrictions, enforced by the types below.
+unsafe impl Send for Handle {}
+unsafe impl Sync for Handle {}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // SAFETY: every transaction holds the handles it's in, so none is
+        // left in this one.
+        unsafe { ffi::mdb_env_close(self.ptr) }
+    }
+}
+
+/// An [`Env`]'s environments, in the order they were opened.
+type Envs = Arc<Vec<Arc<Handle>>>;
+
 pub struct Env {
-    ptrs: Vec<*mut ffi::MDB_env>,
-    /// Where each environment's file is mapped, and how much of it, if
-    /// that could be found: LMDB doesn't say.
-    maps: Vec<Option<(usize, usize)>>,
+    envs: ArcSwap<Vec<Arc<Handle>>>,
     /// Opened only to read: no write transaction can begin, so the writer's
     /// lock, which another process may hold, is never waited on.
     read_only: bool,
     /// The read transactions [checkpoints](Self::begin_checkpoint) hold.
     pins: Mutex<Pins>,
+    /// Where what's committed to one of the environments is kept, if it is.
+    journal: ArcSwapOption<Journal>,
 }
-
-// SAFETY: an MDB_env is safe to share between threads; transactions opened
-// from it carry their own restrictions, enforced by the types below.
-unsafe impl Send for Env {}
-unsafe impl Sync for Env {}
 
 /// A read transaction in each environment, keeping LMDB from reusing the
 /// pages of the commits it reads. Not tied to a thread, as environments
 /// are opened with `MDB_NOTLS`.
-struct Pin([*mut ffi::MDB_txn; MAX_ENVS]);
+struct Pin {
+    txns: [*mut ffi::MDB_txn; MAX_ENVS],
+    _envs: Envs,
+}
 
 impl Drop for Pin {
     fn drop(&mut self) {
-        for &ptr in &self.0 {
+        for &ptr in &self.txns {
             if !ptr.is_null() {
                 // SAFETY: a live read transaction, aborted only here.
                 unsafe { ffi::mdb_txn_abort(ptr) }
@@ -240,6 +278,163 @@ pub struct Meta {
     pub pages: Vec<u8>,
 }
 
+/// What's committed to one environment of an [`Env`] from when
+/// [`Env::journal`] begins it, kept in a file as it's committed, to be
+/// [replayed](Env::replay) into a copy of the environment as it was then.
+/// A commit is its length (u64 LE), then its changes, each a tag, the
+/// table's handle (u32 LE), and what the change takes, each byte string
+/// its length (u32 LE) first:
+///
+/// | tag | change                                   |
+/// |-----|------------------------------------------|
+/// | 1   | put a key and value                      |
+/// | 2   | delete a key, then 0, or 1 and its value |
+/// | 3   | empty the table                          |
+pub struct Journal {
+    env: usize,
+    /// Written, and locked from a commit until it's written, so that what's
+    /// committed is in it once a writer that waited on the commit begins.
+    file: Mutex<File>,
+    /// Read from, while it's written.
+    reader: File,
+    /// How much of the file holds whole commits.
+    written: AtomicU64,
+    /// Whether a commit couldn't be written, which makes it of no use.
+    failed: AtomicBool,
+}
+
+const OP_PUT: u8 = 1;
+const OP_DEL: u8 = 2;
+const OP_CLEAR: u8 = 3;
+
+impl Journal {
+    /// How much it holds, in bytes.
+    pub fn len(&self) -> u64 {
+        self.written.load(Ordering::Acquire)
+    }
+
+    /// Whether it holds nothing yet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How much it holds once every commit made already is in it.
+    fn settled(&self) -> u64 {
+        let _file = self.file.lock().expect("unpoisoned");
+        self.len()
+    }
+
+    /// Add a commit's changes, `ops`, to `file`, its own.
+    fn append(&self, file: &File, ops: &[u8]) {
+        if self.failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let at = self.written.load(Ordering::Relaxed);
+        let wrote = file
+            .write_all_at(&(ops.len() as u64).to_le_bytes(), at)
+            .and_then(|()| file.write_all_at(ops, at + 8));
+        match wrote {
+            Ok(()) => self
+                .written
+                .store(at + 8 + ops.len() as u64, Ordering::Release),
+            Err(err) => {
+                tracing::error!("keeping a commit in the journal failed: {err}");
+                self.failed.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn put_field(ops: &mut Vec<u8>, bytes: &[u8]) {
+    ops.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    ops.extend_from_slice(bytes);
+}
+
+fn record_put(ops: &mut Vec<u8>, dbi: ffi::MDB_dbi, key: &[u8], value: &[u8]) {
+    ops.push(OP_PUT);
+    ops.extend_from_slice(&dbi.to_le_bytes());
+    put_field(ops, key);
+    put_field(ops, value);
+}
+
+fn record_del(ops: &mut Vec<u8>, dbi: ffi::MDB_dbi, key: &[u8], value: Option<&[u8]>) {
+    ops.push(OP_DEL);
+    ops.extend_from_slice(&dbi.to_le_bytes());
+    put_field(ops, key);
+    match value {
+        Some(value) => {
+            ops.push(1);
+            put_field(ops, value);
+        }
+        None => ops.push(0),
+    }
+}
+
+fn record_clear(ops: &mut Vec<u8>, dbi: ffi::MDB_dbi) {
+    ops.push(OP_CLEAR);
+    ops.extend_from_slice(&dbi.to_le_bytes());
+}
+
+/// The changes of a commit in a [`Journal`], read one field at a time.
+struct Ops<'a>(&'a [u8]);
+
+impl<'a> Ops<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let (head, tail) = self.0.split_at_checked(n).ok_or(Error::corrupted())?;
+        self.0 = tail;
+        Ok(head)
+    }
+
+    fn byte(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
+    }
+
+    fn field(&mut self) -> Result<&'a [u8]> {
+        let len = self.u32()? as usize;
+        self.take(len)
+    }
+}
+
+/// Make the changes of a commit in a [`Journal`] in `txn`, of an
+/// environment of its own whose tables are numbered as the journal's are.
+fn apply(txn: &mut RwTxn, ops: &[u8]) -> Result<()> {
+    let mut ops = Ops(ops);
+    while !ops.0.is_empty() {
+        let tag = ops.byte()?;
+        let db = Db {
+            dbi: ops.u32()?,
+            env: 0,
+        };
+        match tag {
+            OP_PUT => {
+                let (key, value) = (ops.field()?, ops.field()?);
+                txn.put(db, key, value)?;
+            }
+            OP_DEL => {
+                let key = ops.field()?;
+                let value = match ops.byte()? {
+                    0 => None,
+                    _ => Some(ops.field()?),
+                };
+                txn.del(db, key, value)?;
+            }
+            OP_CLEAR => txn.clear(db)?,
+            _ => return Err(Error::corrupted()),
+        }
+    }
+    Ok(())
+}
+
+fn io_error(err: std::io::Error) -> Error {
+    Error(err.raw_os_error().unwrap_or(libc::EIO))
+}
+
 impl Env {
     /// Open (creating if need be) the environment in the directory `path`.
     /// Commits aren't flushed to disk: the kernel writes them when it
@@ -266,10 +461,10 @@ impl Env {
 
     fn new(read_only: bool) -> Env {
         Env {
-            ptrs: Vec::new(),
-            maps: Vec::new(),
+            envs: ArcSwap::from_pointee(Vec::new()),
             read_only,
             pins: Mutex::default(),
+            journal: ArcSwapOption::empty(),
         }
     }
 
@@ -285,13 +480,13 @@ impl Env {
         max_dbs: u32,
         max_readers: u32,
     ) -> Result<usize> {
-        assert!(self.ptrs.len() < MAX_ENVS, "too many environments");
+        assert!(self.envs.load().len() < MAX_ENVS, "too many environments");
         let flags = match self.read_only {
             true => ffi::MDB_RDONLY,
             false => ffi::MDB_NOSYNC,
         };
         self.add(path, map_size, flags, max_dbs, max_readers)?;
-        Ok(self.ptrs.len() - 1)
+        Ok(self.envs.load().len() - 1)
     }
 
     fn add(
@@ -305,11 +500,19 @@ impl Env {
         let path =
             CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
         let mut ptr = ptr::null_mut();
-        // SAFETY: plain FFI calls in the documented order; the env is closed
-        // by Drop if any fails, once it's in `ptrs`.
+        // SAFETY: creates the env, closed by the handle's drop from then on.
+        check(unsafe { ffi::mdb_env_create(&mut ptr) })?;
+        let mut handle = Handle {
+            ptr,
+            map: None,
+            map_size,
+            max_dbs,
+            max_readers,
+            tables: Mutex::default(),
+        };
+        // SAFETY: plain FFI calls in the documented order, on the env just
+        // created.
         unsafe {
-            check(ffi::mdb_env_create(&mut ptr))?;
-            self.ptrs.push(ptr);
             check(ffi::mdb_env_set_mapsize(ptr, map_size))?;
             check(ffi::mdb_env_set_maxdbs(ptr, max_dbs))?;
             check(ffi::mdb_env_set_maxreaders(ptr, max_readers))?;
@@ -319,7 +522,10 @@ impl Env {
             let flags = flags | ffi::MDB_NOTLS | ffi::MDB_NORDAHEAD;
             check(ffi::mdb_env_open(ptr, path.as_ptr(), flags, 0o600))?;
         }
-        self.maps.push(map_of(ptr));
+        handle.map = map_of(ptr);
+        let mut envs = Vec::clone(&self.envs.load());
+        envs.push(Arc::new(handle));
+        self.envs.store(Arc::new(envs));
         Ok(())
     }
 
@@ -332,20 +538,24 @@ impl Env {
     /// whose machine crashed gets it back. Abandons a checkpoint begun and
     /// not [confirmed](Self::confirm_checkpoint).
     pub fn begin_checkpoint(&self) -> Result<Vec<Meta>> {
-        let mut pin = Pin([ptr::null_mut(); MAX_ENVS]);
-        for (env, slot) in self.ptrs.iter().zip(&mut pin.0) {
+        let envs = self.envs.load_full();
+        let mut pin = Pin {
+            txns: [ptr::null_mut(); MAX_ENVS],
+            _envs: envs.clone(),
+        };
+        for (env, slot) in envs.iter().zip(&mut pin.txns) {
             // SAFETY: the env is open; the transaction is aborted by Pin's drop.
-            check(unsafe { ffi::mdb_txn_begin(*env, ptr::null_mut(), ffi::MDB_RDONLY, slot) })?;
+            check(unsafe { ffi::mdb_txn_begin(env.ptr, ptr::null_mut(), ffi::MDB_RDONLY, slot) })?;
         }
         let mut metas = Vec::new();
-        for (&env, &txn) in self.ptrs.iter().zip(&pin.0) {
+        for (env, &txn) in envs.iter().zip(&pin.txns) {
             // SAFETY: plain data, filled in by LMDB from an open env, and a
             // live transaction.
             let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
-            check(unsafe { ffi::mdb_env_stat(env, &mut stat) })?;
+            check(unsafe { ffi::mdb_env_stat(env.ptr, &mut stat) })?;
             let txnid = unsafe { ffi::mdb_txn_id(txn) } as u64;
             let mut fd = -1;
-            check(unsafe { ffi::mdb_env_get_fd(env, &mut fd) })?;
+            check(unsafe { ffi::mdb_env_get_fd(env.ptr, &mut fd) })?;
             let page_size = stat.ms_psize as usize;
             let mut pages = vec![0; 2 * page_size];
             // SAFETY: reads into a buffer of the length given, from a file
@@ -367,9 +577,9 @@ impl Env {
     /// Flush every environment's file to disk, the last environment first.
     /// Safe to call while others read and write.
     pub fn sync(&self) -> Result<()> {
-        for &env in self.ptrs.iter().rev() {
+        for env in self.envs.load().iter().rev() {
             // SAFETY: the env is open; 1 forces the flush, as NOSYNC skips it.
-            check(unsafe { ffi::mdb_env_sync(env, 1) })?;
+            check(unsafe { ffi::mdb_env_sync(env.ptr, 1) })?;
         }
         Ok(())
     }
@@ -393,16 +603,21 @@ impl Env {
 
     /// Open a table in the environment `env`, as [`create_db`](Self::create_db).
     pub fn create_db_in(&self, env: usize, name: &str, flags: DbFlags) -> Result<Db> {
-        let name = CString::new(name).map_err(|_| Error(libc::EINVAL))?;
+        let c_name = CString::new(name).map_err(|_| Error(libc::EINVAL))?;
         let (txn, bits) = match self.read_only {
-            true => (self.begin(ffi::MDB_RDONLY)?, flags.bits()),
-            false => (self.write_txn()?.0, flags.bits() | ffi::MDB_CREATE),
+            true => (self.begin(ffi::MDB_RDONLY, None)?, flags.bits()),
+            false => (self.write_txn()?.txn, flags.bits() | ffi::MDB_CREATE),
         };
         let mut dbi = 0;
         // SAFETY: a live transaction and a NUL-terminated name.
-        check(unsafe { ffi::mdb_dbi_open(txn.ptrs[env], name.as_ptr(), bits, &mut dbi) })?;
+        check(unsafe { ffi::mdb_dbi_open(txn.ptrs[env], c_name.as_ptr(), bits, &mut dbi) })?;
+        let handle = txn.envs[env].clone();
         // Committed, even only to read, so the handle outlives it.
-        RwTxn(txn).commit()?;
+        RwTxn::new(txn).commit()?;
+        let mut tables = handle.tables.lock().expect("unpoisoned");
+        if !tables.iter().any(|(opened, ..)| *opened == dbi) {
+            tables.push((dbi, name.to_string(), flags));
+        }
         Ok(Db { dbi, env })
     }
 
@@ -413,15 +628,19 @@ impl Env {
         let txn = self.write_txn()?;
         let mut dbi = 0;
         // SAFETY: a live write transaction and a NUL-terminated name.
-        if found(unsafe { ffi::mdb_dbi_open(txn.0.ptrs[0], name.as_ptr(), 0, &mut dbi) })?.is_none()
+        if found(unsafe { ffi::mdb_dbi_open(txn.txn.ptrs[0], name.as_ptr(), 0, &mut dbi) })?
+            .is_none()
         {
             return Ok(None);
         }
         let entries = txn.len(Db { dbi, env: 0 })?;
         // SAFETY: a live write transaction; 1 deletes the table and closes
         // its handle, which nothing else holds.
-        check(unsafe { ffi::mdb_drop(txn.0.ptrs[0], dbi, 1) })?;
+        check(unsafe { ffi::mdb_drop(txn.txn.ptrs[0], dbi, 1) })?;
+        let handle = txn.envs[0].clone();
         txn.commit()?;
+        let mut tables = handle.tables.lock().expect("unpoisoned");
+        tables.retain(|(opened, ..)| *opened != dbi);
         Ok(Some(entries))
     }
 
@@ -429,7 +648,7 @@ impl Env {
     /// the order of their names. Like [`create_db`](Self::create_db), call
     /// it before any other transaction.
     pub fn tables(&self) -> Result<Vec<(String, Db, DbFlags)>> {
-        let txn = self.begin(ffi::MDB_RDONLY)?;
+        let txn = self.begin(ffi::MDB_RDONLY, None)?;
         let ptr = txn.ptrs[0];
         let mut main = 0;
         // SAFETY: a live transaction; a null name is the table of tables.
@@ -453,8 +672,162 @@ impl Env {
             tables.push((name, Db { dbi, env: 0 }, DbFlags::from_bits(bits)?));
         }
         // Committed, so the handles outlive it.
-        RwTxn(txn).commit()?;
+        RwTxn::new(txn).commit()?;
         Ok(tables)
+    }
+
+    /// The tables opened in environment `env`, in the order they were.
+    pub fn tables_of(&self, env: usize) -> Vec<(String, Db, DbFlags)> {
+        let envs = self.envs.load();
+        let mut tables = envs[env].tables.lock().expect("unpoisoned").clone();
+        tables.sort_by_key(|(dbi, ..)| *dbi);
+        tables
+            .into_iter()
+            .map(|(dbi, name, flags)| (name, Db { dbi, env }, flags))
+            .collect()
+    }
+
+    /// The tables in environment `env`'s file that haven't been opened.
+    /// Safe to call while others read and write, unlike
+    /// [`tables`](Self::tables), as it opens none.
+    pub fn unopened_tables(&self, env: usize) -> Result<Vec<String>> {
+        let opened: Vec<String> = self
+            .tables_of(env)
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect();
+        let txn = self.read_txn_in(env)?;
+        let mut main = 0;
+        // SAFETY: a live transaction; a null name is the table of tables,
+        // which is always open, so LMDB only says which it is.
+        check(unsafe { ffi::mdb_dbi_open(txn.ptrs[env], ptr::null(), 0, &mut main) })?;
+        let mut cursor = txn.cursor(Db { dbi: main, env })?;
+        let mut unopened = Vec::new();
+        let mut entry = cursor.first()?;
+        while let Some((name, _)) = entry {
+            let name = String::from_utf8_lossy(name);
+            if !opened.iter().any(|opened| *opened == name) {
+                unopened.push(name.into_owned());
+            }
+            entry = cursor.next()?;
+        }
+        Ok(unopened)
+    }
+
+    /// Create an empty environment of its own in the directory `path`,
+    /// opened as environment `env` is, its tables opened in the same order,
+    /// so that each [`Db`] of `env`'s is the same table's in it, but for
+    /// the environment it's in, which is 0.
+    pub fn create_like(&self, env: usize, path: &Path) -> Result<Env> {
+        let (map_size, max_dbs, max_readers) = {
+            let envs = self.envs.load();
+            let handle = &envs[env];
+            (handle.map_size, handle.max_dbs, handle.max_readers)
+        };
+        let like = Env::open(path, map_size, max_dbs, max_readers)?;
+        for (name, db, flags) in self.tables_of(env) {
+            if like.create_db(&name, flags)?.dbi != db.dbi {
+                return Err(Error(ffi::MDB_INCOMPATIBLE));
+            }
+        }
+        Ok(like)
+    }
+
+    /// Begin keeping what's committed to environment `env` from now on in a
+    /// [`Journal`], in a new file at `path`, and return it, with a read
+    /// transaction of `env` alone as it is now, before any of it. Fails if
+    /// a journal's kept already.
+    pub fn journal(&self, env: usize, path: &Path) -> Result<(Arc<Journal>, RoTxn<'_>)> {
+        // Holding the writer's lock, so that no commit is under way: each
+        // write transaction begun after keeps what it commits.
+        let writing = self.write_txn()?;
+        if writing.journal.is_some() {
+            return Err(Error(libc::EBUSY));
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(io_error)?;
+        let reader = file.try_clone().map_err(io_error)?;
+        let journal = Arc::new(Journal {
+            env,
+            file: Mutex::new(file),
+            reader,
+            written: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+        });
+        let before = self.read_txn_in(env)?;
+        self.journal.store(Some(journal.clone()));
+        drop(writing);
+        Ok((journal, before))
+    }
+
+    /// Stop keeping a [`Journal`]. Write transactions begun before go on
+    /// keeping theirs in it.
+    pub fn stop_journal(&self) {
+        self.journal.store(None);
+    }
+
+    /// Make in this environment, made [alike](Self::create_like) the
+    /// environment `journal` is of, the changes it holds from `at`, up to
+    /// what it holds now, or with `settled`, up to the end of every commit
+    /// made already, as a commit may be being written to it still. Returns
+    /// where they end.
+    pub fn replay(&self, journal: &Journal, mut at: u64, settled: bool) -> Result<u64> {
+        let end = match settled {
+            true => journal.settled(),
+            false => journal.len(),
+        };
+        if journal.failed.load(Ordering::Relaxed) {
+            return Err(Error(libc::EIO));
+        }
+        let mut txn = self.write_txn()?;
+        let (mut ops, mut pending) = (Vec::new(), 0);
+        while at < end {
+            let mut len = [0; 8];
+            journal
+                .reader
+                .read_exact_at(&mut len, at)
+                .map_err(io_error)?;
+            let len = u64::from_le_bytes(len);
+            if at + 8 + len > end {
+                return Err(Error::corrupted());
+            }
+            ops.resize(len as usize, 0);
+            journal
+                .reader
+                .read_exact_at(&mut ops, at + 8)
+                .map_err(io_error)?;
+            apply(&mut txn, &ops)?;
+            at += 8 + len;
+            pending += len;
+            if pending >= REPLAY_COMMIT_BYTES {
+                txn.commit()?;
+                txn = self.write_txn()?;
+                pending = 0;
+            }
+        }
+        txn.commit()?;
+        Ok(at)
+    }
+
+    /// Put `other`, an environment of its own made
+    /// [alike](Self::create_like) environment `env`, in its place, and
+    /// return the one replaced, as an environment of its own. Transactions
+    /// begun before go on in the one replaced, which is closed once it's
+    /// dropped and the last of them has ended. Call it holding a write
+    /// transaction: one waiting on it to end is begun anew, in `other`.
+    pub fn replace(&self, env: usize, other: Env) -> Env {
+        let handle = other.envs.load()[0].clone();
+        let mut envs = Vec::clone(&self.envs.load());
+        let replaced = std::mem::replace(&mut envs[env], handle);
+        self.envs.store(Arc::new(envs));
+        let out = Env::new(self.read_only);
+        out.envs.store(Arc::new(vec![replaced]));
+        out
     }
 
     /// Write a compacted copy of the environment `env` into the directory
@@ -463,14 +836,16 @@ impl Env {
     pub fn copy_compact(&self, env: usize, path: &Path) -> Result<()> {
         let path =
             CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
+        let envs = self.envs.load();
         // SAFETY: the env is open and the path NUL-terminated.
-        check(unsafe { ffi::mdb_env_copy2(self.ptrs[env], path.as_ptr(), ffi::MDB_CP_COMPACT) })
+        check(unsafe { ffi::mdb_env_copy2(envs[env].ptr, path.as_ptr(), ffi::MDB_CP_COMPACT) })
     }
 
     /// How big the environment `env`'s map is, and how much of it is used,
     /// in bytes.
     pub fn usage(&self, env: usize) -> Result<Usage> {
-        let ptr = self.ptrs[env];
+        let envs = self.envs.load();
+        let ptr = envs[env].ptr;
         // SAFETY: plain data, filled in by LMDB from an open env.
         let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
         let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
@@ -496,12 +871,14 @@ impl Env {
     /// range lock without holding pages, and leaves what it read in the ARC,
     /// where faulting the map in finds it.
     pub fn will_need(&self, env: usize, at: &[u8], len: usize) {
+        let envs = self.envs.load();
+        let handle = &envs[env];
         let mut fd = -1;
         // SAFETY: the env is open.
-        if check(unsafe { ffi::mdb_env_get_fd(self.ptrs[env], &mut fd) }).is_err() {
+        if check(unsafe { ffi::mdb_env_get_fd(handle.ptr, &mut fd) }).is_err() {
             return;
         }
-        let Some(offset) = self.offset_of(env, at) else {
+        let Some(offset) = offset_in(handle, at) else {
             return;
         };
         if READS_AHEAD.fetch_add(1, Ordering::AcqRel) >= MAX_READS_AHEAD {
@@ -542,32 +919,63 @@ impl Env {
     /// Where in environment `env`'s file `at`, read from its map, is, if
     /// it's from there.
     pub fn offset_of(&self, env: usize, at: &[u8]) -> Option<usize> {
-        let (base, len) = self.maps[env]?;
-        let offset = (at.as_ptr() as usize).checked_sub(base)?;
-        (offset < len).then_some(offset)
+        offset_in(&self.envs.load()[env], at)
     }
 
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
-        Ok(RoTxn(self.begin(ffi::MDB_RDONLY)?))
+        Ok(RoTxn(self.begin(ffi::MDB_RDONLY, None)?))
+    }
+
+    /// A read transaction in environment `env` alone: reading a table of
+    /// another in it panics. It pins nothing of the others.
+    pub fn read_txn_in(&self, env: usize) -> Result<RoTxn<'_>> {
+        Ok(RoTxn(self.begin(ffi::MDB_RDONLY, Some(env))?))
     }
 
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
-        Ok(RwTxn(self.begin(0)?))
+        let txn = self.begin(0, None)?;
+        // Holding the writer's lock, as a journal's begun.
+        let journal = self.journal.load_full().map(|journal| Recording {
+            journal,
+            ops: Vec::new(),
+        });
+        Ok(RwTxn { txn, journal })
     }
 
-    /// A transaction in each environment, in the order they were opened.
-    fn begin(&self, flags: u32) -> Result<Txn<'_>> {
-        let mut txn = Txn {
-            ptrs: [ptr::null_mut(); MAX_ENVS],
-            _env: PhantomData,
-        };
-        for (env, slot) in self.ptrs.iter().zip(&mut txn.ptrs) {
-            // SAFETY: the env is open; the transaction is freed by Txn's
-            // drop or commit, those already begun too if this fails.
-            check(unsafe { ffi::mdb_txn_begin(*env, ptr::null_mut(), flags, slot) })?;
+    /// A transaction in each environment, or with `only`, in that one, in
+    /// the order they were opened.
+    fn begin(&self, flags: u32, only: Option<usize>) -> Result<Txn<'_>> {
+        loop {
+            let mut txn = Txn {
+                ptrs: [ptr::null_mut(); MAX_ENVS],
+                envs: self.envs.load_full(),
+                _env: PhantomData,
+            };
+            for (n, slot) in txn.ptrs.iter_mut().enumerate().take(txn.envs.len()) {
+                if only.is_some_and(|only| only != n) {
+                    continue;
+                }
+                // SAFETY: the env is open; the transaction is freed by Txn's
+                // drop or commit, those already begun too if this fails.
+                check(unsafe {
+                    ffi::mdb_txn_begin(txn.envs[n].ptr, ptr::null_mut(), flags, slot)
+                })?;
+            }
+            // A writer waits on the one before, which may have replaced an
+            // environment meanwhile: then it's begun anew, in that.
+            if flags & ffi::MDB_RDONLY != 0 || Arc::ptr_eq(&txn.envs, &self.envs.load()) {
+                return Ok(txn);
+            }
         }
-        Ok(txn)
     }
+}
+
+/// Where in `handle`'s file `at`, read from its map, is, if it's from
+/// there.
+fn offset_in(handle: &Handle, at: &[u8]) -> Option<usize> {
+    let (base, len) = handle.map?;
+    let offset = (at.as_ptr() as usize).checked_sub(base)?;
+    (offset < len).then_some(offset)
 }
 
 /// Where the environment `env`'s file is mapped, and how long the mapping
@@ -612,30 +1020,26 @@ fn map_of(env: *mut ffi::MDB_env) -> Option<(usize, usize)> {
     }
 }
 
-impl Drop for Env {
-    fn drop(&mut self) {
-        // Its transactions first.
-        *self.pins.get_mut().expect("unpoisoned") = Pins::default();
-        for &ptr in &self.ptrs {
-            // SAFETY: every transaction borrows the env, so none outlives it.
-            unsafe { ffi::mdb_env_close(ptr) }
-        }
-    }
-}
-
 /// What reading needs, shared by both kinds of transaction. Values read
 /// borrow the transaction, so a write (which takes `&mut`) can't leave one
 /// dangling.
 pub struct Txn<'env> {
-    /// One per environment, null past the last.
+    /// One per environment, null past the last, or in those it isn't in.
     ptrs: [*mut ffi::MDB_txn; MAX_ENVS],
+    /// The environments it's in, held open until it ends.
+    envs: Envs,
     _env: PhantomData<&'env Env>,
 }
 
 impl Txn<'_> {
     /// The transaction in `db`'s environment.
     fn of(&self, db: Db) -> *mut ffi::MDB_txn {
-        self.ptrs[db.env]
+        let ptr = self.ptrs[db.env];
+        assert!(
+            !ptr.is_null(),
+            "a table of an environment the transaction isn't in"
+        );
+        ptr
     }
 
     pub fn get(&self, db: Db, key: &[u8]) -> Result<Option<&[u8]>> {
@@ -698,16 +1102,40 @@ impl<'env> std::ops::Deref for RoTxn<'env> {
     }
 }
 
-pub struct RwTxn<'env>(Txn<'env>);
+pub struct RwTxn<'env> {
+    txn: Txn<'env>,
+    /// The changes to keep in the journal, if one's kept.
+    journal: Option<Recording>,
+}
+
+/// A write transaction's changes to the environment a [`Journal`] is of,
+/// for it to keep once they're committed.
+struct Recording {
+    journal: Arc<Journal>,
+    ops: Vec<u8>,
+}
 
 impl<'env> std::ops::Deref for RwTxn<'env> {
     type Target = Txn<'env>;
     fn deref(&self) -> &Txn<'env> {
-        &self.0
+        &self.txn
     }
 }
 
-impl RwTxn<'_> {
+impl<'env> RwTxn<'env> {
+    fn new(txn: Txn<'env>) -> RwTxn<'env> {
+        RwTxn { txn, journal: None }
+    }
+
+    /// Where to note a change to `db`, if the journal's kept of its
+    /// environment.
+    fn recording(&mut self, db: Db) -> Option<&mut Vec<u8>> {
+        self.journal
+            .as_mut()
+            .filter(|recording| recording.journal.env == db.env)
+            .map(|recording| &mut recording.ops)
+    }
+
     /// Store `value` under `key`. In a duplicate-sorted table it's added
     /// alongside the key's other values. Returns `false`, writing nothing,
     /// when that exact pair is already there.
@@ -731,9 +1159,15 @@ impl RwTxn<'_> {
     fn put_flags(&mut self, db: Db, key: &[u8], value: &[u8], flags: u32) -> Result<bool> {
         let (mut k, mut v) = (val(key), val(value));
         // SAFETY: a live write transaction, and `&mut self` keeps no reads alive.
-        match unsafe { ffi::mdb_put(self.0.of(db), db.dbi, &mut k, &mut v, flags) } {
+        match unsafe { ffi::mdb_put(self.txn.of(db), db.dbi, &mut k, &mut v, flags) } {
             ffi::MDB_KEYEXIST => Ok(false),
-            code => check(code).map(|()| true),
+            code => {
+                check(code)?;
+                if let Some(ops) = self.recording(db) {
+                    record_put(ops, db.dbi, key, value);
+                }
+                Ok(true)
+            }
         }
     }
 
@@ -742,10 +1176,11 @@ impl RwTxn<'_> {
         let mut ptr = ptr::null_mut();
         // SAFETY: a live write transaction, borrowed mutably while the
         // cursor lives; it's closed on drop.
-        check(unsafe { ffi::mdb_cursor_open(self.0.of(db), db.dbi, &mut ptr) })?;
+        check(unsafe { ffi::mdb_cursor_open(self.txn.of(db), db.dbi, &mut ptr) })?;
         Ok(Sweeper {
             ptr,
-            _txn: PhantomData,
+            dbi: db.dbi,
+            ops: self.recording(db),
         })
     }
 
@@ -754,10 +1189,11 @@ impl RwTxn<'_> {
         let mut ptr = ptr::null_mut();
         // SAFETY: a live write transaction, borrowed mutably while the
         // cursor lives; it's closed on drop.
-        check(unsafe { ffi::mdb_cursor_open(self.0.of(db), db.dbi, &mut ptr) })?;
+        check(unsafe { ffi::mdb_cursor_open(self.txn.of(db), db.dbi, &mut ptr) })?;
         Ok(Appender {
             ptr,
-            _txn: PhantomData,
+            dbi: db.dbi,
+            ops: self.recording(db),
         })
     }
 
@@ -768,27 +1204,49 @@ impl RwTxn<'_> {
         let mut v = value.map(val);
         let v_ptr = v.as_mut().map_or(ptr::null_mut(), |v| v as *mut _);
         // SAFETY: a live write transaction; a null data pointer means "every value".
-        Ok(found(unsafe { ffi::mdb_del(self.0.of(db), db.dbi, &mut k, v_ptr) })?.is_some())
+        let gone =
+            found(unsafe { ffi::mdb_del(self.txn.of(db), db.dbi, &mut k, v_ptr) })?.is_some();
+        if gone && let Some(ops) = self.recording(db) {
+            record_del(ops, db.dbi, key, value);
+        }
+        Ok(gone)
     }
 
     /// Remove every entry of a table, keeping the table.
     pub fn clear(&mut self, db: Db) -> Result<()> {
         // SAFETY: a live write transaction; 0 empties the table without
         // closing its handle.
-        check(unsafe { ffi::mdb_drop(self.0.of(db), db.dbi, 0) })
+        check(unsafe { ffi::mdb_drop(self.txn.of(db), db.dbi, 0) })?;
+        if let Some(ops) = self.recording(db) {
+            record_clear(ops, db.dbi);
+        }
+        Ok(())
     }
 
     /// Commit, the last environment opened first. If one fails, those not
     /// yet committed are aborted.
+    /// What's changed in the environment a journal's kept of is kept in
+    /// it, once it's committed.
     pub fn commit(mut self) -> Result<()> {
-        for slot in self.0.ptrs.iter_mut().rev() {
+        for (n, slot) in self.txn.ptrs.iter_mut().enumerate().rev() {
             if slot.is_null() {
                 continue;
             }
+            let recording = self
+                .journal
+                .as_ref()
+                .filter(|recording| recording.journal.env == n && !recording.ops.is_empty());
+            // Until it's kept, so that a writer begun once this commits
+            // can wait for it to be: see Journal::settled.
+            let file =
+                recording.map(|recording| recording.journal.file.lock().expect("unpoisoned"));
             let ptr = std::mem::replace(slot, ptr::null_mut());
             // SAFETY: commit frees the transaction whatever it returns, so
             // it's nulled first to keep Drop from aborting it again.
             check(unsafe { ffi::mdb_txn_commit(ptr) })?;
+            if let (Some(recording), Some(file)) = (recording, file) {
+                recording.journal.append(&file, &recording.ops);
+            }
         }
         Ok(())
     }
@@ -917,7 +1375,9 @@ impl Drop for Cursor<'_> {
 /// Anything out of order is refused with `MDB_KEYEXIST`.
 pub struct Appender<'t> {
     ptr: *mut ffi::MDB_cursor,
-    _txn: PhantomData<&'t mut ()>,
+    dbi: ffi::MDB_dbi,
+    /// Where to note what's appended, if a journal's kept.
+    ops: Option<&'t mut Vec<u8>>,
 }
 
 impl Appender<'_> {
@@ -926,7 +1386,11 @@ impl Appender<'_> {
     pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let (mut k, mut v) = (val(key), val(value));
         // SAFETY: a live cursor of a live write transaction.
-        check(unsafe { ffi::mdb_cursor_put(self.ptr, &mut k, &mut v, ffi::MDB_APPEND) })
+        check(unsafe { ffi::mdb_cursor_put(self.ptr, &mut k, &mut v, ffi::MDB_APPEND) })?;
+        if let Some(ops) = &mut self.ops {
+            record_put(ops, self.dbi, key, value);
+        }
+        Ok(())
     }
 
     /// In a `DUP_FIXED` table, store `values`, packed, each `size` bytes and
@@ -957,10 +1421,15 @@ impl Appender<'_> {
         // `count` values of `size` bytes from `values`, and writes into
         // `data[1]` how many it stored.
         check(unsafe { ffi::mdb_cursor_put(self.ptr, &mut k, data.as_mut_ptr(), flags) })?;
-        match data[1].mv_size == count {
-            true => Ok(()),
-            false => Err(Error(ffi::MDB_PROBLEM)),
+        if data[1].mv_size != count {
+            return Err(Error(ffi::MDB_PROBLEM));
         }
+        if let Some(ops) = &mut self.ops {
+            for value in values.chunks_exact(size) {
+                record_put(ops, self.dbi, key, value);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -972,7 +1441,9 @@ impl Appender<'_> {
 /// the page it was on.
 pub struct Sweeper<'t> {
     ptr: *mut ffi::MDB_cursor,
-    _txn: PhantomData<&'t mut ()>,
+    dbi: ffi::MDB_dbi,
+    /// Where to note what's deleted, if a journal's kept.
+    ops: Option<&'t mut Vec<u8>>,
 }
 
 impl Sweeper<'_> {
@@ -1027,8 +1498,20 @@ impl Sweeper<'_> {
     /// reliable, not when the entry was the last on its page, where it can
     /// read past the page's end.
     pub fn del(&mut self) -> Result<()> {
+        // Its value too, which only a duplicate-sorted table's deletion
+        // heeds.
+        let entry = match self.ops.is_some() {
+            true => self
+                .current()?
+                .map(|(key, value)| (key.to_vec(), value.to_vec())),
+            false => None,
+        };
         // SAFETY: a live cursor of a live write transaction, on an entry.
-        check(unsafe { ffi::mdb_cursor_del(self.ptr, 0) })
+        check(unsafe { ffi::mdb_cursor_del(self.ptr, 0) })?;
+        if let (Some(ops), Some((key, value))) = (&mut self.ops, entry) {
+            record_del(ops, self.dbi, &key, Some(&value));
+        }
+        Ok(())
     }
 }
 
@@ -1280,6 +1763,144 @@ mod tests {
                 .1
                 == 2u32.to_be_bytes()
         );
+    }
+
+    /// Every entry of `db`, in order.
+    fn dump(txn: &Txn, db: Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut cursor = txn.cursor(db).unwrap();
+        let mut entries = Vec::new();
+        let mut entry = cursor.first().unwrap();
+        while let Some((key, value)) = entry {
+            entries.push((key.to_vec(), value.to_vec()));
+            entry = cursor.next().unwrap();
+        }
+        entries
+    }
+
+    /// What's committed as a journal's kept, replayed into a copy made as
+    /// it began, makes the copy the same; put in its place, the copy's
+    /// read and written after, a writer that waited on it too.
+    #[test]
+    fn replays_a_journal_into_a_copy_put_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (other, copy_dir) = (dir.path().join("other"), dir.path().join("copy"));
+        std::fs::create_dir(&other).unwrap();
+        std::fs::create_dir(&copy_dir).unwrap();
+        let mut env = Env::open(dir.path(), 1 << 24, 8, 16).unwrap();
+        env.attach(&other, 1 << 24, 4, 16).unwrap();
+        let plain = env.create_db("plain", DbFlags::PLAIN).unwrap();
+        let dups = env.create_db("dups", DbFlags::DUP_FIXED).unwrap();
+        let gone = env.create_db("gone", DbFlags::PLAIN).unwrap();
+        let appended = env
+            .create_db_in(1, "appended", DbFlags::INTEGER_KEY)
+            .unwrap();
+        let mut txn = env.write_txn().unwrap();
+        for n in 0..500u32 {
+            txn.put(plain, format!("k{n:03}").as_bytes(), &n.to_be_bytes())
+                .unwrap();
+            txn.put_dup(dups, &[(n % 3) as u8], &n.to_be_bytes())
+                .unwrap();
+            txn.put(gone, &n.to_be_bytes(), b"x").unwrap();
+        }
+        txn.commit().unwrap();
+
+        let copy = env.create_like(0, &copy_dir).unwrap();
+        let (journal, before) = env.journal(0, &dir.path().join("journal")).unwrap();
+        assert!(env.journal(0, &dir.path().join("second")).is_err());
+        let copied: Vec<Db> = copy.tables_of(0).into_iter().map(|(_, db, _)| db).collect();
+        let mut txn = copy.write_txn().unwrap();
+        for ((_, db, _), &to) in env.tables_of(0).iter().zip(&copied) {
+            for (key, value) in dump(&before, *db) {
+                txn.put(to, &key, &value).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        drop(before);
+
+        // Every kind of change, meanwhile.
+        let mut txn = env.write_txn().unwrap();
+        txn.put(plain, b"k001", b"changed").unwrap();
+        txn.del(plain, b"k002", None).unwrap();
+        txn.put_dup(dups, &[7], &9u32.to_be_bytes()).unwrap();
+        txn.del(dups, &[1], Some(&4u32.to_be_bytes())).unwrap();
+        txn.clear(gone).unwrap();
+        let mut sweeper = txn.sweeper(dups).unwrap();
+        let mut entry = sweeper
+            .first()
+            .unwrap()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()));
+        while let Some((key, value)) = entry {
+            let n = u32::from_be_bytes(value[..].try_into().unwrap());
+            entry = match n % 5 == 0 {
+                true => {
+                    sweeper.del().unwrap();
+                    sweeper.get_both_range(&key, &value).unwrap()
+                }
+                false => sweeper.next().unwrap(),
+            }
+            .map(|(k, v)| (k.to_vec(), v.to_vec()));
+        }
+        drop(sweeper);
+        txn.appender(plain).unwrap().append(b"zz", b"last").unwrap();
+        // In the other environment, which isn't journaled.
+        txn.put(appended, &1u64.to_ne_bytes(), b"one").unwrap();
+        txn.commit().unwrap();
+        // Never committed, so never kept.
+        let mut txn = env.write_txn().unwrap();
+        txn.put(plain, b"never", b"!").unwrap();
+        drop(txn);
+        assert!(!journal.is_empty());
+        let at = copy.replay(&journal, 0, false).unwrap();
+        assert_eq!(at, journal.len());
+        let mut txn = env.write_txn().unwrap();
+        txn.put(plain, b"late", b"!").unwrap();
+        txn.commit().unwrap();
+        assert_eq!(copy.replay(&journal, at, true).unwrap(), journal.len());
+        env.stop_journal();
+
+        let (live, copied_txn) = (env.read_txn().unwrap(), copy.read_txn().unwrap());
+        for ((name, db, _), &to) in env.tables_of(0).iter().zip(&copied) {
+            assert_eq!(dump(&live, *db), dump(&copied_txn, to), "{name}");
+        }
+        assert!(live.get(plain, b"never").unwrap().is_none());
+        drop(copied_txn);
+
+        // A writer waiting as it's put in place writes in the copy.
+        let held = env.write_txn().unwrap();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                let mut txn = env.write_txn().unwrap();
+                txn.put(plain, b"waited", b"!").unwrap();
+                txn.commit().unwrap();
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!waiting.is_finished());
+            let old = env.replace(0, copy);
+            drop(held);
+            waiting.join().unwrap();
+            // The old file, read from before, is as it was.
+            assert!(live.get(plain, b"waited").unwrap().is_none());
+            assert!(
+                old.read_txn()
+                    .unwrap()
+                    .get(plain, b"waited")
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        drop(live);
+        let txn = env.read_txn().unwrap();
+        assert_eq!(txn.get(plain, b"waited").unwrap(), Some(&b"!"[..]));
+        assert_eq!(txn.get(plain, b"zz").unwrap(), Some(&b"last"[..]));
+        assert_eq!(
+            txn.get(appended, &1u64.to_ne_bytes()).unwrap(),
+            Some(&b"one"[..])
+        );
+        drop(txn);
+        // And it's checkpointed, as the store's environments are.
+        env.begin_checkpoint().unwrap();
+        env.sync().unwrap();
+        env.confirm_checkpoint();
     }
 
     /// Where a value read is in the file, as read ahead goes by.

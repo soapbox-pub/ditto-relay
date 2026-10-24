@@ -20,10 +20,14 @@ use ditto_relay::store::{BODIES_DIR, History, IndexedTags, Store, Writer};
 use ditto_relay::tls::{self, Tls};
 use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
-use ditto_relay::{compact, control, delete, facets, key, metrics, relay, trends};
+use ditto_relay::{compact, control, delete, facets, key, metrics, relay, repack, trends};
 
 /// How many threads `compact` reads ahead on, unless told.
 const COMPACT_THREADS: usize = 32;
+
+/// How many threads `repack` reads ahead on, unless told: fewer, to leave
+/// the disk to the relay.
+const REPACK_THREADS: usize = 8;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -90,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
             threads,
             bodies,
         } => compact(&config, from, into, threads, bodies),
+        Command::Repack { threads, bodies } => repack(&config, threads, bodies),
     }
 }
 
@@ -526,25 +531,7 @@ fn compact(
     threads: usize,
     bodies: bool,
 ) -> anyhow::Result<()> {
-    let mut progress = |p: &compact::Progress| {
-        let left = match p.done {
-            0 => String::new(),
-            done => {
-                let secs =
-                    p.elapsed.as_secs_f64() * (p.total.saturating_sub(done)) as f64 / done as f64;
-                format!(", about {:.0} minutes left", secs / 60.0)
-            }
-        };
-        eprintln!(
-            "{}: {} of {} {}, {:.1} GB, in {:.0?}{left}",
-            p.table,
-            p.done,
-            p.total,
-            p.unit,
-            p.bytes as f64 / 1e9,
-            p.elapsed,
-        );
-    };
+    let mut progress = |p: &compact::Progress| eprintln!("{p}");
     let copied = match (from, into) {
         (Some(from), Some(into)) => {
             compact::copy(&from, &into, config.map_size, threads, &mut progress)?
@@ -603,6 +590,40 @@ fn compact(
         copied.after as f64 / 1e9,
         copied.elapsed,
         copied.split,
+    );
+    Ok(())
+}
+
+/// `ditto-relay repack`: see [`repack`]. The running relay is asked to do
+/// it; with none running, it's done here, and a relay started meanwhile
+/// waits.
+fn repack(config: &Config, threads: usize, bodies: bool) -> anyhow::Result<()> {
+    let socket = control::socket_path(&config.db_path);
+    let mut say = |line: &str| eprintln!("{line}");
+    let repacked = match control::request_repack(&socket, bodies, threads, say)? {
+        Some(repacked) => repacked,
+        None => {
+            let Some(_lock) = control::Lock::try_acquire(&config.db_path)? else {
+                bail!(
+                    "the relay is using the database but isn't answering on {}: it may be starting or stopping, so try again",
+                    socket.display()
+                );
+            };
+            let store = open_store(config)?;
+            let repacked = repack::repack(&store, bodies, threads, &mut say)?;
+            store.checkpoint()?;
+            repacked
+        }
+    };
+    for (table, entries) in &repacked.tables {
+        println!("{table}: {entries} entries");
+    }
+    println!(
+        "repacked {:.1} GB into {:.1} GB in {:.0?}, the writer waiting {:.1?} of it",
+        repacked.before as f64 / 1e9,
+        repacked.after as f64 / 1e9,
+        repacked.elapsed,
+        repacked.paused,
     );
     Ok(())
 }
@@ -995,6 +1016,40 @@ must be stopped or a snapshot, into --into, to see how long it takes.",
         threads: usize,
         /// Compact the event records too
         #[arg(long, conflicts_with = "from")]
+        bodies: bool,
+    },
+
+    /// Compact the database while the relay runs
+    #[command(
+        long_about = "Compact the database while the relay runs, as \
+`compact` does with it stopped, and put the copy in place of the old file, \
+which is then removed.
+
+The relay goes on reading and writing the old file meanwhile, and what it \
+writes is kept in a journal beside the copy, then made in the copy too. \
+Once the copy has caught up, the relay's writes wait while the last of \
+them is made, about a second, and the copy is put in place. Reads under \
+way go on in the old file, whose space is freed once they end.
+
+It needs room for the copy, about the size of what's live, for what's \
+written meanwhile, and for the old file to grow meanwhile: LMDB can't \
+reuse the pages of the old file the copy is reading. If the relay or the \
+machine stops before the copy's in place, the database is as it was, and \
+what the repack made is removed when the relay next starts.
+
+The indexes (db/data.mdb) are compacted, or with --bodies, the event \
+records (db/bodies) instead. With the relay stopped, it's done here, and \
+a relay started meanwhile waits.",
+        after_help = "Example:
+  sudo -u ditto-relay ditto-relay repack
+  sudo -u ditto-relay ditto-relay repack --bodies"
+    )]
+    Repack {
+        /// How many threads read ahead
+        #[arg(long, value_name = "N", default_value_t = REPACK_THREADS)]
+        threads: usize,
+        /// Compact the event records, rather than the indexes
+        #[arg(long)]
         bodies: bool,
     },
 }

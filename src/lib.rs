@@ -27,6 +27,7 @@ pub mod query;
 pub mod rank;
 pub mod record;
 pub mod relay;
+pub mod repack;
 pub mod search;
 pub mod storage;
 pub mod store;

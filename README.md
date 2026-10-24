@@ -83,6 +83,7 @@ manage it, and are run with the relay's own config, as its user:
 | `cancel` | Cancels a queued deletion ([below](#deleting-events)) |
 | `export`, `import` | Events out and in, as JSON lines ([below](#exporting-and-importing)) |
 | `compact` | Compacts the database, with the relay stopped ([below](#compacting-the-database)) |
+| `repack` | Compacts the database while the relay runs ([below](#compacting-the-database)) |
 
 `ditto-relay help <command>` says more about each, with examples. `check` and
 `deletions` take `--json`, for scripts.
@@ -209,6 +210,29 @@ It reads with 32 threads at once, as the live pages of a big file are scattered,
 waiting on them one at a time is what makes `mdb_copy -c` slow. `--threads` changes
 how many. `compact --from <dir> --into <dir>` only copies the database in `--from`,
 which must be stopped or a snapshot, into `--into`, to see how long it takes.
+
+### While the relay runs
+
+```sh
+sudo -u ditto-relay ditto-relay repack
+sudo -u ditto-relay ditto-relay repack --bodies
+```
+
+`repack` compacts the indexes as `compact` does, or with `--bodies` the event records
+instead, while the relay goes on serving. The relay makes the copy itself, reading
+the database as it was when it began. What it writes meanwhile goes to the old file as
+usual, and is also kept in a journal that the copy catches up from. Once the copy has
+caught up, the relay's writes wait for about a second while the last of them is
+copied, and the copy replaces the old file. Reads already under way finish on the old
+file, which is removed once they're done. Nothing is left to clean up.
+
+It needs room for the copy, for what's written meanwhile, and for the old file to grow
+while the copy reads it, since LMDB can't reuse the pages the copy is reading. It reads
+ahead with 8 threads, fewer than `compact`, to leave the disk to the relay;
+`--threads` changes that. If the relay or the machine stops before the copy is in
+place, the database is as it was, and the half-made copy in `db/repack/` is removed
+when the relay starts. With the relay stopped, `repack` runs by itself, and a relay
+started meanwhile waits for it.
 
 ## Storage
 

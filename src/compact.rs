@@ -84,6 +84,29 @@ pub struct Progress<'a> {
     pub elapsed: Duration,
 }
 
+impl std::fmt::Display for Progress<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let left = match self.done {
+            0 => String::new(),
+            done => {
+                let secs = self.elapsed.as_secs_f64() * (self.total.saturating_sub(done)) as f64
+                    / done as f64;
+                format!(", about {:.0} minutes left", secs / 60.0)
+            }
+        };
+        write!(
+            f,
+            "{}: {} of {} {}, {:.1} GB, in {:.0?}{left}",
+            self.table,
+            self.done,
+            self.total,
+            self.unit,
+            self.bytes as f64 / 1e9,
+            self.elapsed,
+        )
+    }
+}
+
 /// What a copy did.
 pub struct Copied {
     /// Every table copied, and how many entries it has.
@@ -185,106 +208,16 @@ pub fn copy(
         .iter()
         .map(|table| dest.create_db(&table.name, table.flags))
         .collect::<Result<Vec<_>, _>>()?;
-
-    let mut ranges = Vec::new();
-    for (n, table) in tables.iter().enumerate() {
-        ranges.extend(ranges_of(n, split(&source, table, threads.max(1))?));
-    }
-    let split = start.elapsed();
-
-    let reading = source.read_txn()?;
-    let total: u64 = tables
-        .iter()
-        .map(|table| reading.len(table.db).map(|n| n as u64))
-        .sum::<Result<u64, _>>()?;
-    // The range the copy is in, and the next a thread is to read.
-    let copying = AtomicUsize::new(0);
-    let next = AtomicUsize::new(0);
-    let done = AtomicBool::new(false);
-    let pieces = Mutex::new(VecDeque::new());
-    let reader = Reader {
-        env: &source,
+    let copying = Copying {
+        source: &source,
         tables: &tables,
-        ranges: &ranges,
-        copying: &copying,
-        next: &next,
-        ahead: threads * AHEAD_PER_THREAD,
-        pieces: &pieces,
-        done: &done,
-        renew: false,
+        dest: &dest,
+        dests: &dests,
+        threads,
+        live: false,
+        start,
     };
-    std::thread::scope(|scope| -> anyhow::Result<()> {
-        for _ in 0..threads {
-            scope.spawn(|| reader.run());
-        }
-        let copied = (|| -> anyhow::Result<()> {
-            let (mut entries, mut bytes, mut uncommitted) = (0u64, 0u64, 0u64);
-            let mut said = Instant::now();
-            let mut txn = dest.write_txn()?;
-            for (n, range) in ranges.iter().enumerate() {
-                copying.store(n, Ordering::Relaxed);
-                let table = &tables[range.table];
-                let mut appender = txn.appender(dests[range.table])?;
-                walk(&reading, table, range, None, |item| {
-                    match item {
-                        Item::Entry(key, value) => {
-                            appender.append(key, value)?;
-                            entries += 1;
-                            uncommitted += (key.len() + value.len()) as u64;
-                        }
-                        Item::Dups {
-                            key,
-                            values,
-                            size,
-                            first,
-                        } => {
-                            appender.append_dups(key, values, size, first)?;
-                            entries += (values.len() / size) as u64;
-                            uncommitted += values.len() as u64;
-                        }
-                    }
-                    // From within a range, as one key can take minutes.
-                    if said.elapsed() >= Duration::from_secs(1) {
-                        progress(&Progress {
-                            table: &table.name,
-                            done: entries,
-                            total,
-                            unit: "entries",
-                            bytes: bytes + uncommitted,
-                            elapsed: start.elapsed(),
-                        });
-                        said = Instant::now();
-                    }
-                    Ok(())
-                })
-                .with_context(|| format!("Could not copy the table {}", table.name))?;
-                drop(appender);
-                if uncommitted >= COMMIT_BYTES {
-                    txn.commit()?;
-                    txn = dest.write_txn()?;
-                    bytes += std::mem::take(&mut uncommitted);
-                }
-            }
-            txn.commit()?;
-            Ok(())
-        })();
-        done.store(true, Ordering::Relaxed);
-        copied
-    })?;
-
-    // Read from what's been written, not what was meant to be.
-    let check = dest.read_txn()?;
-    let mut counts = Vec::new();
-    for (table, &db) in tables.iter().zip(&dests) {
-        let (want, got) = (reading.len(table.db)?, check.len(db)?);
-        ensure!(
-            want == got,
-            "the copy of the table {} has {got} entries, not {want}",
-            table.name
-        );
-        counts.push((table.name.clone(), got as u64));
-    }
-    drop(check);
+    let (counts, split) = copying.run(None, progress)?;
     dest.sync()?;
     let (before, after) = (source.usage(0)?.used, dest.usage(0)?.used);
     Ok(Copied {
@@ -295,6 +228,179 @@ pub fn copy(
         elapsed: start.elapsed(),
         bodies: Bodies::Left,
     })
+}
+
+/// Copy environment `env` of `source`, a store's, being written meanwhile,
+/// as `reading`, of that environment, sees it, into `dest`, made
+/// [alike](Env::create_like) it, [compacted](self), reading ahead on
+/// `threads` threads. Returns every table copied, with how many entries it
+/// has. The copy isn't synced to disk.
+pub(crate) fn copy_live(
+    source: &Env,
+    env: usize,
+    reading: &Txn,
+    dest: &Env,
+    threads: usize,
+    progress: &mut dyn FnMut(&Progress),
+) -> anyhow::Result<Vec<(String, u64)>> {
+    let tables: Vec<Table> = source
+        .tables_of(env)
+        .into_iter()
+        .map(|(name, db, flags)| Table { name, db, flags })
+        .collect();
+    let dests: Vec<Db> = dest.tables_of(0).into_iter().map(|(_, db, _)| db).collect();
+    let copying = Copying {
+        source,
+        tables: &tables,
+        dest,
+        dests: &dests,
+        threads,
+        live: true,
+        start: Instant::now(),
+    };
+    Ok(copying.run(Some(reading), progress)?.0)
+}
+
+/// A copy of some tables of an environment into another's.
+struct Copying<'a> {
+    source: &'a Env,
+    tables: &'a [Table],
+    dest: &'a Env,
+    /// The table each of `tables` is copied into.
+    dests: &'a [Db],
+    threads: usize,
+    /// Whether `source` is written meanwhile, so that what reads ahead
+    /// reads in transactions of its own, a range each, pinning nothing for
+    /// long.
+    live: bool,
+    start: Instant,
+}
+
+impl Copying<'_> {
+    /// Copy the tables as `reading` sees them, or else a transaction of
+    /// its own, then check the copy holds as many entries. Returns every
+    /// table, with how many it has, and how long splitting them took.
+    fn run(
+        &self,
+        reading: Option<&Txn>,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> anyhow::Result<(Vec<(String, u64)>, Duration)> {
+        let Copying {
+            source,
+            tables,
+            dest,
+            dests,
+            threads,
+            live,
+            start,
+        } = *self;
+        let mut ranges = Vec::new();
+        for (n, table) in tables.iter().enumerate() {
+            ranges.extend(ranges_of(n, split(source, table, threads.max(1))?));
+        }
+        let split = start.elapsed();
+
+        let own;
+        let reading = match reading {
+            Some(reading) => reading,
+            None => {
+                own = source.read_txn()?;
+                &own
+            }
+        };
+        let total: u64 = tables
+            .iter()
+            .map(|table| reading.len(table.db).map(|n| n as u64))
+            .sum::<Result<u64, _>>()?;
+        // The range the copy is in, and the next a thread is to read.
+        let copying = AtomicUsize::new(0);
+        let next = AtomicUsize::new(0);
+        let done = AtomicBool::new(false);
+        let pieces = Mutex::new(VecDeque::new());
+        let reader = Reader {
+            env: source,
+            tables,
+            ranges: &ranges,
+            copying: &copying,
+            next: &next,
+            ahead: threads * AHEAD_PER_THREAD,
+            pieces: &pieces,
+            done: &done,
+            renew: live,
+        };
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            for _ in 0..threads {
+                scope.spawn(|| reader.run());
+            }
+            let copied = (|| -> anyhow::Result<()> {
+                let (mut entries, mut bytes, mut uncommitted) = (0u64, 0u64, 0u64);
+                let mut said = Instant::now();
+                let mut txn = dest.write_txn()?;
+                for (n, range) in ranges.iter().enumerate() {
+                    copying.store(n, Ordering::Relaxed);
+                    let table = &tables[range.table];
+                    let mut appender = txn.appender(dests[range.table])?;
+                    walk(reading, table, range, None, |item| {
+                        match item {
+                            Item::Entry(key, value) => {
+                                appender.append(key, value)?;
+                                entries += 1;
+                                uncommitted += (key.len() + value.len()) as u64;
+                            }
+                            Item::Dups {
+                                key,
+                                values,
+                                size,
+                                first,
+                            } => {
+                                appender.append_dups(key, values, size, first)?;
+                                entries += (values.len() / size) as u64;
+                                uncommitted += values.len() as u64;
+                            }
+                        }
+                        // From within a range, as one key can take minutes.
+                        if said.elapsed() >= Duration::from_secs(1) {
+                            progress(&Progress {
+                                table: &table.name,
+                                done: entries,
+                                total,
+                                unit: "entries",
+                                bytes: bytes + uncommitted,
+                                elapsed: start.elapsed(),
+                            });
+                            said = Instant::now();
+                        }
+                        Ok(())
+                    })
+                    .with_context(|| format!("Could not copy the table {}", table.name))?;
+                    drop(appender);
+                    if uncommitted >= COMMIT_BYTES {
+                        txn.commit()?;
+                        txn = dest.write_txn()?;
+                        bytes += std::mem::take(&mut uncommitted);
+                    }
+                }
+                txn.commit()?;
+                Ok(())
+            })();
+            done.store(true, Ordering::Relaxed);
+            copied
+        })?;
+
+        // Read from what's been written, not what was meant to be.
+        let check = dest.read_txn()?;
+        let mut counts = Vec::new();
+        for (table, &db) in tables.iter().zip(dests) {
+            let (want, got) = (reading.len(table.db)?, check.len(db)?);
+            ensure!(
+                want == got,
+                "the copy of the table {} has {got} entries, not {want}",
+                table.name
+            );
+            counts.push((table.name.clone(), got as u64));
+        }
+        Ok((counts, split))
+    }
 }
 
 /// Compact the database in the directory `dir`, whose main environment
