@@ -206,6 +206,11 @@ const DELETION_FILTER_BITS: u64 = 1 << 31;
 /// The directory, in the database's, of the environment records are kept in.
 pub const BODIES_DIR: &str = "bodies";
 
+/// How many events and addresses a NIP-09 deletion names, at most, for
+/// [`insert`](Store::insert) to look them all up, and so not queue it if
+/// none is stored.
+pub(crate) const SETTLED_AT_ONCE: usize = 64;
+
 /// The deletion filter's file, in the database's directory.
 const DELETION_FILTER_FILE: &str = "deletions.bloom";
 
@@ -1225,7 +1230,20 @@ impl Store {
             }),
             _ => None,
         };
-        if let Some(target) = target {
+        // A NIP-09 deletion naming a few events, none of them stored, as
+        // most do, is done with: what's stored after it can't be what it
+        // covers, which the deletion filter refuses. Queueing it would cost
+        // a commit, and another to drop it.
+        let settled = match &target {
+            Some(Target::Deletion(deletion)) => {
+                deletion.ids.len() + deletion.addresses.len() <= SETTLED_AT_ONCE
+                    && self.deleting(txn, deletion, seq)?.is_empty()
+            }
+            _ => false,
+        };
+        if let Some(target) = target
+            && !settled
+        {
             self.queue_deletion(txn, seq, target)?;
         }
         Ok(Outcome::Stored(seq))

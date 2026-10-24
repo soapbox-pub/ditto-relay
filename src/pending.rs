@@ -883,7 +883,8 @@ mod tests {
         for (seed, note) in (1..=10u8).zip(&notes) {
             store_only(&store, &signed(seed, 200, 5, vec![vec!["e", &note.id]], ""));
         }
-        // Not their author's: refused.
+        // Not their author's: refused, and as it names nothing it may
+        // delete, never queued.
         store_only(
             &store,
             &signed(1, 200, 5, vec![vec!["e", &notes[15].id]], ""),
@@ -896,7 +897,7 @@ mod tests {
         let mut left = left;
         left.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(left, want);
-        assert_eq!(store.pending().len(), 12);
+        assert_eq!(store.pending().len(), 11);
         settle(&store);
         assert!(store.pending().is_empty());
     }

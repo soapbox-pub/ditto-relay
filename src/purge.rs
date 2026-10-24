@@ -1543,19 +1543,19 @@ mod tests {
         (dir, store, notes)
     }
 
-    /// NIP-09 deletions are found and removed together, in a chunk, those
-    /// of what's not stored too, and after a restart, with nothing kept but
-    /// what they name.
+    /// NIP-09 deletions are found and removed together, in a chunk, and
+    /// after a restart, with nothing kept but what they name. Those of what's
+    /// not stored are never queued.
     #[test]
     fn takes_nip09_deletions_together() {
         let (dir, store, notes) = with_nip09(10, 5);
-        assert_eq!(store.pending().len(), 15);
+        assert_eq!(store.pending().len(), 10);
         drop(store);
         let store = open_in(dir.path());
         let mut purger = Purger::new(&store, None, false).unwrap();
         assert!(purger.work(&store, &|_| {}).unwrap());
         assert!(purger.jobs.is_empty());
-        assert_eq!(purger.finished.len(), 15);
+        assert_eq!(purger.finished.len(), 10);
         assert_eq!(purger.total, 10);
         assert!(store.list_pending().unwrap().is_empty());
         let txn = store.read().unwrap();
@@ -1565,6 +1565,26 @@ mod tests {
         }
     }
 
+    /// A deletion stored in the same batch as what it deletes sees it, and
+    /// is queued: only one of nothing stored is settled as it's stored.
+    #[test]
+    fn queues_a_deletion_of_what_its_batch_stores() {
+        let (_dir, store) = open();
+        let note = signed(3, 100, 1, vec![], "note");
+        let deletion = signed(3, 200, 5, vec![vec!["e", &note.id]], "");
+        let records = [
+            crate::record::encode(&note),
+            crate::record::encode(&deletion),
+        ];
+        store
+            .write_batch(records.iter().map(Vec::as_slice), 0)
+            .unwrap();
+        assert_eq!(store.pending().len(), 1);
+        crate::store::tests::settle(&store);
+        let id = crate::event::decode_hex::<32>(&note.id).unwrap();
+        assert!(store.seq_of(&store.read().unwrap(), &id).unwrap().is_none());
+    }
+
     /// NIP-09 deletions and the rest take chunks by turns, so however many
     /// come, a deletion removed one at a time goes on.
     #[test]
@@ -1572,9 +1592,17 @@ mod tests {
         let picked = json!({"kinds": [1], "limit": 30});
         let (_dir, store) = store_with(&events(60), &[picked]);
         let big = store.pending()[0].clone();
-        for n in 0..5u8 {
-            let id = format!("{n:064x}");
-            let deletion = signed(1, 200, 5, vec![vec!["e", &id]], "");
+        // Naming too many to be looked up as they're stored, so queued.
+        let many = crate::store::SETTLED_AT_ONCE as u32 + 1;
+        for n in 0..5u32 {
+            let tags = (0..many)
+                .map(|m| vec!["e".to_string(), format!("{:064x}", n * 1000 + m)])
+                .collect::<Vec<_>>();
+            let tags = tags
+                .iter()
+                .map(|tag| tag.iter().map(String::as_str).collect())
+                .collect();
+            let deletion = signed(1, 200, 5, tags, "");
             store
                 .write_batch([crate::record::encode(&deletion).as_slice()], 0)
                 .unwrap();
