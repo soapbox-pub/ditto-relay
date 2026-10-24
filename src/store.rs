@@ -135,7 +135,7 @@ use crate::facets;
 use crate::filter::Filter;
 use crate::hll::{self, Registers};
 use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
-use crate::metrics::METRICS;
+use crate::metrics::{METRICS, Phase};
 use crate::pending::{self, Hidden, Target};
 use crate::purge::Purger;
 use crate::rank::{self, Rank};
@@ -2201,9 +2201,12 @@ impl Writer {
             panic!("couldn't read the pending deletions: {err:#}");
         });
         let prefetching = store.clone();
+        crate::metrics::watch_writer();
         let thread = std::thread::Builder::new()
             .name("lmdb-writer".into())
             .spawn(move || {
+                METRICS.writer.started();
+                let phase = |phase| METRICS.writer.phase(phase);
                 let mut next_sweep = Instant::now();
                 let mut sweep_chunk = FIRST_SWEEP;
                 let mut next_save = Instant::now() + DELETION_FILTER_SAVE_INTERVAL;
@@ -2211,12 +2214,14 @@ impl Writer {
                 // Whether the web of trust may have pushing to do.
                 let mut trust = true;
                 let turn = |trust: &mut bool| {
+                    let _turn = phase(Phase::Turn);
                     *trust = store.turn().unwrap_or_else(|err| {
                         tracing::error!("a background turn failed: {err}");
                         false
                     });
                 };
                 let forget = || {
+                    let _forget = phase(Phase::Forget);
                     if let Err(err) = store.forget() {
                         tracing::error!("removing the records of removed events failed: {err}");
                     }
@@ -2225,6 +2230,7 @@ impl Writer {
                     forget();
                     if Instant::now() >= next_sweep {
                         let start = Instant::now();
+                        let expiry = phase(Phase::Expiry);
                         let more = match sweep(&store, sweep_chunk) {
                             Ok((removed, more)) => {
                                 tell((Vec::new(), removed));
@@ -2235,6 +2241,7 @@ impl Writer {
                                 false
                             }
                         };
+                        drop(expiry);
                         sweep_chunk =
                             crate::purge::next_chunk(sweep_chunk, start.elapsed(), MAX_SWEEP);
                         forget();
@@ -2275,17 +2282,19 @@ impl Writer {
                             job
                         }
                         Ok(Request::Delete(job)) => {
+                            let _queue = phase(Phase::Queue);
                             let (target, reply) = *job;
                             let _ = reply.send(queue(&store, target));
                             continue;
                         }
                         Ok(Request::Cancel((id, reply))) => {
+                            let _queue = phase(Phase::Queue);
                             let _ = reply.send(purger.cancel(&store, id));
                             continue;
                         }
                         Ok(Request::Stop) => break,
                         Err(RecvTimeoutError::Timeout) => {
-                            purger.step(&store, &tell);
+                            phase(Phase::Purge).run(|| purger.step(&store, &tell));
                             if trust {
                                 turn(&mut trust);
                             }
@@ -2313,7 +2322,8 @@ impl Writer {
                         }
                     }
 
-                    write(&store, batch, &tell);
+                    phase(Phase::Batch).run(|| write(&store, batch, &tell));
+                    let queueing = phase(Phase::Queue);
                     for job in deletes {
                         let (target, reply) = *job;
                         let _ = reply.send(queue(&store, target));
@@ -2321,6 +2331,7 @@ impl Writer {
                     for (id, reply) in cancels {
                         let _ = reply.send(purger.cancel(&store, id));
                     }
+                    drop(queueing);
                     if stop {
                         break;
                     }
@@ -2332,7 +2343,7 @@ impl Writer {
                     // chunk of deleting between them keeps it going however
                     // busy the relay is.
                     turn(&mut trust);
-                    purger.step(&store, &tell);
+                    phase(Phase::Purge).run(|| purger.step(&store, &tell));
                 }
                 forget();
                 if let Some(saving) = saving {
@@ -2413,6 +2424,7 @@ impl Writer {
             .await
             .map_err(|_| anyhow!("writer thread dropped the request"))?;
         METRICS.writes.since(start);
+        METRICS.write_latency.observe(start.elapsed());
         outcome
     }
 

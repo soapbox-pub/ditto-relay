@@ -1245,6 +1245,13 @@ impl<'env> RwTxn<'env> {
     /// What's changed in the environment a journal's kept of is kept in
     /// it, once it's committed.
     pub fn commit(mut self) -> Result<()> {
+        let start = std::time::Instant::now();
+        let committed = self.commit_each();
+        crate::metrics::note_commit(start.elapsed());
+        committed
+    }
+
+    fn commit_each(&mut self) -> Result<()> {
         for (n, slot) in self.txn.ptrs.iter_mut().enumerate().rev() {
             if slot.is_null() {
                 continue;
