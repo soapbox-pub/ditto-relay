@@ -1023,19 +1023,22 @@ must be stopped or a snapshot, into --into, to see how long it takes.",
     #[command(
         long_about = "Compact the database while the relay runs, as \
 `compact` does with it stopped, and put the copy in place of the old file, \
-which is then removed.
+which is then freed a little at a time, as freeing it at once holds up \
+writes on ZFS.
 
 The relay goes on reading and writing the old file meanwhile, and what it \
 writes is kept in a journal beside the copy, then made in the copy too. \
 Once the copy has caught up, the relay's writes wait while the last of \
 them is made, about a second, and the copy is put in place. Reads under \
-way go on in the old file, whose space is freed once they end.
+way go on in the old file, whose space is freed once they end. Sweeps of \
+big deletions wait meanwhile. If the copy can't catch up with what's \
+written, the repack gives up, leaving the old file in place.
 
 It needs room for the copy, about the size of what's live, for what's \
 written meanwhile, and for the old file to grow meanwhile: LMDB can't \
 reuse the pages of the old file the copy is reading. If the relay or the \
 machine stops before the copy's in place, the database is as it was, and \
-what the repack made is removed when the relay next starts.
+what the repack made is freed when the relay next starts.
 
 The indexes (db/data.mdb) are compacted, or with --bodies, the event \
 records (db/bodies) instead. With the relay stopped, it's done here, and \

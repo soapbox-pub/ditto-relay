@@ -226,6 +226,16 @@ impl Drop for Handle {
 /// An [`Env`]'s environments, in the order they were opened.
 type Envs = Arc<Vec<Arc<Handle>>>;
 
+/// An environment let go of, which says when its file's been closed: see
+/// [`Env::closing`].
+pub struct Closing(std::sync::Weak<Handle>);
+
+impl Closing {
+    pub fn is_closed(&self) -> bool {
+        self.0.strong_count() == 0
+    }
+}
+
 pub struct Env {
     envs: ArcSwap<Vec<Arc<Handle>>>,
     /// Opened only to read: no write transaction can begin, so the writer's
@@ -828,6 +838,13 @@ impl Env {
         let out = Env::new(self.read_only);
         out.envs.store(Arc::new(vec![replaced]));
         out
+    }
+
+    /// Let go of this environment of its own, as one [replaced](Self::replace)
+    /// is, and say when its file's closed: once the last transaction begun
+    /// in it has ended.
+    pub fn closing(self) -> Closing {
+        Closing(Arc::downgrade(&self.envs.load()[0]))
     }
 
     /// Write a compacted copy of the environment `env` into the directory

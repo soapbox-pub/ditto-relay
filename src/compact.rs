@@ -566,7 +566,7 @@ fn rewrite(
 }
 
 /// The bytes free for an unprivileged user on the filesystem `dir` is on.
-fn free_space(dir: &Path) -> io::Result<u64> {
+pub(crate) fn free_space(dir: &Path) -> io::Result<u64> {
     let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: plain data, filled in by the kernel, and a NUL-terminated path.

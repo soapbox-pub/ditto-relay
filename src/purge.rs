@@ -103,6 +103,10 @@ const RETRY: Duration = Duration::from_secs(10);
 /// else to delete meanwhile.
 const PLAN_POLL: Duration = Duration::from_millis(20);
 
+/// How often the writer looks whether a repack that holds up the sweeps
+/// is done.
+const SWEEPS_HELD: Duration = Duration::from_secs(1);
+
 /// How often a long deletion says how it's going.
 const SAY_EVERY: Duration = Duration::from_secs(30);
 
@@ -411,16 +415,21 @@ impl Purger {
             })
             .min()
             .map(|(_, i)| i);
+        // None while a repack's under way: a sweep removes millions of
+        // index entries, each kept in the repack's journal, which the copy
+        // may then never catch up with. Only the running relay's writer
+        // waits: carried out flat out, they'd never be done.
+        let repacking = self.aside && store.repacking.load(Ordering::Relaxed);
         let sweep = || {
             self.jobs.iter().position(|job| match &job.work {
-                Work::Sweep(sweep) => sweep.is_started(),
+                Work::Sweep(sweep) => !repacking && sweep.is_started(),
                 _ => false,
             })
         };
         let first_sweep = || {
             self.jobs
                 .iter()
-                .position(|job| matches!(job.work, Work::Sweep(_)))
+                .position(|job| !repacking && matches!(job.work, Work::Sweep(_)))
         };
         let other = each.or_else(sweep).or_else(first_sweep);
         let nip09 = self.jobs.iter().any(Job::is_nip09);
@@ -433,6 +442,10 @@ impl Purger {
         }
         self.nip09_turn = true;
         let Some(i) = other else {
+            if repacking {
+                // Looked at again now and then, until the repack's done.
+                self.resume = Instant::now() + SWEEPS_HELD;
+            }
             return Ok(!self.planning.is_empty() || !self.jobs.is_empty());
         };
         let start = Instant::now();
@@ -1399,6 +1412,34 @@ mod tests {
         // Purged by a fresh purger, as after a restart.
         assert!(purge(&store, 0, None, None));
         assert!(store.stored(&store.read().unwrap(), 1).unwrap().is_none());
+    }
+
+    /// The running relay's sweeps wait while a repack's under way, the
+    /// rest go on, and they're taken up again once it's done.
+    #[test]
+    fn sweeps_wait_out_a_repack() {
+        let events = events(60);
+        let (_dir, store) = store_with(&events, &filters()[..1]);
+        let before = store.len(&store.read().unwrap()).unwrap();
+        let mut purger = Purger::new(&store, None, true).unwrap();
+        purger.sweep_at = 0;
+        store.repacking.store(true, Ordering::Relaxed);
+        for _ in 0..5 {
+            purger.resume = Instant::now();
+            assert!(purger.work(&store, &|_| {}).unwrap());
+            store.forget().unwrap();
+        }
+        assert!(matches!(purger.jobs[0].work, Work::Sweep(_)));
+        assert!(store.sweeping.lock().unwrap().is_none());
+        assert_eq!(store.len(&store.read().unwrap()).unwrap(), before);
+        // Not looked at again at once, which would spin the writer.
+        assert!(purger.resume > Instant::now() + SWEEPS_HELD / 2);
+        store.repacking.store(false, Ordering::Relaxed);
+        while purger.work(&store, &|_| {}).unwrap() {
+            store.forget().unwrap();
+        }
+        store.forget().unwrap();
+        assert!(store.len(&store.read().unwrap()).unwrap() < before);
     }
 
     /// Enough pages that what's deleted often ends one: after deleting the

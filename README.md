@@ -224,14 +224,21 @@ the database as it was when it began. What it writes meanwhile goes to the old f
 usual, and is also kept in a journal that the copy catches up from. Once the copy has
 caught up, the relay's writes wait for about a second while the last of them is
 copied, and the copy replaces the old file. Reads already under way finish on the old
-file, which is removed once they're done. Nothing is left to clean up.
+file. It's kept in `db/repack-old/` (or `db/bodies/repack-old/`) until they're done,
+then freed a little at a time from its end, and removed: on ZFS, removing a file of
+hundreds of gigabytes at once holds up every write until its blocks are freed, which can
+take many minutes. Nothing is left to clean up. Sweeps of big deletions wait while a
+repack runs, as each entry they remove would be copied too. If the copy can't catch up
+with what's written, or there's more left to copy than the writer can wait for, the
+repack gives up and leaves the old file in place.
 
 It needs room for the copy, for what's written meanwhile, and for the old file to grow
-while the copy reads it, since LMDB can't reuse the pages the copy is reading. It reads
+while the copy reads it, since LMDB can't reuse the pages the copy is reading: it
+refuses to begin without about 110% of the file's used size free. It reads
 ahead with 8 threads, fewer than `compact`, to leave the disk to the relay;
 `--threads` changes that. If the relay or the machine stops before the copy is in
-place, the database is as it was, and the half-made copy in `db/repack/` is removed
-when the relay starts. With the relay stopped, `repack` runs by itself, and a relay
+place, the database is as it was, and the half-made copy in `db/repack/` is freed the
+same way when the relay starts, as is an old file not yet freed. With the relay stopped, `repack` runs by itself, and a relay
 started meanwhile waits for it.
 
 ## Storage

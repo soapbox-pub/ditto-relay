@@ -10,8 +10,13 @@ it is tagged.
   indexes or, with `--bodies`, the event records. The relay copies the
   database as it was when the repack began, keeps what it writes meanwhile
   in a journal, and catches the copy up from it. Then it puts the copy in
-  place of the old file, its writes waiting about a second, and removes the
-  old file once the reads under way are done with it.
+  place of the old file, its writes waiting about a second, and once the
+  reads under way are done with the old file, frees it a little at a time:
+  on ZFS, removing hundreds of gigabytes at once held up every write for
+  many minutes. It refuses to begin without room for the copy, flushes the
+  copy before the writer waits, gives up rather than hold the writer up if
+  the copy can't catch up, and holds off sweeps of big deletions meanwhile,
+  whose every entry removed it would copy too.
 - NIP-09 deletions are removed together. Each was found, then removed, in
   transactions of its own, one a chunk, so a relay sent them faster than a
   chunk a write fell behind, however few events they named; most name
