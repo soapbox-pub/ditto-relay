@@ -2091,6 +2091,98 @@ fn save_deletions(store: &Store, covered: u64) {
     }
 }
 
+/// How long a write may take, waiting in the queue and stored, or
+/// prefetched, before it's logged, with where the time went.
+const SLOW_WRITE: Duration = Duration::from_secs(1);
+
+/// How often slow writes are logged, at most: those between are counted.
+const SLOW_WRITE_LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// The slow writes not logged yet, and when they last were.
+#[derive(Default)]
+struct SlowWrites {
+    last: Option<Instant>,
+    unlogged: u64,
+}
+
+/// The kind of event `record` is, for the log.
+fn kind_of(record: &[u8]) -> String {
+    EventView::new(record).map_or_else(|| "?".into(), |view| view.kind().to_string())
+}
+
+/// Note what a batch's writes, `records`, queued at `queued`, taken by the
+/// writer at `taken` and stored since, waited for: in metrics, and in the
+/// log if any took [`SLOW_WRITE`] or more, saying how long in the queue,
+/// behind what (`behind`, the longest the writer spent on one thing since
+/// it last took a batch), and in the batch.
+fn note_batch(
+    records: &[Arc<Vec<u8>>],
+    queued: &[Instant],
+    taken: Instant,
+    behind: Option<(Phase, Duration)>,
+    slow: &mut SlowWrites,
+) {
+    let stored = taken.elapsed();
+    let mut waited = Duration::ZERO;
+    let mut kinds: Vec<String> = Vec::new();
+    let mut slowest = 0;
+    for (record, &at) in records.iter().zip(queued) {
+        let wait = taken.saturating_duration_since(at);
+        METRICS.write_queue_wait.observe(wait);
+        METRICS.write_batch.observe(stored);
+        waited = waited.max(wait);
+        if wait + stored >= SLOW_WRITE {
+            slowest += 1;
+            let kind = kind_of(record);
+            if kinds.len() < 8 && !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+    }
+    if slowest == 0 {
+        return;
+    }
+    slow.unlogged += slowest;
+    if slow
+        .last
+        .is_some_and(|last| last.elapsed() < SLOW_WRITE_LOG_EVERY)
+    {
+        return;
+    }
+    let behind = match behind {
+        Some((phase, took)) => format!(
+            "its longest phase since the last batch {} ({took:.1?})",
+            phase.name()
+        ),
+        None => "no phase since the last batch".into(),
+    };
+    tracing::warn!(
+        "{slowest} of a batch of {} writes took {SLOW_WRITE:?} or more: queued up to {waited:.1?}, behind {behind}, then the batch took {stored:.1?}; kinds {}; {} slow writes since last said",
+        records.len(),
+        kinds.join(", "),
+        slow.unlogged
+    );
+    slow.last = Some(Instant::now());
+    slow.unlogged = 0;
+}
+
+/// When a slow prefetch was last logged.
+static SLOW_PREFETCH: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Log a write whose prefetch took `took`, at most every
+/// [`SLOW_WRITE_LOG_EVERY`].
+fn note_slow_prefetch(record: &[u8], took: Duration) {
+    let mut last = SLOW_PREFETCH.lock().expect("unpoisoned");
+    if last.is_some_and(|last| last.elapsed() < SLOW_WRITE_LOG_EVERY) {
+        return;
+    }
+    tracing::warn!(
+        "prefetching a write of kind {} took {took:.1?}, before it was queued",
+        kind_of(record)
+    );
+    *last = Some(Instant::now());
+}
+
 /// The most expired events removed in one write transaction, and how many
 /// the first removes: as for deleting, the transactions are sized by how
 /// long the last took. After days stopped, there can be tens of thousands
@@ -2117,7 +2209,8 @@ pub struct Writer {
 }
 
 enum Request {
-    Write(WriteJob),
+    /// A record to store, and when it was queued.
+    Write(WriteJob, Instant),
     Delete(Box<DeleteJob>),
     Cancel(CancelJob),
     /// Store what's queued before this, then stop.
@@ -2213,6 +2306,7 @@ impl Writer {
                 let mut saving: Option<JoinHandle<()>> = None;
                 // Whether the web of trust may have pushing to do.
                 let mut trust = true;
+                let mut slow = SlowWrites::default();
                 let turn = |trust: &mut bool| {
                     let _turn = phase(Phase::Turn);
                     *trust = store.turn().unwrap_or_else(|err| {
@@ -2277,9 +2371,9 @@ impl Writer {
                         wait = wait.min(due.saturating_duration_since(Instant::now()));
                     }
                     let first = match rx.recv_timeout(wait) {
-                        Ok(Request::Write(job)) => {
+                        Ok(Request::Write(job, at)) => {
                             METRICS.write_queue.dec();
-                            job
+                            (job, at)
                         }
                         Ok(Request::Delete(job)) => {
                             let _queue = phase(Phase::Queue);
@@ -2302,15 +2396,18 @@ impl Writer {
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
+                    let (first, at) = first;
                     let mut batch = vec![first];
+                    let mut queued = vec![at];
                     let mut stop = false;
                     let mut deletes = Vec::new();
                     let mut cancels = Vec::new();
                     while batch.len() < MAX_WRITE_BATCH {
                         match rx.try_recv() {
-                            Ok(Request::Write(job)) => {
+                            Ok(Request::Write(job, at)) => {
                                 METRICS.write_queue.dec();
                                 batch.push(job);
+                                queued.push(at);
                             }
                             Ok(Request::Delete(job)) => deletes.push(job),
                             Ok(Request::Cancel(job)) => cancels.push(job),
@@ -2322,7 +2419,12 @@ impl Writer {
                         }
                     }
 
+                    let taken = Instant::now();
+                    let behind = METRICS.writer.take_longest();
+                    let records: Vec<Arc<Vec<u8>>> =
+                        batch.iter().map(|(record, _)| record.clone()).collect();
                     phase(Phase::Batch).run(|| write(&store, batch, &tell));
+                    note_batch(&records, &queued, taken, behind, &mut slow);
                     let queueing = phase(Phase::Queue);
                     for job in deletes {
                         let (target, reply) = *job;
@@ -2419,6 +2521,11 @@ impl Writer {
         if let Ok(Err(err)) = prefetch.await {
             tracing::debug!("prefetching failed: {err}");
         }
+        let prefetched = start.elapsed();
+        METRICS.write_prefetch.observe(prefetched);
+        if prefetched >= SLOW_WRITE {
+            note_slow_prefetch(&record, prefetched);
+        }
         let outcome = self
             .queue(record)?
             .await
@@ -2438,7 +2545,11 @@ impl Writer {
     ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<Outcome>>> {
         let (reply, rx) = oneshot::channel();
         METRICS.write_queue.inc();
-        if self.tx.send(Request::Write((record, reply))).is_err() {
+        if self
+            .tx
+            .send(Request::Write((record, reply), Instant::now()))
+            .is_err()
+        {
             METRICS.write_queue.dec();
             bail!("writer thread is gone");
         }
@@ -2452,6 +2563,40 @@ pub mod tests {
     use crate::event::Event;
     use crate::event::tests::signed;
     use crate::record;
+
+    /// What a batch's writes waited for goes in the queue-wait and batch
+    /// histograms, one each a write.
+    #[test]
+    fn notes_what_a_batch_waited_for() {
+        let records = vec![
+            Arc::new(record::encode(&signed(1, 100, 1, vec![], "a"))),
+            Arc::new(record::encode(&signed(2, 100, 3, vec![], "b"))),
+        ];
+        let taken = Instant::now();
+        let queued = [taken - Duration::from_secs(3), taken];
+        let (waits, batches) = (
+            METRICS.write_queue_wait.count(),
+            METRICS.write_batch.count(),
+        );
+        let mut slow = SlowWrites::default();
+        note_batch(
+            &records,
+            &queued,
+            taken,
+            Some((Phase::Turn, Duration::from_secs(3))),
+            &mut slow,
+        );
+        // Other tests write meanwhile, so at least.
+        assert!(METRICS.write_queue_wait.count() >= waits + 2);
+        assert!(METRICS.write_batch.count() >= batches + 2);
+        assert!(slow.last.is_some());
+        assert_eq!(slow.unlogged, 0);
+        // Again at once: counted, not said.
+        note_batch(&records, &queued, taken, None, &mut slow);
+        assert_eq!(slow.unlogged, 1);
+        assert_eq!(kind_of(&records[1]), "3");
+        assert_eq!(kind_of(b"nonsense"), "?");
+    }
 
     /// An event that can't be stored is refused alone, not with the rest
     /// of its batch.

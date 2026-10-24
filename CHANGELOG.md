@@ -4,6 +4,15 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [2.5.2]
+
+- A write's time is split, in metrics, into reading ahead what storing it
+  reads (`write_prefetch_seconds`), waiting in the queue
+  (`write_queue_wait_seconds`), and its batch (`write_batch_seconds`). A
+  write that takes a second or more is logged, at most every 10 seconds,
+  with how long it was queued, the longest thing the writer did meanwhile,
+  how long its batch took, and the kinds of the slow writes.
+
 ## [2.5.1]
 
 - The writer says where its time goes, in metrics: how long it spends on

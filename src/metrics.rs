@@ -96,6 +96,13 @@ pub struct Metrics {
     /// Time from handing an event to the writer to hearing back.
     pub writes: Timer,
     pub write_latency: Histogram,
+    /// Of that, reading ahead what storing it reads, before it's queued.
+    pub write_prefetch: Histogram,
+    /// Waiting in the queue, for the writer to take it into a batch.
+    pub write_queue_wait: Histogram,
+    /// The batch it was stored in, from when the writer took it to when it
+    /// was answered.
+    pub write_batch: Histogram,
     /// Write transactions committed, and how long committing each took.
     pub commits: Histogram,
     pub writer: Writer,
@@ -139,6 +146,9 @@ pub static METRICS: Metrics = Metrics {
     plugin: Timer::new(),
     writes: Timer::new(),
     write_latency: Histogram::new(),
+    write_prefetch: Histogram::new(),
+    write_queue_wait: Histogram::new(),
+    write_batch: Histogram::new(),
     commits: Histogram::new(),
     writer: Writer::new(),
     write_queue: Gauge::new(),
@@ -195,6 +205,12 @@ impl Histogram {
         }
     }
 
+    /// How many it's recorded.
+    #[cfg(test)]
+    pub fn count(&self) -> u64 {
+        self.count.get()
+    }
+
     /// Record one that took `took`.
     pub fn observe(&self, took: Duration) {
         let seconds = took.as_secs_f64();
@@ -234,7 +250,7 @@ impl Phase {
         Phase::Queue,
     ];
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Phase::Forget => "forget",
             Phase::Expiry => "expiry",
@@ -255,6 +271,9 @@ pub struct Writer {
     since: AtomicU64,
     /// The thread's id, for its CPU time, 0 until it starts.
     tid: AtomicI32,
+    /// The longest phase since the writer last took a batch: what writes
+    /// queued meanwhile waited behind.
+    longest: Mutex<Option<(Phase, Duration)>>,
 }
 
 /// What the writer's busy-since is counted from.
@@ -271,7 +290,14 @@ impl Writer {
             phase: AtomicU8::new(0),
             since: AtomicU64::new(0),
             tid: AtomicI32::new(0),
+            longest: Mutex::new(None),
         }
+    }
+
+    /// The longest phase since this was last called, as the writer takes a
+    /// batch.
+    pub fn take_longest(&self) -> Option<(Phase, Duration)> {
+        self.longest.lock().expect("unpoisoned").take()
     }
 
     /// Note that the calling thread is the writer.
@@ -339,6 +365,11 @@ impl Drop for InPhase<'_> {
     fn drop(&mut self) {
         self.writer.phases[self.phase as usize - 1].since(self.start);
         self.writer.phase.store(0, Ordering::Relaxed);
+        let took = self.start.elapsed();
+        let mut longest = self.writer.longest.lock().expect("unpoisoned");
+        if longest.is_none_or(|(_, longest)| took > longest) {
+            *longest = Some((self.phase, took));
+        }
     }
 }
 
@@ -494,6 +525,21 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
         "write_latency_seconds",
         "Time from handing an event to the writer to hearing back.",
         &m.write_latency,
+    );
+    out.histogram(
+        "write_prefetch_seconds",
+        "Of a write, the time reading ahead what storing it reads, before it's queued.",
+        &m.write_prefetch,
+    );
+    out.histogram(
+        "write_queue_wait_seconds",
+        "Of a write, the time queued, until the writer took it into a batch.",
+        &m.write_queue_wait,
+    );
+    out.histogram(
+        "write_batch_seconds",
+        "Of a write, the time its batch took, from when the writer took it to when it was answered.",
+        &m.write_batch,
     );
     out.histogram(
         "commit_seconds",
@@ -769,6 +815,12 @@ mod tests {
         }
         assert!(writer.busy().is_none());
         assert_eq!(writer.phases[Phase::Batch as usize - 1].count.get(), 1);
+        // The longest since last asked, then none.
+        drop(writer.phase(Phase::Turn));
+        let (phase, took) = writer.take_longest().unwrap();
+        assert_eq!(phase, Phase::Batch);
+        assert!(took >= Duration::from_millis(20));
+        assert!(writer.take_longest().is_none());
         writer.started();
         let (user, system) = writer.cpu().unwrap();
         assert!(user >= 0.0 && system >= 0.0);
