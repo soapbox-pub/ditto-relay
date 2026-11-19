@@ -548,7 +548,7 @@ impl Connection {
         let (sink, mut stream) = socket.split();
         let id = state.next_conn.fetch_add(1, Ordering::Relaxed);
         let (link, mut outbound, overflow) = Link::new(OUTBOUND);
-        state.hub.connect(id, link).await;
+        state.hub.connect(id, link);
         let start = tokio::time::Instant::now() + PING_INTERVAL;
         let mut ping = tokio::time::interval_at(start, PING_INTERVAL);
         let mut heard = Instant::now();
@@ -636,7 +636,7 @@ impl Connection {
         // Dropping `queries` drops their tasks, but not what they left
         // running on the blocking pool.
         conn.cancel.cancel();
-        conn.state.hub.disconnect(id).await;
+        conn.state.hub.disconnect(id);
         let _ = tokio::time::timeout(WRITE_TIMEOUT, conn.sink.close()).await;
     }
 
@@ -870,19 +870,14 @@ impl Connection {
             },
         );
         let viewer = self.viewer();
-        let installed = self
-            .state
+        self.state
             .hub
-            .subscribe(self.id, name.clone(), filters.clone(), viewer.clone())
-            .await;
+            .subscribe(self.id, name.clone(), filters.clone(), viewer.clone());
         let state = self.state.clone();
         queries.spawn(async move {
             let (store, search) = (state.store.clone(), state.search.clone());
             let start = Instant::now();
             let stop = cancel.clone();
-            if cancel.run_until_cancelled(installed).await.is_none() {
-                return Done::Req(name, Err(Cancelled.into()));
-            }
             let results = run_query(&state, &cancel, move || {
                 query::run(
                     &store,
@@ -1263,10 +1258,10 @@ impl Connection {
     }
 
     /// Close a subscription, stopping its query. One the connection doesn't
-    /// have costs nothing, so a flood of them can't crowd the shards' queues.
+    /// have costs nothing, so a flood of them can't keep its shard locked.
     async fn end(&mut self, sub_id: &str) {
         if self.subs.remove(sub_id).is_some() {
-            self.state.hub.unsubscribe(self.id, sub_id).await;
+            self.state.hub.unsubscribe(self.id, sub_id);
         }
     }
 

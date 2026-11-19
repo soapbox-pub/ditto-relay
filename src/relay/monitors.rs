@@ -10,16 +10,18 @@
 //! as they're durable, and each event's JSON is written once however many
 //! subscriptions get it.
 //!
-//! The matching runs on a few shard threads, each owning the subscriptions
+//! The matching runs on a few shard threads, each with the subscriptions
 //! of its share of the connections, so the writer only queues a batch and
-//! gets on with the next commit. Everything a shard does — connections
-//! coming and going, subscriptions opening and closing, new events — arrives
-//! on one queue, in order, so there's nothing to lock.
+//! gets on with the next commit. A connection opens and closes its
+//! subscriptions itself, under the shard's lock, rather than queueing that
+//! for the shard's thread and waiting on it: a REQ needs its subscription
+//! live before its query reads the store, and handing that to another
+//! thread and back cost more than the rest of a small query.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::Viewer;
@@ -90,24 +92,17 @@ impl Live {
     }
 }
 
-enum Command {
-    Connect(ConnId, Link),
-    Disconnect(ConnId),
-    Subscribe {
-        conn: ConnId,
-        sub: Arc<str>,
-        filters: Vec<Filter>,
-        viewer: Option<Viewer>,
-        installed: oneshot::Sender<()>,
-    },
-    Unsubscribe(ConnId, String),
-    Events(Arc<Vec<Live>>),
+/// One shard: its connections' subscriptions, and the queue of new events
+/// its thread matches against them.
+struct Shard {
+    events: mpsc::Sender<Arc<Vec<Live>>>,
+    monitors: Arc<Mutex<Monitors>>,
 }
 
 /// The way to the shards. A connection always goes to the same one.
 #[derive(Clone)]
 pub struct Hub {
-    shards: Arc<[mpsc::Sender<Command>]>,
+    shards: Arc<[Shard]>,
 }
 
 impl Hub {
@@ -115,63 +110,56 @@ impl Hub {
     pub fn spawn(shards: usize) -> Hub {
         let shards = (0..shards.max(1))
             .map(|i| {
-                let (tx, mut rx) = mpsc::channel(SHARD_QUEUE);
+                let (events, mut rx) = mpsc::channel::<Arc<Vec<Live>>>(SHARD_QUEUE);
+                let monitors = Arc::new(Mutex::new(Monitors::default()));
+                let theirs = monitors.clone();
                 std::thread::Builder::new()
                     .name(format!("live-{i}"))
                     .spawn(move || {
-                        let mut monitors = Monitors::default();
-                        while let Some(command) = rx.blocking_recv() {
-                            if let Command::Events(_) = command {
-                                METRICS.live_queue.dec();
+                        while let Some(events) = rx.blocking_recv() {
+                            METRICS.live_queue.dec();
+                            for live in events.iter() {
+                                let view = EventView::new(&live.record).expect("an encoded record");
+                                // A lock per event, so a subscription
+                                // waits on one event's matching at most.
+                                lock(&theirs).broadcast(&view, live.seq, &live.json);
                             }
-                            monitors.handle(command);
                         }
                     })
                     .expect("failed to spawn a live subscription thread");
-                tx
+                Shard { events, monitors }
             })
             .collect();
         Hub { shards }
     }
 
-    fn shard(&self, conn: ConnId) -> &mpsc::Sender<Command> {
-        &self.shards[(conn % self.shards.len() as u64) as usize]
+    fn monitors(&self, conn: ConnId) -> MutexGuard<'_, Monitors> {
+        lock(&self.shards[(conn % self.shards.len() as u64) as usize].monitors)
     }
 
-    pub async fn connect(&self, conn: ConnId, link: Link) {
-        let _ = self.shard(conn).send(Command::Connect(conn, link)).await;
+    pub fn connect(&self, conn: ConnId, link: Link) {
+        self.monitors(conn).connect(conn, link);
     }
 
-    pub async fn disconnect(&self, conn: ConnId) {
-        let _ = self.shard(conn).send(Command::Disconnect(conn)).await;
+    pub fn disconnect(&self, conn: ConnId) {
+        self.monitors(conn).disconnect(conn);
     }
 
     /// Open a subscription, replacing any of the same id, for a connection
-    /// that may see only what `viewer` lets it, if there's one. The
-    /// receiver fires once it's live: every event published after that
-    /// reaches it.
-    pub async fn subscribe(
+    /// that may see only what `viewer` lets it, if there's one. It's live
+    /// once this returns: every event published after that reaches it.
+    pub fn subscribe(
         &self,
         conn: ConnId,
         sub: Arc<str>,
         filters: Vec<Filter>,
         viewer: Option<Viewer>,
-    ) -> oneshot::Receiver<()> {
-        let (installed, done) = oneshot::channel();
-        let command = Command::Subscribe {
-            conn,
-            sub,
-            filters,
-            viewer,
-            installed,
-        };
-        let _ = self.shard(conn).send(command).await;
-        done
+    ) {
+        self.monitors(conn).subscribe(conn, sub, filters, viewer);
     }
 
-    pub async fn unsubscribe(&self, conn: ConnId, sub: &str) {
-        let command = Command::Unsubscribe(conn, sub.to_string());
-        let _ = self.shard(conn).send(command).await;
+    pub fn unsubscribe(&self, conn: ConnId, sub: &str) {
+        self.monitors(conn).unsubscribe(conn, sub);
     }
 
     /// Hand events to every shard, waiting if one is behind. Not for async
@@ -183,10 +171,7 @@ impl Hub {
         let events = Arc::new(events);
         for shard in self.shards.iter() {
             METRICS.live_queue.inc();
-            if shard
-                .blocking_send(Command::Events(events.clone()))
-                .is_err()
-            {
+            if shard.events.blocking_send(events.clone()).is_err() {
                 METRICS.live_queue.dec();
             }
         }
@@ -197,11 +182,20 @@ impl Hub {
         let events = Arc::new(events);
         for shard in self.shards.iter() {
             METRICS.live_queue.inc();
-            if shard.send(Command::Events(events.clone())).await.is_err() {
+            if shard.events.send(events.clone()).await.is_err() {
                 METRICS.live_queue.dec();
             }
         }
     }
+}
+
+/// A shard's subscriptions, locked. Nothing panics holding the lock but a
+/// bug, and the subscriptions are still whole after one, so a poisoned lock
+/// is taken anyway.
+fn lock(monitors: &Mutex<Monitors>) -> MutexGuard<'_, Monitors> {
+    monitors
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 struct Installed {
@@ -275,30 +269,6 @@ fn filed(filter: &Filter) -> Filed {
 }
 
 impl Monitors {
-    fn handle(&mut self, command: Command) {
-        match command {
-            Command::Connect(conn, link) => self.connect(conn, link),
-            Command::Disconnect(conn) => self.disconnect(conn),
-            Command::Subscribe {
-                conn,
-                sub,
-                filters,
-                viewer,
-                installed,
-            } => {
-                self.subscribe(conn, sub, filters, viewer);
-                let _ = installed.send(());
-            }
-            Command::Unsubscribe(conn, sub) => self.unsubscribe(conn, &sub),
-            Command::Events(events) => {
-                for live in events.iter() {
-                    let view = EventView::new(&live.record).expect("an encoded record");
-                    self.broadcast(&view, live.seq, &live.json);
-                }
-            }
-        }
-    }
-
     fn connect(&mut self, conn: ConnId, link: Link) {
         let subs = HashMap::new();
         self.conns.insert(conn, Connection { link, subs });
@@ -539,15 +509,12 @@ mod tests {
         let mut receivers = Vec::new();
         for conn in 1..=3 {
             let (link, rx, _) = Link::new(16);
-            hub.connect(conn, link).await;
+            hub.connect(conn, link);
             let kinds = filters(&[json!({"kinds": [1]})]);
-            hub.subscribe(conn, "s".into(), kinds, None)
-                .await
-                .await
-                .unwrap();
+            hub.subscribe(conn, "s".into(), kinds, None);
             receivers.push(rx);
         }
-        hub.unsubscribe(3, "s").await;
+        hub.unsubscribe(3, "s");
 
         let note = signed(1, 100, 1, vec![], "");
         let reaction = signed(2, 100, 7, vec![], "");
@@ -565,14 +532,21 @@ mod tests {
             assert_eq!((&*outbound.sub, outbound.seq), ("s", Some(1)));
             assert_eq!(serde_json::from_str::<Event>(&outbound.json).unwrap(), note);
         }
-        // Once the shards have caught up, nothing else came.
+        // A shard takes events in order, so once a later one has reached
+        // every connection, nothing else came before it.
+        let marker = signed(3, 100, 9, vec![], "");
         for conn in 1..=3 {
-            hub.subscribe(conn, "sync".into(), vec![], None)
-                .await
-                .await
-                .unwrap();
+            hub.subscribe(conn, "sync".into(), filters(&[json!({"kinds": [9]})]), None);
         }
-        assert!(receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
+        let broadcaster = hub.clone();
+        let events = vec![Live::new(Arc::new(encode(&marker)), Some(3))];
+        tokio::task::spawn_blocking(move || broadcaster.broadcast(events))
+            .await
+            .unwrap();
+        for rx in &mut receivers {
+            assert_eq!(&*rx.recv().await.unwrap().sub, "sync");
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]
