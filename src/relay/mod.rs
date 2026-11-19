@@ -71,6 +71,9 @@ pub struct AppState {
     queries: Arc<Semaphore>,
     /// Counts being made, or kept, for every connection asking for them.
     counts: Counts,
+    /// The most records a REQ answered where it's asked may examine: see
+    /// [`query::quick`].
+    quick_budget: usize,
     /// What the relay is called by: its URL, and its onion's.
     urls: Arc<[String]>,
     /// What's served to clients at the relay's URL, and at its onion's, if
@@ -157,6 +160,7 @@ impl AppState {
             verifiers: Arc::new(Semaphore::new(cores())),
             queries: Arc::new(Semaphore::new(cores())),
             counts: Counts::default(),
+            quick_budget: query::QUICK_BUDGET,
         }
     }
 
@@ -873,10 +877,33 @@ impl Connection {
         self.state
             .hub
             .subscribe(self.id, name.clone(), filters.clone(), viewer.clone());
+        // A small query is answered here and now. The live events that
+        // arrive meanwhile wait in the connection's queue, and those it
+        // saw are dropped from there.
+        let start = Instant::now();
+        let relay = config
+            .nip85
+            .then(|| self.state.keypair.x_only_public_key().0.to_byte_array());
+        let quick = query::quick(
+            &self.state.store,
+            relay.as_ref(),
+            &filters,
+            config.default_limit,
+            config.max_limit,
+            visible(viewer.clone()),
+            self.state.quick_budget,
+        );
+        match quick {
+            Ok(None) => {}
+            Ok(Some(results)) => {
+                METRICS.reqs.since(start);
+                return self.on_results(name, Ok(results)).await;
+            }
+            Err(err) => return self.on_results(name, Err(err)).await,
+        }
         let state = self.state.clone();
         queries.spawn(async move {
             let (store, search) = (state.store.clone(), state.search.clone());
-            let start = Instant::now();
             let stop = cancel.clone();
             let results = run_query(&state, &cancel, move || {
                 query::run(
@@ -1039,11 +1066,20 @@ impl Connection {
             return self.refuse(id, refusal).await;
         }
 
+        // A count LMDB keeps, or of a few entries, is answered here and now.
+        let start = Instant::now();
+        match query::quick_count(&self.state.store, &filters, self.state.quick_budget) {
+            Ok(None) => {}
+            Ok(Some(count)) => {
+                METRICS.counts.since(start);
+                return self.on_count_done(id, Ok(Box::new(count))).await;
+            }
+            Err(err) => return self.on_count_done(id, Err(err)).await,
+        }
         let (state, id, viewer) = (self.state.clone(), id.to_string(), self.viewer());
         let cancel = self.cancel.clone();
         queries.spawn(async move {
             let (store, search) = (state.store.clone(), state.search.clone());
-            let start = Instant::now();
             let stop = cancel.clone();
             let shared = filters.clone();
             let make = || {
@@ -1150,14 +1186,36 @@ impl Connection {
                 cancel: cancel.clone(),
             },
         );
-        let (state, viewer) = (self.state.clone(), self.viewer());
+        // A sync of a few events is answered here and now.
+        let start = Instant::now();
+        let max = config.negentropy_max_events;
+        let budget = self.state.quick_budget;
+        let viewer = self.viewer();
+        match query::quick_ids(
+            &self.state.store,
+            &filter,
+            max,
+            visible(viewer.clone()),
+            budget,
+        ) {
+            Ok(None) => {}
+            Ok(Some(found)) => {
+                let items = found.into_iter().map(|(created_at, id)| Item {
+                    timestamp: created_at.into(),
+                    id,
+                });
+                let reconciled = reconcile(Arc::new(Items::new(items.collect())), &msg);
+                METRICS.syncs.since(start);
+                return self.on_reconciled(name, reconciled).await;
+            }
+            Err(err) => return self.on_reconciled(name, Err(err)).await,
+        }
+        let state = self.state.clone();
         queries.spawn(async move {
             let store = state.store.clone();
-            let start = Instant::now();
             let stop = cancel.clone();
             let reconciled = run_query(&state, &cancel, move || {
                 let txn = store.read()?;
-                let max = config.negentropy_max_events;
                 let found = query::every_id(&store, &txn, &filter, max, visible(viewer), &stop)?;
                 drop(txn);
                 let items = found.into_iter().map(|(created_at, id)| Item {

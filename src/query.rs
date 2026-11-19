@@ -159,6 +159,98 @@ pub fn run(
     Ok(Results { next_seq, events })
 }
 
+/// The most records a REQ answered by [`quick`] may examine.
+pub const QUICK_BUDGET: usize = 128;
+
+/// Run a REQ's filters as [`run`] does, if that takes examining at most
+/// `budget` records, or `None` if it would take more. A query that small
+/// is cheaper to answer where it's asked than to hand to the blocking pool
+/// and back. Searches, and filters that may ask for the relay's NIP-85
+/// assertions (those with its pubkey, `relay`, among their authors), are
+/// left to [`run`], and so is every query with a `budget` of 0.
+pub fn quick(
+    store: &Store,
+    relay: Option<&[u8; 32]>,
+    filters: &[Filter],
+    default_limit: u64,
+    max_limit: u64,
+    visible: impl Fn(&EventView) -> bool,
+    budget: usize,
+) -> anyhow::Result<Option<Results>> {
+    let asserted = |filter: &Filter| {
+        relay.is_some_and(|relay| {
+            filter
+                .authors
+                .as_ref()
+                .is_some_and(|authors| authors.binary_search(relay).is_ok())
+        })
+    };
+    if budget == 0 || filters.iter().any(|f| f.search.is_some() || asserted(f)) {
+        return Ok(None);
+    }
+    let txn = store.read()?;
+    let next_seq = store.next_seq(&txn)?;
+    // Each filter's plan, unless it lists ids, and how many records it
+    // would examine at worst, all before any are: if that's plainly too
+    // many, none is examined for nothing.
+    let mut plans = Vec::with_capacity(filters.len());
+    let mut most = 0usize;
+    for filter in filters {
+        let limit = filter.limit.unwrap_or(default_limit).min(max_limit) as usize;
+        if filter.never || limit == 0 {
+            continue;
+        }
+        let plan = match &filter.ids {
+            Some(ids) => {
+                most = most.saturating_add(ids.len());
+                None
+            }
+            None => {
+                let plan = plan(store, &txn, filter)?;
+                let entries = cost(&txn, &plan, budget.saturating_add(1))?;
+                most = most.saturating_add(match plan.exact {
+                    true => entries.min(limit),
+                    false => entries,
+                });
+                Some(plan)
+            }
+        };
+        if most > budget {
+            return Ok(None);
+        }
+        plans.push((filter, limit, plan));
+    }
+    // Nothing runs long enough here to need stopping.
+    let never = CancellationToken::new();
+    let mut left = budget;
+    let mut seen = HashSet::new();
+    let mut events = Vec::new();
+    for (filter, limit, plan) in plans {
+        let found = match plan {
+            None => run_filter(store, &txn, filter, limit, &never)?,
+            Some(plan) => {
+                let mut found = Vec::new();
+                // Ties with the last can take it past what was reckoned.
+                let examined = scan(store, &txn, filter, &plan, limit, left, &never, &mut found)?;
+                if examined > left {
+                    return Ok(None);
+                }
+                left -= examined;
+                newest_first(found, limit)
+            }
+        };
+        for (seq, view) in found {
+            if !visible(&view) {
+                return Err(Restricted.into());
+            }
+            if seen.insert(seq) {
+                events.push(view.to_json());
+            }
+        }
+    }
+    Ok(Some(Results { next_seq, events }))
+}
+
 /// The most weeks one `sort:hot` filter looks back through to fill its
 /// page: see [`fill_back`].
 const MAX_HOT_WINDOWS: usize = 52;
@@ -265,7 +357,8 @@ pub fn run_filter<'t>(
             MAX_EXAMINED,
             cancel,
             &mut found,
-        )? {
+        )? > MAX_EXAMINED
+        {
             METRICS.filters_cut_short.inc();
         }
     }
@@ -289,7 +382,7 @@ pub fn newest<'t>(
     }
     let plan = plan(store, txn, filter)?;
     let mut found = Vec::new();
-    if scan(store, txn, filter, &plan, limit, budget, cancel, &mut found)? {
+    if scan(store, txn, filter, &plan, limit, budget, cancel, &mut found)? > budget {
         return Ok(None);
     }
     Ok(Some(newest_first(found, limit)))
@@ -419,7 +512,7 @@ pub fn every_id(
         let plan = plan(store, txn, filter)?;
         let mut views = Vec::new();
         let budget = max.saturating_add(MAX_TIES);
-        if scan(store, txn, filter, &plan, limit, budget, cancel, &mut views)? {
+        if scan(store, txn, filter, &plan, limit, budget, cancel, &mut views)? > budget {
             return Err(TooExpensive.into());
         }
         if cancel.is_cancelled() {
@@ -753,7 +846,8 @@ impl<'t, 'p> Source<'t, 'p> {
 }
 
 /// Find a plan's newest matches, examining at most `max_examined` records.
-/// Returns whether it stopped for that, short of the limit.
+/// Returns how many it examined: more than `max_examined` if it stopped
+/// for that, short of the limit.
 #[allow(clippy::too_many_arguments)]
 fn scan<'t>(
     store: &Store,
@@ -764,7 +858,7 @@ fn scan<'t>(
     max_examined: usize,
     cancel: &CancellationToken,
     found: &mut Vec<(u64, EventView<'t>)>,
-) -> Result<bool> {
+) -> Result<usize> {
     let mut sources = Vec::new();
     let mut heap = BinaryHeap::new();
     for key in &plan.keys {
@@ -778,7 +872,6 @@ fn scan<'t>(
     let mut authors = HashSet::new();
     let mut last = None;
     let mut examined = 0;
-    let mut cut_short = false;
     while let Some((stamp, i)) = heap.pop() {
         if let Some(next) = sources[i].next()? {
             heap.push((next, i));
@@ -804,7 +897,6 @@ fn scan<'t>(
         }
         examined += 1;
         if examined > max_examined {
-            cut_short = true;
             break;
         }
         if examined % CANCEL_CHECK == 0 && cancel.is_cancelled() {
@@ -822,7 +914,7 @@ fn scan<'t>(
     METRICS
         .events_examined
         .add(examined.min(max_examined) as u64);
-    Ok(cut_short)
+    Ok(examined)
 }
 
 /// What a NIP-45 count found.
@@ -873,6 +965,114 @@ pub fn count(
         true => Err(Cancelled.into()),
         false => Ok(count),
     }
+}
+
+/// What a sync covers: each event's `created_at` and id.
+pub type Synced = Vec<(u32, [u8; 32])>;
+
+/// The ids a sync of `filter` covers, as [`every_id`] finds them (up to
+/// `max`), if that takes examining no more than `budget` entries, or `None`
+/// if it may take more. A `budget` of 0 tries none.
+pub fn quick_ids(
+    store: &Store,
+    filter: &Filter,
+    max: usize,
+    visible: impl Fn(&EventView) -> bool,
+    budget: usize,
+) -> anyhow::Result<Option<Synced>> {
+    if budget == 0 {
+        return Ok(None);
+    }
+    let txn = store.read()?;
+    let entries = match &filter.ids {
+        Some(ids) => ids.len(),
+        None if filter.never => 0,
+        None => cost(&txn, &plan(store, &txn, filter)?, budget.saturating_add(1))?,
+    };
+    if entries > budget {
+        return Ok(None);
+    }
+    let never = CancellationToken::new();
+    every_id(store, &txn, filter, max, visible, &never).map(Some)
+}
+
+/// A COUNT as [`count`] answers it, if that takes no more than walking or
+/// loading `budget` entries, or `None` if it may take more: a count LMDB
+/// keeps, or one of a few entries, is cheaper to answer where it's asked
+/// than to hand to the blocking pool and back. Only single filters an
+/// index pins down are tried; a `budget` of 0 tries none.
+pub fn quick_count(
+    store: &Store,
+    filters: &[Filter],
+    budget: usize,
+) -> anyhow::Result<Option<Count>> {
+    let [filter] = filters else {
+        return Ok(None);
+    };
+    if budget == 0
+        || filter.never
+        || filter.distinct_author()
+        || filter.ids.is_some()
+        || filter.search.is_some()
+    {
+        return Ok(None);
+    }
+    let txn = store.read()?;
+    let plan = plan(store, &txn, filter)?;
+    if !plan.exact || !plan.disjoint {
+        return Ok(None);
+    }
+    let unbounded = filter.since == 0 && filter.until == u32::MAX && plan.kinds.is_none();
+    if !unbounded && cost(&txn, &plan, budget.saturating_add(1))? > budget {
+        return Ok(None);
+    }
+    // One tag value's sketch is made from the events of each key that
+    // doesn't keep one, so they count against the budget too.
+    let sketched = filter.first_tag.is_some();
+    if sketched {
+        if plan.db != store.tables.tags || !unbounded {
+            return Ok(None);
+        }
+        let mut cursor = txn.cursor(plan.db)?;
+        let mut loads = 0usize;
+        for key in &plan.keys {
+            if txn.get(store.tables.hll, key)?.is_none() && cursor.set(key)?.is_some() {
+                loads = loads.saturating_add(cursor.count()?);
+                if loads > budget {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    let never = CancellationToken::new();
+    let count = match unbounded {
+        true => {
+            let mut cursor = txn.cursor(plan.db)?;
+            let mut total = 0;
+            for key in &plan.keys {
+                if cursor.set(key)?.is_some() {
+                    total += cursor.count()? as u64;
+                }
+            }
+            total
+        }
+        false => {
+            let mut total = 0;
+            walk(&txn, filter, &plan, &never, |_| total += 1)?;
+            total
+        }
+    };
+    let hll = match sketched {
+        true => {
+            let mut registers = [0; hll::REGISTERS];
+            for key in &plan.keys {
+                hll::merge(&mut registers, &store.key_sketch(&txn, key)?);
+            }
+            Some(registers)
+        }
+        false => None,
+    };
+    Ok(Some(Count { count, hll }))
 }
 
 fn count_unless_cancelled(
@@ -1170,6 +1370,125 @@ mod tests {
             .iter()
             .map(|json| serde_json::from_str::<Event>(json).unwrap().id)
             .collect()
+    }
+
+    fn parsed(filters: &[Value]) -> Vec<Filter> {
+        filters
+            .iter()
+            .map(|f| Filter::parse(f, &test_tags(), MAX_VALUES).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn answers_small_queries_quickly_and_alike() {
+        let (_dir, store) = open();
+        for i in 0..200u64 {
+            let tag = vec!["t", if i % 10 == 0 { "rare" } else { "common" }];
+            put(
+                &store,
+                &signed((i % 3) as u8 + 1, 100 + i / 2, 1, vec![tag], ""),
+            );
+        }
+        let reacted = signed(1, 50, 1, vec![], "");
+        put(&store, &reacted);
+        for i in 0..5 {
+            let tags = vec![vec!["e", reacted.id.as_str()]];
+            put(&store, &signed(i + 4, 60, 7, tags, "+"));
+        }
+        let alice = signed(1, 0, 1, vec![], "").pubkey;
+        let note = signed(2, 100, 1, vec![vec!["t", "common"]], "").id;
+
+        let quick_for = |filters: &[Filter]| {
+            quick(&store, None, filters, 100, 500, |_| true, QUICK_BUDGET).unwrap()
+        };
+        let small = [
+            vec![json!({"kinds": [1], "limit": 1})],
+            vec![json!({"kinds": [1], "limit": 100})],
+            vec![json!({"#t": ["rare"]})],
+            vec![json!({"authors": [alice], "kinds": [1], "limit": 10})],
+            vec![json!({"ids": [note, "ab".repeat(32)]})],
+            vec![json!({"kinds": [7]}), json!({"#e": [reacted.id]})],
+            vec![json!({"authors": ["cd".repeat(32)]})],
+            vec![json!({"kinds": [1], "since": 190, "limit": 10})],
+        ];
+        for filters in small {
+            let filters = parsed(&filters);
+            let results = quick_for(&filters).expect("quick");
+            let ran = run(
+                &store,
+                None,
+                None,
+                &filters,
+                100,
+                500,
+                |_| true,
+                &Default::default(),
+            );
+            assert_eq!(results.events, ran.unwrap().events, "{filters:?}");
+        }
+        // Past the budget, at worst or as reckoned: left to `run`.
+        let large = [
+            vec![json!({"kinds": [1], "limit": 500})],
+            vec![json!({"#t": ["common"], "limit": 500})],
+            vec![
+                json!({"kinds": [1], "limit": 100}),
+                json!({"#t": ["common"], "limit": 50}),
+            ],
+        ];
+        for filters in large {
+            assert!(quick_for(&parsed(&filters)).is_none(), "{filters:?}");
+        }
+        let filters = parsed(&[json!({"kinds": [1], "limit": 1})]);
+        assert!(
+            quick(&store, None, &filters, 100, 500, |_| true, 0)
+                .unwrap()
+                .is_none()
+        );
+        // One that may ask for the relay's own assertions.
+        let filters = parsed(&[json!({"authors": [alice], "kinds": [1]})]);
+        let relay: [u8; 32] = hex::decode(&alice).unwrap().try_into().unwrap();
+        let asserted = quick(&store, Some(&relay), &filters, 100, 500, |_| true, 128);
+        assert!(asserted.unwrap().is_none());
+
+        let counted = [
+            json!({"kinds": [7]}),
+            json!({"#e": [reacted.id]}),
+            json!({"#t": ["rare"]}),
+            json!({"kinds": [7], "since": 55}),
+            json!({"authors": [alice], "kinds": [1]}),
+        ];
+        for filter in counted {
+            let filters = parsed(std::slice::from_ref(&filter));
+            let quick = quick_count(&store, &filters, QUICK_BUDGET).unwrap();
+            assert_eq!(quick, Some(count_of(&store, filter.clone())), "{filter}");
+            let synced = quick_ids(&store, &filters[0], 1000, |_| true, QUICK_BUDGET);
+            let txn = store.read().unwrap();
+            let every = every_id(
+                &store,
+                &txn,
+                &filters[0],
+                1000,
+                |_| true,
+                &Default::default(),
+            );
+            assert_eq!(synced.unwrap(), Some(every.unwrap()), "{filter}");
+        }
+        // Kept counts need no budget; walks and sketches past it do.
+        let all = parsed(&[json!({"kinds": [1]})]);
+        assert_eq!(quick_count(&store, &all, 1).unwrap().unwrap().count, 201);
+        let common = parsed(&[json!({"#t": ["common"]})]);
+        assert!(
+            quick_count(&store, &common, QUICK_BUDGET)
+                .unwrap()
+                .is_none()
+        );
+        let since = parsed(&[json!({"kinds": [1], "since": 100})]);
+        assert!(quick_count(&store, &since, QUICK_BUDGET).unwrap().is_none());
+        assert!(
+            quick_ids(&store, &all[0], 1000, |_| true, QUICK_BUDGET)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

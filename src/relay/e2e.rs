@@ -99,15 +99,25 @@ impl Relay {
     /// With `onion`, an onion service at that URL too, whose router is served
     /// on a port of its own, as it would be on Tor's streams.
     async fn start_onion(config: Config, onion: Option<&str>) -> Relay {
+        Relay::start_tweaked(config, onion, |_| {}).await
+    }
+
+    /// [`Relay::start_onion`], with its state changed by `tweak` first.
+    async fn start_tweaked(
+        config: Config,
+        onion: Option<&str>,
+        tweak: impl FnOnce(&mut AppState),
+    ) -> Relay {
         let (dir, store) = store::tests::open();
         let keypair = secp256k1::Keypair::from_secret_bytes([1; 32]).unwrap();
-        let state = AppState::new(
+        let mut state = AppState::new(
             config,
             keypair,
             Arc::new(store),
             None,
             onion.map(String::from),
         );
+        tweak(&mut state);
         let onion = match onion {
             Some(_) => {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -546,7 +556,8 @@ async fn answers_every_req_sent_at_once() {
 /// the stored results, which see it, and not again as a live event.
 #[tokio::test]
 async fn sends_events_stored_while_a_query_waits_once() {
-    let relay = Relay::start().await;
+    // Every query to the blocking pool, where it can be made to wait.
+    let relay = Relay::start_tweaked(config(), None, |state| state.quick_budget = 0).await;
     let mut reader = relay.connect().await;
     let mut writer = relay.connect().await;
     // Every core busy, so the REQ's query waits its turn.

@@ -19,6 +19,11 @@ it is tagged.
   `distinct:author` counts, each of which reads hundreds of thousands of
   events. How many COUNTs were answered this way is
   `counts_shared_total`.
+- Small queries are answered faster: a REQ that reads up to 128 events, a
+  COUNT the database keeps or of up to 128 events, and a NEG-OPEN covering
+  up to 128 events are answered as they arrive, rather than queued for a
+  thread of their own. Looking up an event by id, or the newest of a kind,
+  now answers about twice as many requests a second.
 
 ## [2.5.1]
 
