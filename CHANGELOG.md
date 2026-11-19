@@ -24,6 +24,9 @@ it is tagged.
   up to 128 events are answered as they arrive, rather than queued for a
   thread of their own. Looking up an event by id, or the newest of a kind,
   now answers about twice as many requests a second.
+- An event sent again once it's stored is recognized sooner, before
+  waiting for a thread to check its signature: about twice as many resent
+  events are answered a second.
 
 ## [2.5.1]
 

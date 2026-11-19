@@ -1351,25 +1351,26 @@ impl Connection {
 }
 
 /// The event if its id and signature are good, or None if it's stored
-/// already. Both checks run on the blocking pool: the lookup can stall
-/// on disk, and the signature takes a while.
+/// already. The lookup runs here and now, as small queries do (see
+/// [`query::quick`]); the signature, which takes a while, on the blocking
+/// pool.
 async fn verify(state: &AppState, ev: Event) -> Result<Option<Event>, Cow<'static, str>> {
+    // Events are resent all the time, and each would cost a signature
+    // check, so look first: one with the stored copy's signature is that
+    // event, verified when it was stored.
+    let id = event::decode_hex::<32>(&ev.id);
+    let sig = event::decode_hex::<64>(&ev.sig);
+    if let (Some(id), Some(sig)) = (id, sig) {
+        let store = &state.store;
+        let stored = store.read().and_then(|txn| store.sig_of(&txn, &id));
+        if stored.ok().flatten() == Some(sig) {
+            return Ok(None);
+        }
+    }
     let Ok(_place) = state.verifiers.acquire().await else {
         return Err("error: shutting down".into());
     };
-    let store = state.store.clone();
     let verified = tokio::task::spawn_blocking(move || {
-        // Events are resent all the time, and each would cost a
-        // signature check, so look first: one with the stored copy's
-        // signature is that event, verified when it was stored.
-        let id = event::decode_hex::<32>(&ev.id);
-        let sig = event::decode_hex::<64>(&ev.sig);
-        if let (Some(id), Some(sig)) = (id, sig) {
-            let stored = store.read().and_then(|txn| store.sig_of(&txn, &id));
-            if stored.ok().flatten() == Some(sig) {
-                return Ok(None);
-            }
-        }
         ev.verify()?;
         Ok(Some(ev))
     })
