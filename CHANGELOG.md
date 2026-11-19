@@ -12,6 +12,13 @@ it is tagged.
   write that takes a second or more is logged, at most every 10 seconds,
   with how long it was queued, the longest thing the writer did meanwhile,
   how long its batch took, and the kinds of the slow writes.
+- A COUNT asked for while the same one is running, by any connection,
+  waits for it rather than counting again, and one that took a second or
+  more is kept for 5 minutes and told to whoever asks for it meanwhile.
+  Ditto's chart of each client's users asks every visitor for the same
+  `distinct:author` counts, each of which reads hundreds of thousands of
+  events. How many COUNTs were answered this way is
+  `counts_shared_total`.
 
 ## [2.5.1]
 

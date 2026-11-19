@@ -131,6 +131,8 @@ rand = "0.10.3"
 tempfile = "3.27.0"
 # Certificates' validity, for rcgen.
 time = "0.3"
+# Paused time, for what waits a while.
+tokio = { version = "1.53.1", features = ["test-util"] }
 tokio-tungstenite = "0.29.0"
 
 # A smaller, faster binary, from a build that takes several minutes every time.

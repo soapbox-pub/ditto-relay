@@ -35,8 +35,10 @@ use crate::record::{self, EventView};
 use crate::search::SearchIndex;
 use crate::store::{Outcome, Store, Writer};
 use crate::{key, landing};
+use counts::Counts;
 use monitors::{ConnId, Hub, Link, Live, Outbound};
 
+mod counts;
 mod monitors;
 
 #[derive(Clone)]
@@ -67,6 +69,8 @@ pub struct AppState {
     /// A place per core for queries. A REQ or COUNT waits its turn, rather
     /// than being refused, when every core is busy.
     queries: Arc<Semaphore>,
+    /// Counts being made, or kept, for every connection asking for them.
+    counts: Counts,
     /// What the relay is called by: its URL, and its onion's.
     urls: Arc<[String]>,
     /// What's served to clients at the relay's URL, and at its onion's, if
@@ -152,6 +156,7 @@ impl AppState {
             connections: TaskTracker::new(),
             verifiers: Arc::new(Semaphore::new(cores())),
             queries: Arc::new(Semaphore::new(cores())),
+            counts: Counts::default(),
         }
     }
 
@@ -1045,11 +1050,17 @@ impl Connection {
             let (store, search) = (state.store.clone(), state.search.clone());
             let start = Instant::now();
             let stop = cancel.clone();
-            let count = run_query(&state, &cancel, move || {
-                query::count(&store, search.as_deref(), &filters, visible(viewer), &stop)
-                    .map(Box::new)
-            })
-            .await;
+            let shared = filters.clone();
+            let make = || {
+                run_query(&state, &cancel, move || {
+                    query::count(&store, search.as_deref(), &filters, visible(viewer), &stop)
+                })
+            };
+            let count = cancel
+                .run_until_cancelled(state.counts.get(&shared, make))
+                .await
+                .unwrap_or_else(|| Err(Cancelled.into()))
+                .map(Box::new);
             METRICS.counts.since(start);
             Done::Count(id, count)
         });

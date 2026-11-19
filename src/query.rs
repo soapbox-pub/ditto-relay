@@ -826,7 +826,7 @@ fn scan<'t>(
 }
 
 /// What a NIP-45 count found.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Count {
     pub count: u64,
     /// For a single filter with a tag, a sketch of the events' authors.

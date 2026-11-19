@@ -121,6 +121,8 @@ pub struct Metrics {
     /// Stored events loaded to answer REQs and COUNTs, matching or not.
     pub events_examined: Counter,
     pub counts_refused: Counter,
+    /// COUNTs answered with a count another connection asked for.
+    pub counts_shared: Counter,
     pub errors_write: Counter,
     pub errors_query: Counter,
     pub errors_panic: Counter,
@@ -159,6 +161,7 @@ pub static METRICS: Metrics = Metrics {
     filters_cut_short: Counter::new(),
     events_examined: Counter::new(),
     counts_refused: Counter::new(),
+    counts_shared: Counter::new(),
     errors_write: Counter::new(),
     errors_query: Counter::new(),
     errors_panic: Counter::new(),
@@ -610,6 +613,12 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
         "counter",
         "COUNTs refused as too expensive.",
         m.counts_refused.get() as f64,
+    );
+    out.one(
+        "counts_shared_total",
+        "counter",
+        "COUNTs answered with a count made or kept for another.",
+        m.counts_shared.get() as f64,
     );
     out.metric(
         "errors_total",
