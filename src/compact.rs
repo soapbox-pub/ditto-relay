@@ -66,8 +66,24 @@ const WRITER_CHECK: Duration = Duration::from_millis(20);
 /// [pieces](Piece).
 const BIG_KEY: usize = if cfg!(test) { 500 } else { 1 << 16 };
 
-/// How many pieces a big key's values are read ahead in, at most.
-const PIECES: usize = 256;
+/// How many pieces a big key's values are read ahead in: one per
+/// [`PIECE_VALUES`] of them, and at least [`MIN_PIECES`], as each is begun
+/// with a lookup, but at most [`PIECES`].
+fn pieces_of(count: usize) -> usize {
+    (count / PIECE_VALUES).clamp(MIN_PIECES, PIECES)
+}
+
+const PIECE_VALUES: usize = 1 << 14;
+const MIN_PIECES: usize = 256;
+
+/// How many pieces a big key's values are read ahead in, at most. They're
+/// split evenly by value, not by how many there are, and values bunch: a
+/// stamp starts with its `created_at`, and most events are from the last
+/// few of the years between the oldest and the newest. In 256 pieces, a
+/// few held nearly all of relay.ditto.pub's 290 million `created` stamps,
+/// each read by one thread a page at a time, and the copy caught up with
+/// them, copying 55,000 entries a second rather than 485,000.
+const PIECES: usize = 1 << 14;
 
 /// How many ranges ahead of the copy each thread may read.
 const AHEAD_PER_THREAD: usize = 4;
@@ -768,7 +784,7 @@ fn midpoint(a: &[u8], b: &[u8], integer: bool) -> Vec<u8> {
 }
 
 /// Told of a big key, its first value and its last, by [`walk`].
-type BigKey<'a> = &'a mut dyn FnMut(&[u8], &[u8], &[u8]);
+type BigKey<'a> = &'a mut dyn FnMut(&[u8], usize, &[u8], &[u8]);
 
 /// Walk `range` of `table`, in order, handing `visit` what's there. With
 /// `big`, a key with [`BIG_KEY`] values or more is handed to it instead,
@@ -799,10 +815,11 @@ fn walk<'t>(
         }
         let size = value.len();
         if let Some(big) = &mut big
-            && cursor.count()? >= BIG_KEY
+            && let count = cursor.count()?
+            && count >= BIG_KEY
         {
             let last = cursor.last_dup()?.map_or(value, |(_, last)| last);
-            big(key, value, last);
+            big(key, count, value, last);
             entry = cursor.next_nodup()?;
             continue;
         }
@@ -1018,8 +1035,8 @@ impl Reader<'_> {
             }
             let range = &self.ranges[n];
             let table = &self.tables[range.table];
-            let mut big = |key: &[u8], first: &[u8], last: &[u8]| {
-                let bounds = spread(first, last);
+            let mut big = |key: &[u8], count: usize, first: &[u8], last: &[u8]| {
+                let bounds = spread(first, last, pieces_of(count));
                 let mut pieces = self.pieces.lock().expect("unpoisoned");
                 for (n, start) in bounds.iter().enumerate() {
                     pieces.push_back(Piece {
@@ -1052,10 +1069,10 @@ fn touch(bytes: &[u8]) {
 
 /// Where the [pieces](Piece) of a key whose values run from `first` to
 /// `last` begin: `first`, then values about evenly spread up to `last`.
-fn spread(first: &[u8], last: &[u8]) -> Vec<Vec<u8>> {
+fn spread(first: &[u8], last: &[u8], pieces: usize) -> Vec<Vec<u8>> {
     let mut bounds = vec![first.to_vec(), last.to_vec()];
     // Each round doubles the pieces, bounds.len() - 1, at most.
-    while 2 * (bounds.len() - 1) <= PIECES {
+    while 2 * (bounds.len() - 1) <= pieces {
         let mut split = Vec::with_capacity(bounds.len() * 2);
         for pair in bounds.windows(2) {
             split.push(pair[0].clone());
@@ -1298,12 +1315,21 @@ mod tests {
     fn reads_a_big_key_in_pieces() {
         let first = 5u64.to_be_bytes();
         let last = 1_000_000u64.to_be_bytes();
-        let bounds = spread(&first, &last);
+        let bounds = spread(&first, &last, PIECES);
         assert!(bounds.len() > PIECES / 2 && bounds.len() <= PIECES);
+        let fewer = spread(&first, &last, MIN_PIECES);
+        assert!(fewer.len() > MIN_PIECES / 2 && fewer.len() <= MIN_PIECES);
+        // As many as the values make worth reading apart.
+        assert_eq!(pieces_of(BIG_KEY), MIN_PIECES);
+        assert_eq!(pieces_of(PIECE_VALUES * 1000), 1000);
+        assert_eq!(pieces_of(usize::MAX), PIECES);
         assert_eq!(bounds[0], first);
         assert!(bounds.windows(2).all(|w| w[0] < w[1] && w[1].len() == 8));
         assert!(bounds.last().unwrap() < &last.to_vec());
-        assert_eq!(spread(&first, &6u64.to_be_bytes()), [first.to_vec()]);
+        assert_eq!(
+            spread(&first, &6u64.to_be_bytes(), PIECES),
+            [first.to_vec()]
+        );
 
         let dir = tempfile::tempdir().unwrap();
         fill(dir.path());
@@ -1321,7 +1347,7 @@ mod tests {
         let count = cursor.count().unwrap();
         assert!(count >= BIG_KEY, "{count}");
         let last = cursor.last_dup().unwrap().unwrap().1;
-        let bounds = spread(first, last);
+        let bounds = spread(first, last, pieces_of(count));
         assert!(bounds.len() > 4);
         let read: usize = bounds
             .iter()
