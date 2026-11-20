@@ -24,7 +24,7 @@
 //! in its freelist. Otherwise [`in_place`] writes it anew, as it is, only if
 //! a new file would suit ZFS better: see [`crate::storage`].
 
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
@@ -64,18 +64,24 @@ const MAX_WAIT: Duration = Duration::from_secs(5);
 const WRITER_CHECK: Duration = Duration::from_millis(20);
 
 /// How many values a key has at least for its values to be read ahead in
-/// [pieces](Piece).
-const BIG_KEY: usize = if cfg!(test) { 500 } else { 1 << 16 };
+/// [pieces](Piece), by any thread, rather than with the rest of its range,
+/// by the one reading it: about a page of stamps, past which LMDB keeps a
+/// key's values on pages of their own, and reading them is most of reading
+/// the range. A range is split by its keys, not their values, so one of
+/// keys with many values each can hold millions: on relay.ditto.pub, one of
+/// `tags` held 1.2 million values in keys of fewer than 4,096 each, and one
+/// thread took 78 s to read it, the copy right behind it.
+const BIG_KEY: usize = if cfg!(test) { 500 } else { 1 << 8 };
 
 /// How many pieces a big key's values are read ahead in: one per
-/// [`PIECE_VALUES`] of them, and at least [`MIN_PIECES`], as each is begun
-/// with a lookup, but at most [`PIECES`].
+/// [`PIECE_VALUES`] of them, about 10 pages of stamps, but at most
+/// [`PIECES`].
 fn pieces_of(count: usize) -> usize {
     (count / PIECE_VALUES).clamp(MIN_PIECES, PIECES)
 }
 
-const PIECE_VALUES: usize = 1 << 14;
-const MIN_PIECES: usize = 256;
+const PIECE_VALUES: usize = 1 << 12;
+const MIN_PIECES: usize = 1;
 
 /// How many pieces a big key's values are read ahead in, at most. They're
 /// split evenly by value, not by how many there are, and values bunch: a
@@ -86,8 +92,11 @@ const MIN_PIECES: usize = 256;
 /// them, copying 55,000 entries a second rather than 485,000.
 const PIECES: usize = 1 << 14;
 
-/// How many ranges ahead of the copy each thread may read.
-const AHEAD_PER_THREAD: usize = 4;
+/// How many ranges ahead of the copy each thread may read. Ranges differ
+/// in size by thousands of times, and a big one takes a thread a while: the
+/// further ahead it begins, the likelier it's read before the copy gets
+/// there.
+const AHEAD_PER_THREAD: usize = 16;
 
 /// About how much is copied in one write transaction.
 const COMMIT_BYTES: u64 = 64 << 20;
@@ -362,7 +371,7 @@ impl Copying<'_> {
         let copying = AtomicUsize::new(0);
         let next = AtomicUsize::new(0);
         let done = AtomicBool::new(false);
-        let pieces = Mutex::new(VecDeque::new());
+        let pieces = Mutex::new(Pieces::new());
         let reader = Reader {
             env: source,
             tables,
@@ -890,7 +899,7 @@ struct Ahead {
     ranges: OnceLock<Vec<Range>>,
     copying: AtomicUsize,
     next: AtomicUsize,
-    pieces: Mutex<VecDeque<Piece>>,
+    pieces: Mutex<Pieces>,
     done: AtomicBool,
 }
 
@@ -912,7 +921,7 @@ impl TableAhead {
             ranges: OnceLock::new(),
             copying: AtomicUsize::new(0),
             next: AtomicUsize::new(0),
-            pieces: Mutex::new(VecDeque::new()),
+            pieces: Mutex::new(Pieces::new()),
             done: AtomicBool::new(false),
         });
         let ahead = shared.clone();
@@ -985,8 +994,8 @@ struct Reader<'a> {
     next: &'a AtomicUsize,
     /// How many ranges ahead of the copy a thread may read.
     ahead: usize,
-    /// Pieces of big keys, in order, read before any more ranges.
-    pieces: &'a Mutex<VecDeque<Piece>>,
+    /// Pieces of big keys still to read.
+    pieces: &'a Mutex<Pieces>,
     done: &'a AtomicBool,
     /// Whether to read each range in a transaction of its own, as of a
     /// store being written meanwhile.
@@ -1009,17 +1018,18 @@ impl Reader<'_> {
                     Err(_) => return,
                 };
             }
-            let piece = self.pieces.lock().expect("unpoisoned").pop_front();
-            if let Some(piece) = piece {
+            let n = self.next.load(Ordering::Relaxed);
+            let copying = self.copying.load(Ordering::Relaxed);
+            // A range left to read, near enough the copy.
+            let due = n < self.ranges.len() && n <= copying + self.ahead;
+            if let Some(piece) = self.next_piece(copying, due) {
                 if let Err(err) = read_piece(&txn, &self.tables[piece.table], &piece) {
                     tracing::debug!("reading ahead failed: {err:#}");
                 }
                 continue;
             }
-            let n = self.next.load(Ordering::Relaxed);
-            let copying = self.copying.load(Ordering::Relaxed);
             // None left, or far enough ahead: big keys' pieces may come.
-            if n >= self.ranges.len() || n > copying + self.ahead {
+            if !due {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
@@ -1039,13 +1049,14 @@ impl Reader<'_> {
             let mut big = |key: &[u8], count: usize, first: &[u8], last: &[u8]| {
                 let bounds = spread(first, last, pieces_of(count));
                 let mut pieces = self.pieces.lock().expect("unpoisoned");
-                for (n, start) in bounds.iter().enumerate() {
-                    pieces.push_back(Piece {
+                for (i, start) in bounds.iter().enumerate() {
+                    let piece = Piece {
                         table: range.table,
                         key: key.to_vec(),
                         start: start.clone(),
-                        end: bounds.get(n + 1).cloned(),
-                    });
+                        end: bounds.get(i + 1).cloned(),
+                    };
+                    pieces.insert((n, key.to_vec(), start.clone()), piece);
                 }
             };
             let read = walk(&txn, table, range, Some(&mut big), |item| {
@@ -1062,6 +1073,35 @@ impl Reader<'_> {
         }
     }
 }
+
+impl Reader<'_> {
+    /// The piece of a big key to read next, if one's to be read before the
+    /// next range, `due` saying whether one's left near enough the copy:
+    /// the first, by range, then key, then value, unless it's further on
+    /// than the range after the copy's and a range is due. Pieces of what's
+    /// copied already are dropped. Pieces of every big key in the ranges
+    /// read ahead would otherwise keep the threads from the ranges, as a
+    /// table with many big keys made them: the copy, reading the small keys
+    /// between them itself a page at a time, copied 6,500 entries a second.
+    fn next_piece(&self, copying: usize, due: bool) -> Option<Piece> {
+        let mut pieces = self.pieces.lock().expect("unpoisoned");
+        while let Some(first) = pieces.first_entry()
+            && first.key().0 < copying
+        {
+            first.remove();
+        }
+        match pieces.first_key_value() {
+            Some(((range, ..), _)) if !due || *range <= copying + 1 => {
+                pieces.pop_first().map(|(_, piece)| piece)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Pieces of big keys still to read, by the range each key starts in, then
+/// key, then the value each starts at.
+type Pieces = BTreeMap<(usize, Vec<u8>, Vec<u8>), Piece>;
 
 /// Read a byte of each page of `bytes`, as values may span several.
 fn touch(bytes: &[u8]) {
@@ -1318,8 +1358,7 @@ mod tests {
         let last = 1_000_000u64.to_be_bytes();
         let bounds = spread(&first, &last, PIECES);
         assert!(bounds.len() > PIECES / 2 && bounds.len() <= PIECES);
-        let fewer = spread(&first, &last, MIN_PIECES);
-        assert!(fewer.len() > MIN_PIECES / 2 && fewer.len() <= MIN_PIECES);
+        assert_eq!(spread(&first, &last, MIN_PIECES), [first.to_vec()]);
         // As many as the values make worth reading apart.
         assert_eq!(pieces_of(BIG_KEY), MIN_PIECES);
         assert_eq!(pieces_of(PIECE_VALUES * 1000), 1000);
@@ -1348,7 +1387,7 @@ mod tests {
         let count = cursor.count().unwrap();
         assert!(count >= BIG_KEY, "{count}");
         let last = cursor.last_dup().unwrap().unwrap().1;
-        let bounds = spread(first, last, pieces_of(count));
+        let bounds = spread(first, last, 16);
         assert!(bounds.len() > 4);
         let read: usize = bounds
             .iter()
