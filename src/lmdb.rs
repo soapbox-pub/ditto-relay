@@ -196,6 +196,37 @@ pub struct Usage {
     pub used: u64,
 }
 
+/// What's reading an environment: see [`Env::readers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Readers {
+    /// The id of its latest commit.
+    pub latest: u64,
+    /// The commit each open read transaction reads.
+    pub reading: Vec<u64>,
+}
+
+/// Note the commit a line of `mdb_reader_list` says a reader reads: `pid
+/// thread txnid`, the txnid `-` for a slot not reading now. Its other
+/// lines are headers.
+unsafe extern "C" fn list_reader(msg: *const libc::c_char, ctx: *mut libc::c_void) -> libc::c_int {
+    // SAFETY: LMDB hands a NUL-terminated line, and `ctx` is the Vec that
+    // `Env::readers` passed it.
+    let (line, reading) = unsafe {
+        (
+            std::ffi::CStr::from_ptr(msg).to_string_lossy(),
+            &mut *ctx.cast::<Vec<u64>>(),
+        )
+    };
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if let [pid, _, txnid] = fields[..]
+        && pid.parse::<i64>().is_ok()
+        && let Ok(txnid) = txnid.parse()
+    {
+        reading.push(txnid);
+    }
+    0
+}
+
 /// How much a [replay](Env::replay) writes in one transaction, about.
 const REPLAY_COMMIT_BYTES: u64 = 64 << 20;
 
@@ -895,6 +926,42 @@ impl Env {
         unsafe {
             libc::madvise(base as *mut libc::c_void, used, libc::MADV_DONTNEED);
         }
+    }
+
+    /// Environment `env`'s latest commit, and the commit each of its open
+    /// read transactions reads, every process's: LMDB reuses no page freed
+    /// since the oldest of them.
+    pub fn readers(&self, env: usize) -> Result<Readers> {
+        let envs = self.envs.load();
+        let ptr = envs[env].ptr;
+        // SAFETY: plain data, filled in by LMDB from an open env.
+        let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
+        check(unsafe { ffi::mdb_env_info(ptr, &mut info) })?;
+        let mut reading = Vec::new();
+        // SAFETY: the env is open, and `list_reader` is only handed
+        // `reading`, for the length of the call.
+        check(unsafe {
+            ffi::mdb_reader_list(
+                ptr,
+                Some(list_reader),
+                (&raw mut reading).cast::<libc::c_void>(),
+            )
+        })?;
+        Ok(Readers {
+            latest: info.me_last_txnid as u64,
+            reading,
+        })
+    }
+
+    /// Free the slots in environment `env`'s reader table of processes that
+    /// have died, whose read transactions would otherwise keep LMDB from
+    /// reusing pages until every process closes it. Returns how many.
+    pub fn clear_dead_readers(&self, env: usize) -> Result<usize> {
+        let envs = self.envs.load();
+        let mut dead = 0;
+        // SAFETY: the env is open.
+        check(unsafe { ffi::mdb_reader_check(envs[env].ptr, &mut dead) })?;
+        Ok(usize::try_from(dead).unwrap_or(0))
     }
 
     /// Have the kernel start reading the `len` bytes of environment
@@ -2090,6 +2157,27 @@ mod tests {
         txn.commit().unwrap();
         let txn = env.read_txn().unwrap();
         assert_eq!(txn.get(records, &key(5)).unwrap(), Some(&b"five"[..]));
+    }
+
+    #[test]
+    fn lists_open_reads() {
+        let (_dir, env) = open();
+        let db = env.create_db("plain", DbFlags::PLAIN).unwrap();
+        let quiet = env.readers(0).unwrap();
+        assert!(quiet.reading.is_empty(), "{quiet:?}");
+        let read = env.read_txn().unwrap();
+        for value in [b"1", b"2"] {
+            let mut txn = env.write_txn().unwrap();
+            txn.put(db, b"a", value).unwrap();
+            txn.commit().unwrap();
+        }
+        let readers = env.readers(0).unwrap();
+        assert_eq!(readers.reading, [quiet.latest]);
+        assert_eq!(readers.latest, quiet.latest + 2);
+        // Its own process is alive.
+        assert_eq!(env.clear_dead_readers(0).unwrap(), 0);
+        drop(read);
+        assert!(env.readers(0).unwrap().reading.is_empty());
     }
 
     #[test]

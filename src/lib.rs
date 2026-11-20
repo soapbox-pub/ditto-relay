@@ -30,6 +30,7 @@ pub mod plugin;
 pub mod purge;
 pub mod query;
 pub mod rank;
+pub mod reads;
 pub mod record;
 pub mod relay;
 pub mod repack;

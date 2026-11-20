@@ -165,6 +165,16 @@ it is tagged.
   it's done, checking whether an event was deleted searches the
   database.
 
+- LMDB reuses no page freed since the oldest read still open, so while one
+  stays open its file grows by every page written. How long each
+  environment's oldest read has held pages back is now
+  `lmdb_pages_held_seconds`, with `lmdb_open_reads`, and one that has for 10
+  minutes or more is logged. A process that dies mid-read, as a
+  `ditto-relay` command killed from a shell can, used to leave its slot
+  holding pages back until the relay restarted: every minute the relay now
+  frees such slots, logs it, and counts them in
+  `lmdb_dead_readers_freed_total`.
+
 ## [2.5.1]
 
 - The writer says where its time goes, in metrics: how long it spends on

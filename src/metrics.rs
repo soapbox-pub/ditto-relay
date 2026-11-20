@@ -719,6 +719,33 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
             (r#"env="bodies""#, bodies.used as f64),
         ],
     );
+    let reads = crate::reads::ENVS.iter().zip(&crate::reads::READS);
+    let (mut oldest, mut open, mut cleared) = (Vec::new(), Vec::new(), Vec::new());
+    for (env, reads) in reads {
+        let label = format!(r#"env="{env}""#);
+        let (secs, count) = reads.oldest();
+        oldest.push((label.clone(), secs));
+        open.push((label.clone(), count as f64));
+        cleared.push((label, reads.cleared.load(Ordering::Relaxed) as f64));
+    }
+    out.metric(
+        "lmdb_pages_held_seconds",
+        "gauge",
+        "How long each LMDB environment's oldest open read transaction has kept it from reusing pages: since the commit after the one it reads, 0 if it reads the latest. Meanwhile every page written goes on the end of the file.",
+        &labelled(&oldest),
+    );
+    out.metric(
+        "lmdb_open_reads",
+        "gauge",
+        "Read transactions open in each LMDB environment, every process's.",
+        &labelled(&open),
+    );
+    out.metric(
+        "lmdb_dead_readers_freed_total",
+        "counter",
+        "Reader table slots freed of processes that died mid-read, which kept LMDB from reusing pages.",
+        &labelled(&cleared),
+    );
     out.metric(
         "lmdb_map_bytes",
         "gauge",
@@ -729,6 +756,14 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
         ],
     );
     Ok(out.0)
+}
+
+/// Labelled values as [`Out::metric`] takes them.
+fn labelled(values: &[(String, f64)]) -> Vec<(&str, f64)> {
+    values
+        .iter()
+        .map(|(label, v)| (label.as_str(), *v))
+        .collect()
 }
 
 #[derive(Clone)]

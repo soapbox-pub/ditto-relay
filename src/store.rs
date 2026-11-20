@@ -3308,6 +3308,7 @@ impl Writer {
         });
         let prefetching = store.clone();
         crate::metrics::watch_writer();
+        crate::reads::watch(store.clone());
         let thread = std::thread::Builder::new()
             .name("lmdb-writer".into())
             .spawn(move || {
