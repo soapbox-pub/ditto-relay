@@ -178,11 +178,14 @@ it is tagged.
 - `repack` is gentler and faster. It stops copying whenever the relay's
   writer falls behind, and says how long it waited for it: on relay.ditto.pub
   a repack's first minutes held writes up for 25 seconds. It reads ahead on
-  32 threads by default rather than 8, and reads a key with many values,
-  like `created`'s one, in a piece per 16,384 of them rather than 256 pieces
-  in all, most of them empty: copying it went 9 times slower than the table
-  before. What a repack cut short left is freed once the relay has opened
-  the database, not while it opens it, which took 20 seconds rather than 4.
+  32 threads by default rather than 8; it reads each key with more than a
+  page of values, and what's left of any range past 1 MiB of it, by
+  whichever thread is free, nearest the copy first; and a key with millions
+  of values, like `created`'s one, in a piece per 4,096. Tables whose keys
+  bunch, like `tags`, copied at 5,000 entries a second, and now at hundreds
+  of thousands. What a repack cut short left is freed once the relay has
+  opened the database, not while it opens it, which took 20 seconds rather
+  than 4.
 
 ## [2.5.1]
 
