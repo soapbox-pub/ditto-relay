@@ -1022,8 +1022,14 @@ impl Reader<'_> {
             let copying = self.copying.load(Ordering::Relaxed);
             // A range left to read, near enough the copy.
             let due = n < self.ranges.len() && n <= copying + self.ahead;
-            if let Some(piece) = self.next_piece(copying, due) {
-                if let Err(err) = read_piece(&txn, &self.tables[piece.table], &piece) {
+            if let Some((n, work)) = self.next_work(copying, due) {
+                let read = match work {
+                    Work::Values(piece) => {
+                        read_piece(&txn, &self.tables[piece.table], &piece).map(|_| ())
+                    }
+                    Work::Keys(range) => self.read_range(&txn, n, &range),
+                };
+                if let Err(err) = read {
                     tracing::debug!("reading ahead failed: {err:#}");
                 }
                 continue;
@@ -1044,64 +1050,175 @@ impl Reader<'_> {
             if n < copying {
                 continue;
             }
-            let range = &self.ranges[n];
-            let table = &self.tables[range.table];
-            let mut big = |key: &[u8], count: usize, first: &[u8], last: &[u8]| {
-                let bounds = spread(first, last, pieces_of(count));
-                let mut pieces = self.pieces.lock().expect("unpoisoned");
-                for (i, start) in bounds.iter().enumerate() {
-                    let piece = Piece {
-                        table: range.table,
-                        key: key.to_vec(),
-                        start: start.clone(),
-                        end: bounds.get(i + 1).cloned(),
-                    };
-                    pieces.insert((n, key.to_vec(), start.clone()), piece);
-                }
-            };
-            let read = walk(&txn, table, range, Some(&mut big), |item| {
-                let bytes = match item {
-                    Item::Entry(_, value) => value,
-                    Item::Dups { values, .. } => values,
-                };
-                touch(bytes);
-                Ok(())
-            });
-            if let Err(err) = read {
+            if let Err(err) = self.read_range(&txn, n, &self.ranges[n]) {
                 tracing::debug!("reading ahead failed: {err:#}");
             }
         }
     }
-}
 
-impl Reader<'_> {
-    /// The piece of a big key to read next, if one's to be read before the
-    /// next range, `due` saying whether one's left near enough the copy:
-    /// the first, by range, then key, then value, unless it's further on
-    /// than the range after the copy's and a range is due. Pieces of what's
-    /// copied already are dropped. Pieces of every big key in the ranges
-    /// read ahead would otherwise keep the threads from the ranges, as a
-    /// table with many big keys made them: the copy, reading the small keys
-    /// between them itself a page at a time, copied 6,500 entries a second.
-    fn next_piece(&self, copying: usize, due: bool) -> Option<Piece> {
-        let mut pieces = self.pieces.lock().expect("unpoisoned");
-        while let Some(first) = pieces.first_entry()
+    /// Read `range`, of range `n` or the rest of it, handing its big keys'
+    /// values to whichever thread reads them, in [pieces](Piece). Past
+    /// [`READ_STEP`] of it, what's left is split, and handed out likewise.
+    fn read_range(&self, txn: &Txn, n: usize, range: &Range) -> anyhow::Result<()> {
+        let table = &self.tables[range.table];
+        let mut big = |key: &[u8], count: usize, first: &[u8], last: &[u8]| {
+            let bounds = spread(first, last, pieces_of(count));
+            let mut work = self.pieces.lock().expect("unpoisoned");
+            for (i, start) in bounds.iter().enumerate() {
+                let piece = Piece {
+                    table: range.table,
+                    key: key.to_vec(),
+                    start: start.clone(),
+                    end: bounds.get(i + 1).cloned(),
+                };
+                work.insert((n, key.to_vec(), start.clone()), Work::Values(piece));
+            }
+        };
+        let (mut read, mut at) = (0usize, None::<Vec<u8>>);
+        let walked = walk(txn, table, range, Some(&mut big), |item| {
+            let (key, bytes) = match item {
+                Item::Entry(key, value) => (key, value),
+                Item::Dups { key, values, .. } => (key, values),
+            };
+            touch(bytes);
+            read += key.len() + bytes.len();
+            if read >= READ_STEP {
+                at = Some(key.to_vec());
+                return Err(anyhow::Error::new(SplitRest));
+            }
+            Ok(())
+        });
+        let Some(at) = at else {
+            return walked;
+        };
+        let rest = split_between(txn, table, &at, range.end.as_deref(), SPLIT_REST)?;
+        // Nothing to split it at: the rest's read here, whatever its size.
+        if rest.len() < 2 {
+            let range = Range {
+                table: range.table,
+                start: at,
+                end: range.end.clone(),
+            };
+            return walk(txn, table, &range, Some(&mut big), |item| {
+                touch(match item {
+                    Item::Entry(_, value) => value,
+                    Item::Dups { values, .. } => values,
+                });
+                Ok(())
+            });
+        }
+        let mut work = self.pieces.lock().expect("unpoisoned");
+        for (i, start) in rest.iter().enumerate() {
+            let end = match rest.get(i + 1) {
+                Some(next) => Some(next.clone()),
+                None => range.end.clone(),
+            };
+            let part = Range {
+                table: range.table,
+                start: start.clone(),
+                end,
+            };
+            work.insert((n, start.clone(), Vec::new()), Work::Keys(part));
+        }
+        Ok(())
+    }
+
+    /// What to read next, before the next range, `due` saying whether one's
+    /// left near enough the copy: the first, by range, then key, then
+    /// value, unless it's further on than the range after the copy's and a
+    /// range is due. What's copied already is dropped. Pieces of every big
+    /// key in the ranges read ahead would otherwise keep the threads from
+    /// the ranges, as a table with many big keys made them: the copy,
+    /// reading the small keys between them itself a page at a time, copied
+    /// 6,500 entries a second.
+    fn next_work(&self, copying: usize, due: bool) -> Option<(usize, Work)> {
+        let mut work = self.pieces.lock().expect("unpoisoned");
+        while let Some(first) = work.first_entry()
             && first.key().0 < copying
         {
             first.remove();
         }
-        match pieces.first_key_value() {
+        match work.first_key_value() {
             Some(((range, ..), _)) if !due || *range <= copying + 1 => {
-                pieces.pop_first().map(|(_, piece)| piece)
+                work.pop_first().map(|((n, ..), work)| (n, work))
             }
             _ => None,
         }
     }
 }
 
-/// Pieces of big keys still to read, by the range each key starts in, then
-/// key, then the value each starts at.
-type Pieces = BTreeMap<(usize, Vec<u8>, Vec<u8>), Piece>;
+/// How much of a range one thread reads ahead before splitting what's
+/// left of it between the threads. A range is split by its keys, and keys
+/// bunch, so some ranges hold thousands of times what others do: on
+/// relay.ditto.pub, one of `tags` held 1.2 million small keys' values, and
+/// one thread took 48 s to read it, the copy right behind it.
+const READ_STEP: usize = 1 << 20;
+
+/// How many parts what's left of a range is split into.
+const SPLIT_REST: usize = 8;
+
+/// Stops a walk reading ahead, to split what's left.
+#[derive(Debug)]
+struct SplitRest;
+
+impl std::fmt::Display for SplitRest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("splitting the rest")
+    }
+}
+
+impl std::error::Error for SplitRest {}
+
+/// Keys from `from`, to `to` or the table's last, splitting them into up to
+/// `parts`, each where the one before ends: `from` first, then keys about
+/// halfway between, as [`split`] finds them.
+fn split_between(
+    txn: &Txn,
+    table: &Table,
+    from: &[u8],
+    to: Option<&[u8]>,
+    parts: usize,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut cursor = txn.cursor(table.db)?;
+    let last = match to {
+        Some(to) => to.to_vec(),
+        None => match cursor.last()? {
+            Some((last, _)) => last.to_vec(),
+            None => return Ok(vec![from.to_vec()]),
+        },
+    };
+    let mut bounds = vec![from.to_vec(), last];
+    while bounds.len() - 1 < parts {
+        let mut split = Vec::with_capacity(bounds.len() * 2);
+        for pair in bounds.windows(2) {
+            split.push(pair[0].clone());
+            if let Some(key) = between(txn, &mut cursor, table, &pair[0], &pair[1])? {
+                split.push(key);
+            }
+        }
+        split.push(bounds[bounds.len() - 1].clone());
+        if split.len() == bounds.len() {
+            break;
+        }
+        bounds = split;
+    }
+    // The last is where the next begins, or the table's last key, which
+    // the part before it holds.
+    bounds.pop();
+    Ok(bounds)
+}
+
+/// What's read ahead besides ranges.
+enum Work {
+    /// Some of a big key's values.
+    Values(Piece),
+    /// The rest of a range, split from it.
+    Keys(Range),
+}
+
+/// What's read ahead besides ranges, still to read: by the range it's of,
+/// then key, then for a big key's values, the value it starts at.
+type Pieces = BTreeMap<(usize, Vec<u8>, Vec<u8>), Work>;
 
 /// Read a byte of each page of `bytes`, as values may span several.
 fn touch(bytes: &[u8]) {
@@ -1179,6 +1296,33 @@ mod tests {
         let (a, b) = (1000u64.to_ne_bytes(), u64::MAX.to_ne_bytes());
         let m = u64::from_ne_bytes(midpoint(&a, &b, true).try_into().unwrap());
         assert_eq!(m, 1000 / 2 + u64::MAX / 2);
+    }
+
+    #[test]
+    fn splits_the_rest_of_a_range() {
+        let dir = tempfile::tempdir().unwrap();
+        fill(dir.path());
+        let env = Env::open_read_only(dir.path(), 1 << 28, 8, 16).unwrap();
+        let (name, db, flags) = env
+            .tables()
+            .unwrap()
+            .into_iter()
+            .find(|(name, ..)| name == "plain")
+            .unwrap();
+        let table = Table { name, db, flags };
+        let txn = env.read_txn().unwrap();
+        let (from, to) = (&b"key:1"[..], &b"key:8"[..]);
+        let parts = split_between(&txn, &table, from, Some(to), 8).unwrap();
+        assert!(parts.len() > 4 && parts.len() <= 8, "{}", parts.len());
+        assert_eq!(parts[0], from);
+        assert!(parts.windows(2).all(|w| w[0] < w[1]));
+        assert!(parts.iter().all(|key| &key[..] < to));
+        // To the table's last key.
+        let rest = split_between(&txn, &table, from, None, 8).unwrap();
+        assert!(rest.len() > 4 && rest.iter().all(|key| &key[..] >= from));
+        // Nothing between: it stays whole.
+        let last = txn.cursor(db).unwrap().last().unwrap().unwrap().0.to_vec();
+        assert_eq!(split_between(&txn, &table, &last, None, 8).unwrap(), [last]);
     }
 
     type Contents = Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>;
