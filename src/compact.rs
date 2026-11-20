@@ -36,11 +36,31 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail, ensure};
 
 use crate::lmdb::{Cursor, Db, DbFlags, Env, Txn};
+use crate::metrics::METRICS;
 use crate::storage;
 use crate::store::BODIES_DIR;
 
-/// The most ranges a table is split into.
-const MAX_RANGES: usize = 1 << 16;
+/// The most ranges a table is split into. Each bound is found with a lookup
+/// or two, most of them reading pages from disk, so a table split finer
+/// than reading ahead needs takes minutes to split, and keeps the disk from
+/// the relay meanwhile: on relay.ditto.pub, 65,536 a table took five and a
+/// half.
+const MAX_RANGES: usize = 1 << 12;
+
+/// While the relay runs, how long its writer may be on one thing, or how
+/// many writes may wait for it, before the copy stops for it to catch up.
+/// A copy writes faster than the relay does, and ZFS holds up every write
+/// to a pool whose dirty data piles up, the relay's commits among them: on
+/// relay.ditto.pub, a repack's first minutes held writes up for 25 s.
+const WRITER_BEHIND: Duration = Duration::from_millis(250);
+const WRITES_WAITING: i64 = 50;
+
+/// The longest the copy stops for the relay's writer at once, so that a
+/// writer slow for its own reasons doesn't stop it for good.
+const MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// How often the copy looks whether the relay's writer is behind.
+const WRITER_CHECK: Duration = Duration::from_millis(20);
 
 /// How many values a key has at least for its values to be read ahead in
 /// [pieces](Piece).
@@ -82,6 +102,8 @@ pub struct Progress<'a> {
     pub bytes: u64,
     /// Since copying the tables, or `bodies`, began.
     pub elapsed: Duration,
+    /// Of that, how long the copy stopped for the relay's writer.
+    pub waited: Duration,
 }
 
 impl std::fmt::Display for Progress<'_> {
@@ -94,15 +116,22 @@ impl std::fmt::Display for Progress<'_> {
                 format!(", about {:.0} minutes left", secs / 60.0)
             }
         };
+        let waited = match self.waited.is_zero() {
+            true => String::new(),
+            false => format!(
+                ", {:.0?} of it waiting for the relay's writes",
+                Duration::from_secs(self.waited.as_secs())
+            ),
+        };
         write!(
             f,
-            "{}: {} of {} {}, {:.1} GB, in {:.0?}{left}",
+            "{}: {} of {} {}, {:.1} GB, in {:.0?}{waited}{left}",
             self.table,
             self.done,
             self.total,
             self.unit,
             self.bytes as f64 / 1e9,
-            self.elapsed,
+            Duration::from_secs(self.elapsed.as_secs()),
         )
     }
 }
@@ -335,6 +364,7 @@ impl Copying<'_> {
             let copied = (|| -> anyhow::Result<()> {
                 let (mut entries, mut bytes, mut uncommitted) = (0u64, 0u64, 0u64);
                 let mut said = Instant::now();
+                let (mut checked, mut waited) = (Instant::now(), Duration::ZERO);
                 let mut txn = dest.write_txn()?;
                 for (n, range) in ranges.iter().enumerate() {
                     copying.store(n, Ordering::Relaxed);
@@ -358,6 +388,10 @@ impl Copying<'_> {
                                 uncommitted += values.len() as u64;
                             }
                         }
+                        if live && checked.elapsed() >= WRITER_CHECK {
+                            waited += wait_for_writer();
+                            checked = Instant::now();
+                        }
                         // From within a range, as one key can take minutes.
                         if said.elapsed() >= Duration::from_secs(1) {
                             progress(&Progress {
@@ -367,6 +401,7 @@ impl Copying<'_> {
                                 unit: "entries",
                                 bytes: bytes + uncommitted,
                                 elapsed: start.elapsed(),
+                                waited,
                             });
                             said = Instant::now();
                         }
@@ -375,6 +410,9 @@ impl Copying<'_> {
                     .with_context(|| format!("Could not copy the table {}", table.name))?;
                     drop(appender);
                     if uncommitted >= COMMIT_BYTES {
+                        if live {
+                            waited += wait_for_writer();
+                        }
                         txn.commit()?;
                         txn = dest.write_txn()?;
                         bytes += std::mem::take(&mut uncommitted);
@@ -558,6 +596,7 @@ fn rewrite(
                 unit: "bytes",
                 bytes: at,
                 elapsed: start.elapsed(),
+                waited: Duration::ZERO,
             });
             said = Instant::now();
         }
@@ -580,6 +619,23 @@ pub(crate) fn free_space(dir: &Path) -> io::Result<u64> {
 /// Split `table` into ranges of keys, returning where each begins, then
 /// its last key: none if it's empty. Each split is a key about midway
 /// between two others, so the ranges follow how the keys are spread.
+/// Wait while the relay's writer is behind, as [`WRITER_BEHIND`] and
+/// [`WRITES_WAITING`] tell, for at most [`MAX_WAIT`]. Returns how long.
+fn wait_for_writer() -> Duration {
+    let start = Instant::now();
+    while start.elapsed() < MAX_WAIT {
+        let busy = METRICS
+            .writer
+            .busy()
+            .is_some_and(|(_, took)| took >= WRITER_BEHIND);
+        if !busy && METRICS.write_queue.get() < WRITES_WAITING {
+            break;
+        }
+        std::thread::sleep(WRITER_CHECK);
+    }
+    start.elapsed()
+}
+
 fn split(env: &Env, table: &Table, threads: usize) -> anyhow::Result<Vec<Vec<u8>>> {
     let txn = env.read_txn()?;
     let mut cursor = txn.cursor(table.db)?;
@@ -1225,7 +1281,8 @@ mod tests {
                 "empty" => 0..1,
                 "one" => 1..2,
                 "dups" => 100..600,
-                _ => 1000..MAX_RANGES + 1,
+                // The last round of halving can take it past the most.
+                _ => 1000..2 * MAX_RANGES + 1,
             };
             assert!(
                 expected.contains(&bounds.len()),

@@ -239,8 +239,9 @@ repack gives up and leaves the old file in place.
 It needs room for the copy, for what's written meanwhile, and for the old file to grow
 while the copy reads it, since LMDB can't reuse the pages the copy is reading: it
 refuses to begin without about 110% of the file's used size free. It reads
-ahead with 8 threads, fewer than `compact`, to leave the disk to the relay;
-`--threads` changes that. If the relay or the machine stops before the copy is in
+ahead with 32 threads, as `compact` does (`--threads` changes that), and stops
+copying whenever the relay's writer falls behind, so the relay's writes come
+first. If the relay or the machine stops before the copy is in
 place, the database is as it was, and the half-made copy in `db/repack/` is freed the
 same way when the relay starts, as is an old file not yet freed. With the relay stopped, `repack` runs by itself, and a relay
 started meanwhile waits for it.

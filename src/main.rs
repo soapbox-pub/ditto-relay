@@ -28,9 +28,12 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// How many threads `compact` reads ahead on, unless told.
 const COMPACT_THREADS: usize = 32;
 
-/// How many threads `repack` reads ahead on, unless told: fewer, to leave
-/// the disk to the relay.
-const REPACK_THREADS: usize = 8;
+/// How many threads `repack` reads ahead on, unless told. Each waits on the
+/// disk for a page at a time, as the live pages of a big, long-written file
+/// are scattered all over it: on relay.ditto.pub's ZFS, 8 read about 950
+/// pages a second, 32 about 2,700. The copy stops for the relay's writer
+/// whenever it falls behind, so the relay's writes come first anyway.
+const REPACK_THREADS: usize = 32;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

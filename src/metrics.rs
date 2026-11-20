@@ -57,7 +57,7 @@ impl Gauge {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn get(&self) -> i64 {
+    pub fn get(&self) -> i64 {
         self.0.load(Ordering::Relaxed)
     }
 }

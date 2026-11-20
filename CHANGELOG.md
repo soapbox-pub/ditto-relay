@@ -175,6 +175,13 @@ it is tagged.
   frees such slots, logs it, and counts them in
   `lmdb_dead_readers_freed_total`.
 
+- `repack` is gentler and faster. It stops copying whenever the relay's
+  writer falls behind, and says how long it waited for it: on relay.ditto.pub
+  a repack's first minutes held writes up for 25 seconds. Tables are split
+  into 4,096 ranges for reading ahead rather than 65,536, which took five
+  minutes of lookups before copying began. It reads ahead on 32 threads by
+  default rather than 8, nearly three times as fast on a big file.
+
 ## [2.5.1]
 
 - The writer says where its time goes, in metrics: how long it spends on
