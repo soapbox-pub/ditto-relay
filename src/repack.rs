@@ -96,17 +96,21 @@ pub struct Repacked {
 /// thread of their own.
 pub fn clear_leftovers(dir: &Path) -> std::io::Result<()> {
     for dir in [dir.to_path_buf(), dir.join(BODIES_DIR)] {
+        // What's there before what's put aside below, which is freed
+        // there: listed after, each would be freed twice at once, too fast
+        // for ZFS, which held up the relay's start on relay.ditto.pub.
+        let old = match std::fs::read_dir(dir.join(OLD_DIR)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            old => old?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?,
+        };
         let work = dir.join(WORK_DIR);
         if work.exists() {
             put_aside(&dir, &work)?;
         }
-        let old = match std::fs::read_dir(dir.join(OLD_DIR)) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            old => old?,
-        };
         let live = std::fs::metadata(dir.join(DATA_FILE)).ok();
-        for entry in old {
-            let path = entry?.path();
+        for path in old {
             // Linked as the copy was to be put in place, which it never
             // was: the file in use, which unlinking here leaves alone.
             let linked = live

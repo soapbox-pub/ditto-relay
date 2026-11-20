@@ -116,11 +116,11 @@ impl std::fmt::Display for Progress<'_> {
                 format!(", about {:.0} minutes left", secs / 60.0)
             }
         };
-        let waited = match self.waited.is_zero() {
-            true => String::new(),
-            false => format!(
+        let waited = match self.waited.as_secs() {
+            0 => String::new(),
+            secs => format!(
                 ", {:.0?} of it waiting for the relay's writes",
-                Duration::from_secs(self.waited.as_secs())
+                Duration::from_secs(secs)
             ),
         };
         write!(
