@@ -91,14 +91,16 @@ pub struct Repacked {
     pub paused: Duration,
 }
 
-/// Remove what a repack left in the database in `dir`: what it didn't
-/// finish, and old files not yet freed, which are [freed](discard) on a
-/// thread of their own.
-pub fn clear_leftovers(dir: &Path) -> std::io::Result<()> {
+/// Put aside what a repack left in the database in `dir`, what it didn't
+/// finish, and return it with the old files not yet freed, all of them to
+/// be [freed](discard) once the store's open: freeing them meanwhile, even
+/// a step at a time, held up the flushes opening makes, which on
+/// relay.ditto.pub took 20 s rather than 4.
+pub fn clear_leftovers(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut freeing = Vec::new();
     for dir in [dir.to_path_buf(), dir.join(BODIES_DIR)] {
-        // What's there before what's put aside below, which is freed
-        // there: listed after, each would be freed twice at once, too fast
-        // for ZFS, which held up the relay's start on relay.ditto.pub.
+        // Listed before what's put aside below is put there, as that's
+        // freed already.
         let old = match std::fs::read_dir(dir.join(OLD_DIR)) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             old => old?
@@ -107,7 +109,7 @@ pub fn clear_leftovers(dir: &Path) -> std::io::Result<()> {
         };
         let work = dir.join(WORK_DIR);
         if work.exists() {
-            put_aside(&dir, &work)?;
+            freeing.extend(put_aside(&dir, &work)?);
         }
         let live = std::fs::metadata(dir.join(DATA_FILE)).ok();
         for path in old {
@@ -119,16 +121,16 @@ pub fn clear_leftovers(dir: &Path) -> std::io::Result<()> {
                 .is_some_and(|(live, old)| (live.dev(), live.ino()) == (old.dev(), old.ino()));
             match linked {
                 true => std::fs::remove_file(&path)?,
-                false => discard(path, None),
+                false => freeing.push(path),
             }
         }
     }
-    Ok(())
+    Ok(freeing)
 }
 
-/// Move what's in `work`, beside the file in `dir`, into [`OLD_DIR`] to be
-/// [freed](discard), and remove `work`.
-fn put_aside(dir: &Path, work: &Path) -> std::io::Result<()> {
+/// Move what's in `work`, beside the file in `dir`, into [`OLD_DIR`], and
+/// remove `work`. Returns what's moved, to be [freed](discard).
+fn put_aside(dir: &Path, work: &Path) -> std::io::Result<Vec<PathBuf>> {
     let old = dir.join(OLD_DIR);
     std::fs::create_dir_all(&old)?;
     let mut aside = Vec::new();
@@ -143,10 +145,7 @@ fn put_aside(dir: &Path, work: &Path) -> std::io::Result<()> {
         aside.push(to);
     }
     std::fs::remove_dir_all(work)?;
-    for path in aside {
-        discard(path, None);
-    }
-    Ok(())
+    Ok(aside)
 }
 
 /// A path in `dir` for a file called after `name`, there once.
@@ -258,8 +257,9 @@ fn run(
     );
     let work = dir.join(WORK_DIR);
     if work.exists() {
-        put_aside(&dir, &work)
+        let aside = put_aside(&dir, &work)
             .with_context(|| format!("Could not put aside {}", work.display()))?;
+        aside.into_iter().for_each(|path| discard(path, None));
     }
     let before = env.usage(which)?.used;
     // The copy's no bigger than what's used, and what's written meanwhile
@@ -339,8 +339,9 @@ fn run(
     })();
     // The journal, and the copy if it isn't in place. If they can't be put
     // aside, they are when the store next opens.
-    if let Err(err) = put_aside(&dir, &work) {
-        tracing::warn!("couldn't put aside {}: {err}", work.display());
+    match put_aside(&dir, &work) {
+        Ok(aside) => aside.into_iter().for_each(|path| discard(path, None)),
+        Err(err) => tracing::warn!("couldn't put aside {}: {err}", work.display()),
     }
     repacked
 }

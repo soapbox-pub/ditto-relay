@@ -40,12 +40,13 @@ use crate::metrics::METRICS;
 use crate::storage;
 use crate::store::BODIES_DIR;
 
-/// The most ranges a table is split into. Each bound is found with a lookup
-/// or two, most of them reading pages from disk, so a table split finer
-/// than reading ahead needs takes minutes to split, and keeps the disk from
-/// the relay meanwhile: on relay.ditto.pub, 65,536 a table took five and a
-/// half.
-const MAX_RANGES: usize = 1 << 12;
+/// The most ranges a table is split into. Each is read ahead by one thread
+/// at a time, a page at a time, and the copy reads them in order, so a range
+/// takes as long to read ahead as to copy unread: ranges must be small for
+/// threads reading ahead to read the next many at once. In 4,096 a table,
+/// relay.ditto.pub's copied 10,000 entries a second rather than 485,000.
+/// Finding each bound is a lookup or two, so splitting takes a while.
+const MAX_RANGES: usize = 1 << 16;
 
 /// While the relay runs, how long its writer may be on one thing, or how
 /// many writes may wait for it, before the copy stops for it to catch up.

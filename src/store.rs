@@ -574,7 +574,7 @@ impl Store {
                 bodies.display()
             )
         })?;
-        crate::repack::clear_leftovers(dir)
+        let leftovers = crate::repack::clear_leftovers(dir)
             .with_context(|| format!("Could not remove what a repack left in {}", dir.display()))?;
         let boot_id = checkpoint::boot_id();
         let files = checkpoint::files(dir, &[&bodies]);
@@ -685,6 +685,10 @@ impl Store {
         store.forget()?;
         wot::open(&store, store.wot.as_ref())?;
         rank::open(&store)?;
+        // Once it's open, as freeing them holds up the flushes opening makes.
+        for path in leftovers {
+            crate::repack::discard(path, None);
+        }
         Ok(store)
     }
 
