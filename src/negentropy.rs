@@ -106,8 +106,18 @@ pub struct Item {
 pub struct Items(Vec<Item>);
 
 impl Items {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn new(mut items: Vec<Item>) -> Items {
-        items.sort_unstable();
+        // Mostly in order already, as an index has them, which this sort
+        // makes quick work of.
+        items.sort();
         items.dedup();
         Items(items)
     }

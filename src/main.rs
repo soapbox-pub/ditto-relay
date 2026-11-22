@@ -16,11 +16,14 @@ use ditto_relay::purge::Purger;
 use ditto_relay::rank::Rank;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
-use ditto_relay::store::{BODIES_DIR, History, IndexedTags, Store, Writer};
+use ditto_relay::store::{BODIES_DIR, History, IndexedTags, Store, Writer, Written};
 use ditto_relay::tls::{self, Tls};
 use ditto_relay::tor::{self, OnionKey, Tor};
 use ditto_relay::wot::Wot;
 use ditto_relay::{compact, control, delete, facets, key, metrics, relay, repack, trends};
+
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// How many threads `compact` reads ahead on, unless told.
 const COMPACT_THREADS: usize = 32;
@@ -87,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Deletions { json } => deletions(&config, json),
         Command::Cancel { id } => cancel(&config, id),
         Command::Export { filter } => export(&config, filter.as_deref()),
+        Command::Salvage { dir, from } => salvage(&config, dir, from),
         Command::Import { file, no_verify } => import(&config, file, !no_verify).await,
         Command::Compact {
             from,
@@ -393,6 +397,23 @@ fn cancel(config: &Config, id: u64) -> anyhow::Result<()> {
 }
 
 /// `ditto-relay export`: see [`export`].
+fn salvage(config: &Config, dir: Option<PathBuf>, from: u64) -> anyhow::Result<()> {
+    let dir = dir.unwrap_or_else(|| config.db_path.join(BODIES_DIR));
+    let mut said = Instant::now();
+    let progress = |written, seq| {
+        if said.elapsed() >= Duration::from_secs(1) {
+            eprintln!("salvaged {written} events so far, through {seq}");
+            said = Instant::now();
+        }
+    };
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
+    let (written, unreadable) =
+        ditto_relay::export::salvage(&dir, config.map_size, from, &mut out, progress)
+            .with_context(|| format!("Could not read the records in {}", dir.display()))?;
+    eprintln!("salvaged {written} events; {unreadable} records couldn't be read");
+    Ok(())
+}
+
 fn export(config: &Config, json: Option<&str>) -> anyhow::Result<()> {
     let store = open_read_only(config)?;
     let filter = match json {
@@ -474,7 +495,15 @@ async fn import(config: &Config, file: Option<PathBuf>, verify: bool) -> anyhow:
     let store = Arc::new(open_store(config)?);
     // What NIP-09 deletions among them remove, for the search index. What
     // they store, it finds itself, catching up when the relay starts.
-    let (removed, told) = std::sync::mpsc::channel();
+    let (removed, told) = std::sync::mpsc::channel::<Written>();
+    // What's removed, gathered as it's told: what's stored, dropped.
+    let told = std::thread::spawn(move || {
+        told.iter()
+            .flat_map(|(_, removed)| removed)
+            .collect::<Vec<u64>>()
+    });
+    // The relay's stopped: nothing reads while it's written.
+    store.bulk();
     let writer = Writer::spawn(store.clone(), config.search.then_some(removed), |_| {});
     let mut importer = Importer::new(store.clone(), writer.clone(), verify);
     let mut lines = tokio::io::AsyncBufReadExt::lines(input);
@@ -492,7 +521,7 @@ async fn import(config: &Config, file: Option<PathBuf>, verify: bool) -> anyhow:
     }
     let tally = importer.finish().await?;
     tokio::task::spawn_blocking(move || writer.stop()).await?;
-    let removed: Vec<u64> = told.try_iter().flatten().collect();
+    let removed = told.join().expect("gathering what was removed panicked");
     if !removed.is_empty() {
         let (_, mut indexer) = SearchIndex::open(
             &config.search_path,
@@ -948,6 +977,31 @@ How it's going is said on stderr.",
         /// Only what this NIP-01 filter matches, as JSON
         #[arg(long, value_name = "JSON")]
         filter: Option<String>,
+    },
+
+    /// Write the events in a records file to stdout, as JSON lines,
+    /// reading nothing else of the database
+    #[command(
+        long_about = "Write every event in a database's records file \
+(its `bodies` directory) to stdout, as JSON, an event a line, in the order \
+they were stored, reading nothing else of the database. For a database \
+whose main file is lost or damaged: import what this writes into a new \
+one, with the relay stopped, to store it all anew.
+
+Unlike `export`, it writes every record kept, old versions and expired \
+and deleted events among them; importing them, in this order, keeps of \
+those what it would have. It only reads.",
+        after_help = "Examples:
+  ditto-relay salvage /var/lib/ditto-relay/db/bodies > events.jsonl
+  ditto-relay salvage old/bodies | ditto-relay -c new.toml import --no-verify"
+    )]
+    Salvage {
+        /// The records file's directory [default: the database's bodies]
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Begin at this sequence number, as where one stopped
+        #[arg(long, value_name = "SEQ", default_value_t = 0)]
+        from: u64,
     },
 
     /// Store events read as JSON lines, from a file or stdin

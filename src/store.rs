@@ -115,7 +115,7 @@
 //! forget, so one counts authors whose events have since gone too.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -133,14 +133,18 @@ use crate::event::KindClass;
 use crate::event::decode_hex;
 use crate::facets;
 use crate::filter::Filter;
+use crate::headers::Headers;
 use crate::hll::{self, Registers};
-use crate::lmdb::{Db, DbFlags, Env, Result, RoTxn, RwTxn, Txn, Usage};
+use crate::json_cache::JsonCache;
+use crate::lmdb::{Cursor, Db, DbFlags, Deferrer, Env, Result, RoTxn, RwTxn, Txn, Usage};
+use crate::memtable::{Down, Ix, Memtable, Snap, Value};
 use crate::metrics::{METRICS, Phase};
 use crate::pending::{self, Hidden, Target};
 use crate::purge::Purger;
 use crate::rank::{self, Rank};
 use crate::record::{self, Element, EventView, Header, tag_value};
 use crate::storage;
+use crate::tally::Tally;
 use crate::wot::{self, Wot};
 
 pub const STAMP_LEN: usize = 10;
@@ -158,6 +162,9 @@ pub const MAX_TAG_NAME: usize = 64;
 
 /// How many events a tag key has before its HyperLogLog is kept.
 pub const HLL_THRESHOLD: usize = 1000;
+
+/// How many tag keys' HyperLogLog offsets are kept at most.
+const OFFSETS: usize = 100_000;
 
 /// How far short of [`HLL_THRESHOLD`] a key's events are read ahead, as
 /// the events filed before it in the writer's queue may bring it there.
@@ -213,6 +220,10 @@ pub(crate) const SETTLED_AT_ONCE: usize = 64;
 
 /// The deletion filter's file, in the database's directory.
 const DELETION_FILTER_FILE: &str = "deletions.bloom";
+
+/// The file of each event's header, in the database's directory: see
+/// [`crate::headers`].
+const HEADERS_FILE: &str = "headers";
 
 /// How many deletions the filter is caught up with per read transaction.
 const CATCH_UP_CHUNK: usize = if cfg!(test) { 2 } else { 10_000 };
@@ -403,6 +414,10 @@ pub struct Tables {
     pub pending: Db,
     pub unlinked: Db,
     pub meta: Db,
+    /// The changes to the indexes kept in memory, by the commit that made
+    /// them, until they're merged into LMDB: see [`crate::memtable`]. None
+    /// in a store opened only to read from before there was one.
+    pub filed: Option<Db>,
 }
 
 impl Tables {
@@ -431,7 +446,26 @@ impl Tables {
             pending: env.create_db("pending", DbFlags::PLAIN)?,
             unlinked: env.create_db("unlinked", DbFlags::INTEGER_KEY)?,
             meta: env.create_db("meta", DbFlags::PLAIN)?,
+            filed: match env.create_db("filed", DbFlags::INTEGER_KEY) {
+                Ok(db) => Some(db),
+                Err(err) if err.is_not_found() => None,
+                Err(err) => return Err(err),
+            },
         })
+    }
+
+    /// The indexes whose changes are kept in memory until merged, and the
+    /// table each is in.
+    fn kept_in_memory(&self) -> Vec<(Db, Ix)> {
+        vec![
+            (self.ids, Ix::Ids),
+            (self.created, Ix::Created),
+            (self.kinds, Ix::Kinds),
+            (self.authors, Ix::Authors),
+            (self.author_kinds, Ix::AuthorKinds),
+            (self.tags, Ix::Tags),
+            (self.facets, Ix::Facets),
+        ]
     }
 }
 
@@ -458,6 +492,27 @@ pub struct Store {
     checkpoints: Mutex<Checkpoints>,
     /// The pending deletions, whose events reads hide: see [`pending`].
     pub(crate) hidden: ArcSwap<Hidden>,
+    /// The JSON of events queries returned lately.
+    pub json: JsonCache,
+    /// The changes to the indexes not merged into LMDB yet.
+    memtable: Memtable,
+    /// The thread storing the records of the events the writer stores, as
+    /// it goes on with their indexes, if records are kept apart: begun
+    /// once the first are.
+    records: std::sync::OnceLock<Option<Deferrer>>,
+    /// How many events each `tags` key without a HyperLogLog has had filed
+    /// under it since the store was opened, at least: one short of
+    /// [`HLL_THRESHOLD`] needn't have them counted. So after a restart, a
+    /// key gets its HyperLogLog only once that many more events come.
+    tally: Tally,
+    /// The HyperLogLog offsets of the tag keys sketched lately: working one
+    /// out hashes most values, and a key with a HyperLogLog comes up often.
+    offsets: Mutex<hashbrown::HashMap<Box<[u8]>, usize>>,
+    /// Whether every event has its [header](Tables::headers).
+    /// Each event's header: see [`crate::headers`]. None in a store opened
+    /// only to read with no file of them, or another database's.
+    headers: Option<Arc<Headers>>,
+    headers_filled: AtomicBool,
     /// Those queued in the write transaction being made, to unhide if it
     /// doesn't commit.
     pub(crate) uncommitted: Mutex<Vec<u64>>,
@@ -469,6 +524,23 @@ pub struct Store {
     unlinking: AtomicBool,
     /// Whether a [repack](crate::repack) is under way.
     pub(crate) repacking: AtomicBool,
+    /// How far events have gone out live ahead of their commits.
+    live: Live,
+    /// Whether it's being written in bulk, with nothing reading it: see
+    /// [`Store::bulk`].
+    bulk: AtomicBool,
+}
+
+/// How far events have gone out to live subscriptions, which get them just
+/// before they're committed, and how far their commits have got: see
+/// [`Store::settle`].
+#[derive(Default)]
+struct Live {
+    /// The sequence number after the last event that went out.
+    out: AtomicU64,
+    /// The sequence number after the last whose commit is done with,
+    /// whether it was made or not.
+    settled: AtomicU64,
 }
 
 /// When the store's [checkpoints](crate::checkpoint) are made.
@@ -529,10 +601,14 @@ impl Store {
         let mut env = Env::open(dir, map_size, 32, 1024)
             .with_context(|| format!("Could not open the database at {}", dir.display()))?;
         let bodies = env
-            .attach(&bodies, map_size, 1, 1024)
+            .attach(&bodies, map_size, 2, 1024)
             .with_context(|| format!("Could not open the database at {}", bodies.display()))?;
         // Before anything's written: until it's durable, LMDB may write
-        // over the last checkpoint's pages.
+        // over the last checkpoint's pages. The headers it has, written
+        // since the last, with it.
+        if let Ok(headers) = std::fs::File::open(dir.join(HEADERS_FILE)) {
+            headers.sync_data()?;
+        }
         let metas = checkpoint::begin(&env)?;
         checkpoint::finish(&env, dir, &files, boot_id.as_deref(), &metas).with_context(|| {
             format!(
@@ -544,6 +620,8 @@ impl Store {
             tracing::warn!("{mismatch}");
         }
         let tables = Tables::open(&env, bodies)?;
+        let (headers, headers_kept) =
+            open_headers(&env, tables.meta, dir, true)?.expect("made if it's not there");
         // Where an older `ditto-relay delete`, which wrote the store itself,
         // left what it removed for the search indexer to delete.
         if let Some(queued) = env.remove_db("search_queue")?
@@ -582,10 +660,21 @@ impl Store {
             hidden: ArcSwap::default(),
             uncommitted: Mutex::default(),
             sweeping: Mutex::default(),
+            json: JsonCache::default(),
+            live: Live::default(),
+            bulk: AtomicBool::new(false),
+            memtable: Memtable::new(tables.kept_in_memory()),
+            records: std::sync::OnceLock::new(),
+            tally: Tally::default(),
+            offsets: Mutex::default(),
+            headers: Some(Arc::new(headers)),
+            headers_filled: AtomicBool::new(false),
             unlinking: AtomicBool::new(true),
             repacking: AtomicBool::new(false),
         };
         let next = store.drop_uncommitted()?;
+        store.begin_headers(true, headers_kept)?;
+        store.replay_filed()?;
         store.load_pending()?;
         store.name()?;
         // Saved since the last event was stored, or a new database.
@@ -614,10 +703,12 @@ impl Store {
         let opening = || format!("Could not open the database at {}", dir.display());
         let mut env = Env::open_read_only(dir, map_size, 32, 1024).with_context(opening)?;
         let bodies = env
-            .attach(&dir.join(BODIES_DIR), map_size, 1, 1024)
+            .attach(&dir.join(BODIES_DIR), map_size, 2, 1024)
             .with_context(opening)?;
         let tables = Tables::open(&env, bodies).with_context(opening)?;
-        Ok(Store {
+        let headers =
+            open_headers(&env, tables.meta, dir, false)?.map(|(headers, _)| Arc::new(headers));
+        let store = Store {
             env: Arc::new(env),
             bodies,
             tables,
@@ -638,9 +729,33 @@ impl Store {
             hidden: ArcSwap::default(),
             uncommitted: Mutex::default(),
             sweeping: Mutex::default(),
+            json: JsonCache::default(),
+            live: Live::default(),
+            bulk: AtomicBool::new(false),
+            memtable: Memtable::new(tables.kept_in_memory()),
+            records: std::sync::OnceLock::new(),
+            tally: Tally::default(),
+            offsets: Mutex::default(),
+            headers,
+            headers_filled: AtomicBool::new(false),
             unlinking: AtomicBool::new(false),
             repacking: AtomicBool::new(false),
-        })
+        };
+        store.begin_headers(false, true)?;
+        store.replay_filed()?;
+        Ok(store)
+    }
+
+    /// Ask for an event's header to be read into the cache.
+    pub fn prefetch_header(&self, seq: u64) {
+        if let Some(headers) = &self.headers {
+            headers.prefetch(seq);
+        }
+    }
+
+    /// Each event's header, if they're kept: see [`crate::headers`].
+    pub(crate) fn headers(&self) -> Option<&Headers> {
+        self.headers.as_deref()
     }
 
     /// The data files of the store's environments.
@@ -697,19 +812,26 @@ impl Store {
                 return;
             }
         };
-        let (env, dir, files, boot_id) = (
+        let (env, dir, files, boot_id, headers, bodies) = (
             self.env.clone(),
             self.dir.clone(),
             self.files(),
             self.boot_id.clone(),
+            self.headers.clone(),
+            self.bodies,
         );
         checkpoints.finishing = Some(std::thread::spawn(move || {
             let start = Instant::now();
-            let finished = checkpoint::finish(&env, &dir, &files, boot_id.as_deref(), &metas);
+            let finished = sync_headers(headers.as_deref())
+                .and_then(|()| checkpoint::finish(&env, &dir, &files, boot_id.as_deref(), &metas));
+            // The records written, and only read as they're asked for. The
+            // main file's pages are the indexes', which the writer walks all
+            // the time: unmapped, they'd be faulted in again at once.
+            env.release(bodies);
             METRICS.checkpoints.since(start);
             match finished {
-                Ok(()) if start.elapsed() > checkpoint::INTERVAL => tracing::warn!(
-                    "a checkpoint took {:.1?}, longer than the time between them",
+                Ok(()) if start.elapsed() > checkpoint::SLOW => tracing::warn!(
+                    "a checkpoint took {:.1?}: the disk may not keep up",
                     start.elapsed()
                 ),
                 Ok(()) => tracing::debug!("checkpointed in {:.1?}", start.elapsed()),
@@ -727,6 +849,7 @@ impl Store {
         }
         checkpoints.last = Instant::now();
         let metas = checkpoint::begin(&self.env)?;
+        sync_headers(self.headers.as_deref())?;
         checkpoint::finish(
             &self.env,
             &self.dir,
@@ -754,6 +877,7 @@ impl Store {
             tracing::warn!("dropping {} records never committed", orphans.len());
             for key in &orphans {
                 txn.del(self.tables.events, key, None)?;
+                self.del_header(key);
             }
             txn.commit()?;
         }
@@ -868,13 +992,249 @@ impl Store {
         Ok((self.env.usage(0)?, self.env.usage(self.bodies)?))
     }
 
+    /// A read transaction, seeing the changes to the indexes kept in
+    /// memory as of the commit it reads.
     pub fn read(&self) -> Result<RoTxn<'_>> {
-        self.env.read_txn()
+        // The layers first: see crate::memtable.
+        let layers = self.memtable.layers();
+        let mut txn = self.env.read_txn()?;
+        let snap = self.memtable.snap(&layers, self.commit_of(&txn)?);
+        txn.set_overlay(snap);
+        Ok(txn)
     }
 
-    pub fn write(&self) -> Result<RwTxn<'_>> {
+    /// The number of the last commit to change the indexes, as `txn`
+    /// reads: see [`crate::memtable`].
+    fn commit_of(&self, txn: &Txn) -> Result<u64> {
+        Ok(txn
+            .get(self.tables.meta, COMMIT)?
+            .map_or(0, |v| u64::from_be_bytes(v.try_into().unwrap_or_default())))
+    }
+
+    /// A write transaction. What it changes of the indexes kept in memory
+    /// is filed there as it's made, and kept beside the commit; if it's
+    /// dropped without committing, it's undone.
+    pub fn write(&self) -> Result<Write<'_>> {
         self.checkpoint_if_due();
-        self.env.write_txn()
+        let layers = self.memtable.layers();
+        let mut txn = self.env.write_txn()?;
+        let snap = self.memtable.snap(&layers, self.commit_of(&txn)? + 1);
+        txn.set_overlay(snap);
+        Ok(Write {
+            txn: Some(txn),
+            store: self,
+        })
+    }
+
+    /// A [write](Self::write) transaction storing records by another
+    /// thread, in a transaction of its own, while it goes on: committing
+    /// it waits for theirs. Only reading them back, by sequence number,
+    /// sees those written in it.
+    fn write_records_apart(&self) -> Result<Write<'_>> {
+        let records = self.records.get_or_init(|| {
+            if self.bodies == 0 {
+                return None;
+            }
+            Deferrer::spawn(self.env.clone(), self.bodies)
+                .inspect_err(|err| tracing::warn!("couldn't start storing records apart: {err}"))
+                .ok()
+        });
+        let Some(records) = records else {
+            return self.write();
+        };
+        self.checkpoint_if_due();
+        let layers = self.memtable.layers();
+        let mut txn = self.env.write_txn_deferring(records)?;
+        let snap = self.memtable.snap(&layers, self.commit_of(&txn)? + 1);
+        txn.set_overlay(snap);
+        Ok(Write {
+            txn: Some(txn),
+            store: self,
+        })
+    }
+
+    /// Merge every change to the indexes kept in memory into LMDB,
+    /// returning how many there were. Between writes.
+    pub fn merge(&self) -> Result<usize> {
+        let mut merged = 0;
+        while self.unmerged() > 0 {
+            merged += self.merge_step(usize::MAX)?;
+        }
+        Ok(merged)
+    }
+
+    /// Merge into LMDB, in one transaction, about `budget` of the changes
+    /// to the indexes kept in memory, whole keys at a time: first freezing
+    /// those filed so far, if none are frozen. Returns how many it merged.
+    /// Between writes.
+    pub fn merge_step(&self, budget: usize) -> Result<usize> {
+        let mut txn = self.env.write_txn()?;
+        let t = self.tables;
+        let at = self.commit_of(&txn)? + 1;
+        if !self.memtable.merging() {
+            if self.memtable.active_records() == 0 {
+                return Ok(0);
+            }
+            self.memtable.freeze(at - 1);
+        }
+        let dbs = t.kept_in_memory();
+        let db = |ix| dbs.iter().find(|(_, i)| *i == ix).expect("kept").0;
+        let merging = || {
+            let slice = self
+                .memtable
+                .merge_slice(&mut txn, at, budget, db)?
+                .expect("a layer frozen");
+            match &slice.last {
+                // Where it's got to, for a restart to go on from.
+                Some((ix, key)) => {
+                    let mut at = slice.through.to_be_bytes().to_vec();
+                    at.push(ix.byte());
+                    at.extend_from_slice(key);
+                    txn.put(t.meta, MERGING, &at)?;
+                }
+                // Done: the commits' changes are all in LMDB.
+                None => {
+                    txn.del(t.meta, MERGING, None)?;
+                    if let Some(filed) = t.filed {
+                        let mut done = Vec::new();
+                        let mut cursor = txn.cursor(filed)?;
+                        let mut entry = cursor.first()?;
+                        while let Some((key, _)) = entry
+                            && filed_commit(key) <= slice.through
+                        {
+                            done.push(key.to_vec());
+                            entry = cursor.next()?;
+                        }
+                        drop(cursor);
+                        for key in done {
+                            txn.del(filed, &key, None)?;
+                        }
+                    }
+                }
+            }
+            txn.put(t.meta, COMMIT, &at.to_be_bytes())?;
+            txn.commit()?;
+            Ok(slice)
+        };
+        match merging() {
+            Ok(slice) => {
+                let entries = slice.entries;
+                self.memtable.sliced(slice);
+                Ok(entries)
+            }
+            Err(err) => {
+                self.memtable.unslice();
+                Err(err)
+            }
+        }
+    }
+
+    /// Have the writer keep many more index changes in memory before
+    /// merging them, and merge them all at once, as when importing with
+    /// the relay stopped: a merge into big indexes touches a page for each
+    /// change of a few, and one of many touches each page once for many.
+    /// Nothing reads meanwhile, so no one waits on the writer as it merges.
+    pub fn bulk(&self) {
+        self.bulk.store(true, Ordering::Relaxed);
+    }
+
+    /// How many index changes kept in memory have the writer merge them,
+    /// and how many it merges at a time between writes.
+    fn merging_at(&self) -> (usize, usize) {
+        match self.bulk.load(Ordering::Relaxed) {
+            true => (BULK_MERGE_AT, BULK_MERGE_SLICE),
+            false => (MERGE_AT, MERGE_SLICE),
+        }
+    }
+
+    /// Whether a frozen layer of index changes is being merged.
+    pub fn merging(&self) -> bool {
+        self.memtable.merging()
+    }
+
+    /// Whether a merge is under way, or due, with `at` changes kept in
+    /// memory: then the writer goes on with it between writes.
+    pub fn merge_due(&self, at: usize) -> bool {
+        let (active, frozen) = self.memtable.unmerged();
+        frozen || active >= at
+    }
+
+    /// How many changes to the indexes are kept in memory, and keys of
+    /// those being merged, unmerged.
+    pub fn unmerged(&self) -> usize {
+        let (active, frozen) = self.memtable.unmerged();
+        active + usize::from(frozen)
+    }
+
+    /// File again the changes to the indexes committed and not merged
+    /// before the store was last closed: those of a merge under way as
+    /// frozen, and the keys it had merged as merged.
+    fn replay_filed(&self) -> Result<()> {
+        let Some(filed) = self.tables.filed else {
+            return Ok(());
+        };
+        let txn = self.env.read_txn()?;
+        let merging = txn.get(self.tables.meta, MERGING)?.and_then(|at| {
+            let (through, rest) = at.split_first_chunk::<8>()?;
+            let (&ix, key) = rest.split_first()?;
+            Some((u64::from_be_bytes(*through), Ix::from_byte(ix)?, key))
+        });
+        let mut cursor = txn.cursor(filed)?;
+        let mut entry = cursor.first()?;
+        let mut commits = 0;
+        let mut frozen = merging.is_none();
+        while let Some((key, ops)) = entry {
+            if let Some((through, ix, last)) = merging
+                && !frozen
+                && filed_commit(key) > through
+            {
+                self.memtable.freeze(through);
+                self.memtable.merged_through((ix, last));
+                frozen = true;
+            }
+            if self.memtable.replay(ops).is_none() {
+                tracing::error!("a commit's changes to the indexes can't be read");
+            }
+            commits += 1;
+            entry = cursor.next()?;
+        }
+        if let Some((through, ix, last)) = merging
+            && !frozen
+        {
+            self.memtable.freeze(through);
+            self.memtable.merged_through((ix, last));
+        }
+        if commits > 0 {
+            tracing::info!("filed again the index changes of {commits} commits not merged");
+        }
+        Ok(())
+    }
+
+    /// Put an entry in an index, in memory if it's kept there.
+    fn index_put(&self, txn: &mut RwTxn, db: Db, key: &[u8], value: &[u8]) -> Result<()> {
+        match self.memtable.ix_of(db) {
+            Some(ix) => self.memtable.add(ix, key, value, filing_at(txn)),
+            None => {
+                txn.put_dup(db, key, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete an entry from an index, in memory if it's kept there,
+    /// returning whether there was one.
+    fn index_del(&self, txn: &mut RwTxn, db: Db, key: &[u8], value: &[u8]) -> Result<bool> {
+        let Some(ix) = self.memtable.ix_of(db) else {
+            return txn.del(db, key, Some(value));
+        };
+        let there = match ix {
+            Ix::Ids => value_of(txn, db, key)?.is_some_and(|v| &*v == value),
+            _ => has_entry(txn, db, key, value)?,
+        };
+        if there {
+            self.memtable.remove(ix, key, value, filing_at(txn));
+        }
+        Ok(there)
     }
 
     /// How much an author's engagement counts, from 0 to 1: their weight
@@ -964,9 +1324,8 @@ impl Store {
 
     /// The sequence number an event is stored under, expired or not.
     pub fn seq_of(&self, txn: &Txn, id: &[u8; 32]) -> Result<Option<u64>> {
-        Ok(txn
-            .get(self.tables.ids, id)?
-            .map(|value| u64::from_be_bytes(value.try_into().unwrap_or_default())))
+        Ok(value_of(txn, self.tables.ids, id)?
+            .map(|value| u64::from_be_bytes((*value).try_into().unwrap_or_default())))
     }
 
     /// A stored event's signature.
@@ -984,6 +1343,145 @@ impl Store {
         Ok(self
             .stored(txn, seq)?
             .filter(|view| !view.is_expired(now) && !self.hides(seq, view)))
+    }
+
+    /// File a record's [header](Tables::headers) under `seq`.
+    fn put_header(&self, seq: u64, record: &[u8]) {
+        let (Some(headers), Some(row)) = (&self.headers, header_row(record)) else {
+            return;
+        };
+        // Without it, the event's read from its record.
+        if let Err(err) = headers.put(seq, &row) {
+            tracing::error!("writing an event's header failed: {err}");
+        }
+    }
+
+    /// Remove the [header](crate::headers) of a record's key.
+    pub(crate) fn del_header(&self, key: &[u8]) {
+        if let Some(headers) = &self.headers {
+            headers.clear(u64::from_ne_bytes(key.try_into().unwrap_or_default()));
+        }
+    }
+
+    /// Whether every event has its [header](Tables::headers), so that
+    /// reading many events' needn't read ahead of their records.
+    pub fn headers_filled(&self) -> bool {
+        self.headers_filled.load(Ordering::Relaxed)
+    }
+
+    /// Note whether the events stored before there were
+    /// [headers](Tables::headers) need theirs: if there's none, but there
+    /// are events, from the next one stored down, until
+    /// [`fill_headers`](Self::fill_headers) is done.
+    fn begin_headers(&self, writable: bool, kept: bool) -> Result<()> {
+        let t = self.tables;
+        if self.headers.is_none() {
+            return Ok(());
+        }
+        let filled = match writable {
+            true => {
+                let mut txn = self.write()?;
+                // A file begun again: the rows of what's stored go back in.
+                if !kept {
+                    txn.del(t.meta, HEADERS_BELOW, None)?;
+                }
+                let below = txn.get(t.meta, HEADERS_BELOW)?.is_some();
+                let unfilled = !kept && txn.len(t.events)? > 0;
+                if !below && unfilled {
+                    let next = self.next_seq(&txn)?;
+                    txn.put(t.meta, HEADERS_BELOW, &next.to_be_bytes())?;
+                    txn.commit()?;
+                }
+                !below && !unfilled
+            }
+            false => self.read()?.get(t.meta, HEADERS_BELOW)?.is_none(),
+        };
+        self.headers_filled.store(filled, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Leave the events with no [header](Tables::headers) as they are,
+    /// read from their records.
+    pub fn stop_filling_headers(&self) {
+        self.headers_filled.store(true, Ordering::Relaxed);
+    }
+
+    /// File the headers of up to `max` of the events stored before there
+    /// were [headers](Tables::headers), the newest first, in a transaction.
+    /// Whether there are more.
+    pub fn fill_headers(&self, max: usize) -> Result<bool> {
+        let t = self.tables;
+        let Some(headers) = self.headers.clone() else {
+            return Ok(false);
+        };
+        let mut txn = self.write()?;
+        let Some(below) = txn
+            .get(t.meta, HEADERS_BELOW)?
+            .map(|v| u64::from_be_bytes(v.try_into().unwrap_or_default()))
+        else {
+            self.headers_filled.store(true, Ordering::Relaxed);
+            return Ok(false);
+        };
+        let mut rows = Vec::new();
+        let mut lowest = below;
+        let mut cursor = txn.cursor(t.events)?;
+        let mut entry = match cursor.set_range(&below.to_ne_bytes())? {
+            Some(_) => cursor.prev()?,
+            None => cursor.last()?,
+        };
+        let mut visited = 0;
+        while let Some((key, record)) = entry
+            && visited < max
+        {
+            visited += 1;
+            let seq = u64::from_ne_bytes(key.try_into().expect("8 bytes"));
+            lowest = seq;
+            if let Some(row) = header_row(record) {
+                rows.push((seq, row));
+            }
+            entry = cursor.prev()?;
+        }
+        let more = entry.is_some();
+        drop(cursor);
+        for (seq, row) in &rows {
+            if let Err(err) = headers.put(*seq, row) {
+                tracing::error!("writing an event's header failed: {err}");
+            }
+        }
+        match more {
+            true => txn.put(t.meta, HEADERS_BELOW, &lowest.to_be_bytes())?,
+            false => txn.del(t.meta, HEADERS_BELOW, None)?,
+        };
+        txn.commit()?;
+        if !more {
+            self.headers_filled.store(true, Ordering::Relaxed);
+        }
+        Ok(more)
+    }
+
+    /// [`Briefs`] of events as of `txn`, for reading many.
+    pub fn briefs<'s, 't>(&'s self, txn: &'t Txn<'t>) -> Result<Briefs<'s, 't>> {
+        Ok(Briefs {
+            store: self,
+            txn,
+            headers: self.headers.as_deref(),
+            hidden: self.hidden.load_full(),
+            unlinked: txn.cursor(self.tables.unlinked)?.first()?.is_some(),
+            now: crate::event::now(),
+        })
+    }
+
+    /// A [`Loader`] of events as of `txn`, for loading many.
+    pub fn loader<'s, 't>(&'s self, txn: &'t Txn<'t>) -> Result<Loader<'s, 't>> {
+        Ok(Loader {
+            store: self,
+            txn,
+            cursor: txn.cursor(self.tables.events)?,
+            at: None,
+            hidden: self.hidden.load_full(),
+            unlinked: txn.cursor(self.tables.unlinked)?.first()?.is_some(),
+            now: crate::event::now(),
+        })
     }
 
     /// A stored event, expired or not, and whether or not a pending
@@ -1061,22 +1559,57 @@ impl Store {
         records: impl IntoIterator<Item = &'a [u8]>,
         now: u32,
     ) -> Result<Batch> {
+        let records = records.into_iter().map(|record| (record, None));
+        self.write_batch_then(records, now, |_| {})
+    }
+
+    /// [`write_batch`](Self::write_batch), of records with their
+    /// [keys](Self::keys_of_record) if they're worked out already, handing
+    /// `ahead` what it did just before it's committed.
+    fn write_batch_then<'a>(
+        &self,
+        records: impl IntoIterator<Item = (&'a [u8], Option<&'a IndexKeys>)>,
+        now: u32,
+        ahead: impl FnOnce(&Batch),
+    ) -> Result<Batch> {
         let written = (|| {
-            let mut txn = self.write()?;
+            let mut txn = self.write_records_apart()?;
             let mut batch = Batch::default();
-            for record in records {
-                let outcome = self.insert(&mut txn, record, now, &mut batch.removed)?;
+            for (record, keys) in records {
+                let outcome = self.insert(&mut txn, record, keys, now, &mut batch.removed)?;
                 batch.outcomes.push(outcome);
             }
+            ahead(&batch);
             txn.commit()?;
             Ok(batch)
         })();
+        let out = self.live.out.load(Ordering::Relaxed);
+        self.live.settled.store(out, Ordering::Release);
         match &written {
             Ok(_) => self.committed_queued(),
             // What deletions it queued are hidden no longer.
             Err(_) => self.forget_uncommitted(),
         }
         written
+    }
+
+    /// Note that the events through `seq` are going out live, ahead of
+    /// their commit.
+    fn going_live(&self, seq: u64) {
+        self.live.out.store(seq + 1, Ordering::Release);
+    }
+
+    /// Wait for the commits of the events gone out live by now to be done
+    /// with, made or not: what's read after then holds every one of them
+    /// stored, so a subscription made by now misses none, whether it was
+    /// made before or after one went out. Waits on the commit under way,
+    /// if any, or not at all.
+    pub async fn settle(&self) {
+        let out = self.live.out.load(Ordering::Acquire);
+        let start = Instant::now();
+        while self.live.settled.load(Ordering::Acquire) < out && start.elapsed() < SETTLE_AT_MOST {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Read, in a read transaction, what [`insert`](Self::insert)ing a
@@ -1118,13 +1651,12 @@ impl Store {
             seek(db, &key, &at)?;
             // A key about to reach the threshold has its events read to
             // sketch them: read them too.
-            if db == t.tags && txn.get(t.hll, &key)?.is_none() {
-                let mut cursor = txn.cursor(t.tags)?;
-                if cursor.set(&key)?.is_some()
-                    && cursor.count()? + HLL_PREFETCH_MARGIN >= HLL_THRESHOLD
-                {
-                    self.sketch_from_events(txn, &key)?;
-                }
+            if db == t.tags
+                && self.tally.get(&key) + 1 + HLL_PREFETCH_MARGIN >= HLL_THRESHOLD
+                && txn.get(t.hll, &key)?.is_none()
+                && count_key(txn, t.tags, &key)? + HLL_PREFETCH_MARGIN >= HLL_THRESHOLD
+            {
+                self.sketch_from_events(txn, &key)?;
             }
         }
         rank::prefetch(self, txn, &view)
@@ -1137,6 +1669,7 @@ impl Store {
         &self,
         txn: &mut RwTxn,
         record: &[u8],
+        keys: Option<&IndexKeys>,
         now: u32,
         removed: &mut Vec<u64>,
     ) -> Result<Outcome> {
@@ -1179,12 +1712,20 @@ impl Store {
 
         let seq = self.put_record(txn, &view, record)?;
         let stamp = stamp(created_at, seq);
-        txn.put_dup(t.created, CREATED, &stamp)?;
-        txn.put_dup(t.authors, view.pubkey(), &kinded(&stamp, view.kind()))?;
-        for (db, key) in self.index_keys(&view) {
-            txn.put_dup(db, &key, &stamp)?;
-            if db == t.tags {
-                self.sketch(txn, &key, view.pubkey())?;
+        self.index_put(txn, t.created, CREATED, &stamp)?;
+        self.index_put(txn, t.authors, view.pubkey(), &kinded(&stamp, view.kind()))?;
+        let worked_out;
+        let keys = match keys {
+            Some(keys) => keys,
+            None => {
+                worked_out = self.index_keys(&view);
+                &worked_out
+            }
+        };
+        for (db, key) in keys {
+            self.index_put(txn, *db, key, &stamp)?;
+            if *db == t.tags {
+                self.sketch(txn, key, view.pubkey())?;
             }
         }
         rank::index(self, txn, seq, &view)?;
@@ -1255,11 +1796,9 @@ impl Store {
         if self.deletions.rules_out(&key) {
             return Ok(None);
         }
-        let mut cursor = txn.cursor(self.tables.author_kinds)?;
-        if cursor.set(&key)?.is_none() {
-            return Ok(None);
-        }
-        Ok(cursor.last_dup()?.map(|(_, stamp)| stamp_created_at(stamp)))
+        let newest =
+            entries_down(txn, self.tables.author_kinds, &key, &[0xff; STAMP_LEN])?.next()?;
+        Ok(newest.map(|stamp| stamp_created_at(&stamp)))
     }
 
     /// What a NIP-62 request to vanish by `pubkey` at `until` removes,
@@ -1568,7 +2107,7 @@ impl Store {
         let record = self.record(txn, seq)?.expect("a stored record");
         self.remove(txn, seq)?;
         removed.push(seq);
-        self.insert(txn, &record, now, removed)?;
+        self.insert(txn, &record, None, now, removed)?;
         Ok(())
     }
 
@@ -1625,7 +2164,8 @@ impl Store {
         if !txn.append(t.events, &seq.to_ne_bytes(), record)? {
             txn.put(t.events, &seq.to_ne_bytes(), record)?;
         }
-        txn.put(t.ids, view.id(), &seq.to_be_bytes())?;
+        self.put_header(seq, record);
+        self.index_put(txn, t.ids, view.id(), &seq.to_be_bytes())?;
         if let Some(expiration) = view.expiration() {
             txn.put_dup(t.expiring, EXPIRING, &stamp(expiration, seq))?;
         }
@@ -1671,7 +2211,14 @@ impl Store {
     /// Every (index, key) an event's stamp is filed under, besides
     /// `created` and `authors`. Each at most once, since a stamp is only
     /// stored once per key anyway.
-    fn index_keys(&self, view: &EventView) -> Vec<(Db, Vec<u8>)> {
+    /// The keys a record is filed under besides its author's and its time,
+    /// worked out ahead of the writer, so as to spare it the work: none if
+    /// it isn't a record.
+    pub fn keys_of_record(&self, record: &[u8]) -> Option<IndexKeys> {
+        EventView::new(record).map(|view| self.index_keys(&view))
+    }
+
+    fn index_keys(&self, view: &EventView) -> IndexKeys {
         let t = self.tables;
         let kind = view.kind().to_be_bytes();
         let mut keys = vec![
@@ -1713,9 +2260,9 @@ impl Store {
         let stamp = stamp(view.created_at(), seq);
         let mut dropped = 0;
         for key in self.stale_tag_keys(&view) {
-            if txn.del(t.tags, &key, Some(&stamp))? {
+            if self.index_del(txn, t.tags, &key, &stamp)? {
                 dropped += 1;
-                if txn.cursor(t.tags)?.set(&key)?.is_none() {
+                if count_key(txn, t.tags, &key)? == 0 {
                     txn.del(t.hll, &key, None)?;
                 }
             }
@@ -1750,15 +2297,15 @@ impl Store {
         let registers = match txn.get(t.hll, key)? {
             Some(stored) => {
                 let mut registers: Registers = stored.try_into().unwrap_or([0; hll::REGISTERS]);
-                let offset = hll::offset(&tag_key_value(key));
-                if !hll::add(&mut registers, offset, pubkey) {
+                if !hll::add(&mut registers, self.offset_of(key), pubkey) {
                     return Ok(());
                 }
                 registers
             }
             None => {
-                let mut cursor = txn.cursor(t.tags)?;
-                if cursor.set(key)?.is_none() || cursor.count()? < HLL_THRESHOLD {
+                if self.tally.add(key) < HLL_THRESHOLD
+                    || count_key(txn, t.tags, key)? < HLL_THRESHOLD
+                {
                     return Ok(());
                 }
                 self.sketch_from_events(txn, key)?
@@ -1766,6 +2313,20 @@ impl Store {
         };
         txn.put(t.hll, key, &registers)?;
         Ok(())
+    }
+
+    /// The HyperLogLog offset of a tag key's value.
+    fn offset_of(&self, key: &[u8]) -> usize {
+        let mut offsets = self.offsets.lock().expect("unpoisoned");
+        if let Some(&offset) = offsets.get(key) {
+            return offset;
+        }
+        let offset = hll::offset(&tag_key_value(key));
+        if offsets.len() >= OFFSETS {
+            offsets.clear();
+        }
+        offsets.insert(key.into(), offset);
+        offset
     }
 
     /// Sketch a tag key's authors from its events. Only their headers are
@@ -1781,8 +2342,15 @@ impl Store {
             true
         })?;
         for seq in seqs {
-            let record = txn.get(self.tables.events, &seq.to_ne_bytes())?;
-            if let Some(author) = record.and_then(|r| record::author_unless_expired(r, now)) {
+            let key = seq.to_ne_bytes();
+            let row = self.headers.as_ref().and_then(|headers| headers.get(seq));
+            let author = match &row {
+                Some(row) => row_author(row, now),
+                None => txn
+                    .get(self.tables.events, &key)?
+                    .and_then(|r| record::author_unless_expired(r, now)),
+            };
+            if let Some(author) = author {
                 hll::add(&mut registers, offset, author);
             }
         }
@@ -1824,7 +2392,7 @@ impl Store {
         if let Some(expiration) = view.expiration() {
             txn.del(t.expiring, EXPIRING, Some(&stamp(expiration, seq)))?;
         }
-        txn.del(t.ids, view.id(), None)?;
+        self.index_del(txn, t.ids, view.id(), &seq.to_be_bytes())?;
         txn.put(t.unlinked, &seq.to_ne_bytes(), &[])?;
         self.unlinking.store(true, Ordering::Relaxed);
         Ok(true)
@@ -1851,6 +2419,7 @@ impl Store {
             let left = entry.is_some();
             for key in &seqs {
                 txn.del(t.events, key, None)?;
+                self.del_header(key);
                 txn.del(t.unlinked, key, None)?;
             }
             if !seqs.is_empty() {
@@ -1883,11 +2452,11 @@ impl Store {
         let t = self.tables;
         let stamp = stamp(view.created_at(), seq);
         rank::unindex(self, txn, seq, view)?;
-        txn.del(t.authors, view.pubkey(), Some(&kinded(&stamp, view.kind())))?;
+        self.index_del(txn, t.authors, view.pubkey(), &kinded(&stamp, view.kind()))?;
         for (db, key) in self.index_keys(view) {
-            txn.del(db, &key, Some(&stamp))?;
+            self.index_del(txn, db, &key, &stamp)?;
             // A sketch outlives its events, but not its key.
-            if db == t.tags && txn.cursor(t.tags)?.set(&key)?.is_none() {
+            if db == t.tags && count_key(txn, t.tags, &key)? == 0 {
                 txn.del(t.hll, &key, None)?;
             }
         }
@@ -1903,9 +2472,114 @@ impl Store {
                 wot::relist(self, txn, wot, view.pubkey(), &wot::follows(view), &[])?;
             }
         }
-        txn.del(t.created, CREATED, Some(&stamp))?;
+        self.index_del(txn, t.created, CREATED, &stamp)?;
         Ok(())
     }
+}
+
+/// A write transaction of the store's: see [`Store::write`].
+pub struct Write<'s> {
+    txn: Option<RwTxn<'s>>,
+    store: &'s Store,
+}
+
+impl<'s> Write<'s> {
+    pub fn commit(mut self) -> Result<()> {
+        let mut txn = self.txn.take().expect("not committed");
+        let ops = self.store.memtable.take_ops();
+        if !ops.is_empty()
+            && let Some(filed) = self.store.tables.filed
+        {
+            let at = filing_at(&txn);
+            let put = txn
+                .put(filed, &at.to_ne_bytes(), &ops)
+                .and_then(|_| txn.put(self.store.tables.meta, COMMIT, &at.to_be_bytes()));
+            if let Err(err) = put {
+                self.store.memtable.rollback();
+                return Err(err);
+            }
+        }
+        match txn.commit() {
+            Ok(()) => {
+                self.store.memtable.commit();
+                Ok(())
+            }
+            Err(err) => {
+                self.store.memtable.rollback();
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for Write<'_> {
+    fn drop(&mut self) {
+        if self.txn.take().is_some() {
+            self.store.memtable.rollback();
+            self.store.memtable.take_ops();
+        }
+    }
+}
+
+impl<'s> std::ops::Deref for Write<'s> {
+    type Target = RwTxn<'s>;
+    fn deref(&self) -> &RwTxn<'s> {
+        self.txn.as_ref().expect("not committed")
+    }
+}
+
+impl std::ops::DerefMut for Write<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.txn.as_mut().expect("not committed")
+    }
+}
+
+/// The commit a write transaction's changes to the indexes are filed as.
+fn filing_at(txn: &Txn) -> u64 {
+    txn.overlay().expect("a store's write transaction").at()
+}
+
+/// A transaction that sees no index changes kept in memory.
+static NO_LAYERS: std::sync::LazyLock<Snap> = std::sync::LazyLock::new(|| Snap::new(&[], 0));
+
+/// What `txn` sees of `db` in memory, and which index it is: nothing, if
+/// it's not one kept there.
+fn view<'t>(txn: &'t Txn, db: Db) -> (&'t Snap, Ix) {
+    txn.overlay()
+        .and_then(|snap| Some((snap, snap.ix_of(db)?)))
+        .unwrap_or((&NO_LAYERS, Ix::Tags))
+}
+
+/// How many entries `key` has in `db`.
+pub fn count_key(txn: &Txn, db: Db, key: &[u8]) -> Result<usize> {
+    let (snap, ix) = view(txn, db);
+    snap.count(txn, db, ix, key)
+}
+
+/// `key`'s entries in `db`, newest first, from the last no greater than
+/// `from`.
+pub fn entries_down<'t>(txn: &'t Txn, db: Db, key: &[u8], from: &[u8]) -> Result<Down<'t>> {
+    let (snap, ix) = view(txn, db);
+    snap.down(txn, db, ix, key, from)
+}
+
+/// The keys of `db` from `from`, in order, up to the first not starting
+/// with `prefix`. One may have no entries left.
+pub fn keys_from(txn: &Txn, db: Db, from: &[u8], prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let (snap, ix) = view(txn, db);
+    snap.keys(txn, db, ix, from, prefix)
+}
+
+/// The value of `key` in `db`, a table of one value a key.
+pub fn value_of<'t>(txn: &'t Txn, db: Db, key: &[u8]) -> Result<Option<Value<'t>>> {
+    let (snap, ix) = view(txn, db);
+    snap.get(txn, db, ix, key)
+}
+
+/// Whether `key` has the entry `entry` in `db`.
+pub fn has_entry(txn: &Txn, db: Db, key: &[u8], entry: &[u8]) -> Result<bool> {
+    let (snap, ix) = view(txn, db);
+    snap.has(txn, db, ix, key, entry)
 }
 
 /// Call `f` with each of `key`'s entries from `since` to `until`, oldest
@@ -1920,6 +2594,13 @@ pub fn each_stamp(
     mut f: impl FnMut(&[u8]) -> bool,
 ) -> Result<()> {
     let (low, high) = (stamp(since, 0), stamp(until, MAX_SEQ));
+    if let Some(snap) = txn.overlay()
+        && let Some(ix) = snap.ix_of(db)
+        && !snap.untouched(ix, key)
+    {
+        let high = [&high[..], &[0xff; 2]].concat();
+        return snap.each(txn, db, ix, key, (&low, &high), |entry| f(entry));
+    }
     let mut cursor = txn.cursor(db)?;
     let Some((_, first)) = cursor.get_both_range(key, &low)? else {
         return Ok(());
@@ -2025,7 +2706,17 @@ pub fn address(pubkey: &[u8; 32], kind: u16, d: &[u8]) -> Vec<u8> {
     out
 }
 
-type WriteJob = (Arc<Vec<u8>>, oneshot::Sender<anyhow::Result<Outcome>>);
+/// A record to store, the keys it's filed under if they're worked out,
+/// and what's done with the outcome.
+type WriteJob = (Arc<Vec<u8>>, Option<IndexKeys>, Answer);
+
+/// The tables and keys an event is filed under besides its author's and
+/// its time: see [`Store::keys_of_record`].
+pub type IndexKeys = Vec<(Db, Vec<u8>)>;
+
+/// What's done with a write's outcome, on the writer's thread: it should
+/// be quick.
+pub type Answer = Box<dyn FnOnce(anyhow::Result<Outcome>) + Send>;
 
 /// Remove up to `max` events that have expired, in a transaction, returning
 /// their sequence numbers, and whether there may be more.
@@ -2040,21 +2731,52 @@ fn sweep(store: &Store, max: usize) -> Result<(Vec<u64>, bool)> {
 /// The events a write stored, by sequence number, and what it removed.
 pub type Written = (Vec<(u64, Arc<Vec<u8>>)>, Vec<u64>);
 
+/// The longest [`Store::settle`] waits, should a commit take that long.
+const SETTLE_AT_MOST: Duration = Duration::from_secs(1);
+
 /// Store a batch of jobs in one transaction, answer each, and `tell` what
-/// was written. One event's failure fails the transaction, and with it
-/// every other event in it, so a batch that fails is tried again an event
-/// at a time: only the event that can't be stored is refused.
-fn write(store: &Store, batch: Vec<WriteJob>, tell: &impl Fn(Written)) {
+/// was written. What it stores goes `live` just before it's committed,
+/// unless it's `gone_live` already. One event's failure fails the
+/// transaction, and with it every other event in it, so a batch that fails
+/// is tried again an event at a time: only the event that can't be stored
+/// is refused.
+fn write(
+    store: &Store,
+    batch: Vec<WriteJob>,
+    tell: &impl Fn(Written),
+    live: &impl Fn(Vec<(u64, Arc<Vec<u8>>)>),
+    gone_live: bool,
+) {
     let now = crate::event::now();
-    let records = batch.iter().map(|(record, _)| record.as_slice());
-    let err = match store.write_batch(records, now) {
+    let records = batch
+        .iter()
+        .map(|(record, keys, _)| (record.as_slice(), keys.as_ref()));
+    let went_live = std::cell::Cell::new(gone_live);
+    let ahead = |done: &Batch| {
+        if went_live.replace(true) {
+            return;
+        }
+        let stored: Vec<_> = batch
+            .iter()
+            .zip(&done.outcomes)
+            .filter_map(|((record, _, _), outcome)| match outcome {
+                Outcome::Stored(seq) => Some((*seq, record.clone())),
+                _ => None,
+            })
+            .collect();
+        if let Some(&(last, _)) = stored.last() {
+            store.going_live(last);
+            live(stored);
+        }
+    };
+    let err = match store.write_batch_then(records, now, ahead) {
         Ok(Batch { outcomes, removed }) => {
             let mut stored = Vec::new();
-            for ((record, reply), outcome) in batch.into_iter().zip(outcomes) {
+            for ((record, _, reply), outcome) in batch.into_iter().zip(outcomes) {
                 if let Outcome::Stored(seq) = outcome {
                     stored.push((seq, record));
                 }
-                let _ = reply.send(Ok(outcome));
+                reply(Ok(outcome));
             }
             tell((stored, removed));
             return;
@@ -2063,8 +2785,8 @@ fn write(store: &Store, batch: Vec<WriteJob>, tell: &impl Fn(Written)) {
     };
     if batch.len() == 1 {
         tracing::error!("write failed: {err}");
-        let (_, reply) = batch.into_iter().next().expect("one job");
-        let _ = reply.send(Err(anyhow!("{err}")));
+        let (_, _, reply) = batch.into_iter().next().expect("one job");
+        reply(Err(anyhow!("{err}")));
         return;
     }
     tracing::warn!(
@@ -2072,7 +2794,7 @@ fn write(store: &Store, batch: Vec<WriteJob>, tell: &impl Fn(Written)) {
         batch.len()
     );
     for job in batch {
-        write(store, vec![job], tell);
+        write(store, vec![job], tell, live, went_live.get());
     }
 }
 
@@ -2190,6 +2912,296 @@ fn note_slow_prefetch(record: &[u8], took: Duration) {
 const MAX_SWEEP: usize = 10_000;
 const FIRST_SWEEP: usize = 64;
 
+/// The length of a [header](Tables::headers): id, `created_at`,
+/// expiration, 0 if none, and author.
+const HEADER_ROW: usize = crate::headers::ROW;
+
+/// A record's [header](Tables::headers).
+fn header_row(record: &[u8]) -> Option<[u8; HEADER_ROW]> {
+    let header = Header::new(record)?;
+    let mut row = [0; HEADER_ROW];
+    row[..32].copy_from_slice(header.id());
+    row[32..36].copy_from_slice(&header.created_at().to_le_bytes());
+    // 0 for none: one that expired at 0 is as expired at 1.
+    let expiration = header.expiration().map_or(0, |at| at.max(1));
+    row[36..40].copy_from_slice(&expiration.to_le_bytes());
+    row[40..].copy_from_slice(header.pubkey());
+    Some(row)
+}
+
+/// A [header](Tables::headers)'s author, unless it's expired by `now`.
+fn row_author(row: &[u8], now: u32) -> Option<&[u8; 32]> {
+    let expiration = u32::from_le_bytes(row[36..40].try_into().expect("4 bytes"));
+    if expiration != 0 && expiration <= now {
+        return None;
+    }
+    row[40..].try_into().ok()
+}
+
+/// What [`Briefs`] say of an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Brief {
+    pub created_at: u32,
+    pub id: [u8; 32],
+    pub pubkey: [u8; 32],
+}
+
+impl From<Header<'_>> for Brief {
+    fn from(header: Header) -> Brief {
+        Brief {
+            created_at: header.created_at(),
+            id: *header.id(),
+            pubkey: *header.pubkey(),
+        }
+    }
+}
+
+/// The `meta` key of the number of the last commit to change the indexes:
+/// see [`crate::memtable`].
+const COMMIT: &[u8] = b"commit";
+
+/// The `meta` key of how far the merge of index changes kept in memory
+/// under way has got: the last commit whose changes it merges, then the
+/// index and key it last merged.
+const MERGING: &[u8] = b"merging";
+
+/// The `meta` key of the id the database's [headers](crate::headers) file
+/// is known by.
+const HEADERS_ID: &[u8] = b"headers_id";
+
+/// Open the database's [headers](crate::headers) file, with whether it was
+/// there as it was: made, with an id, if `writable`.
+fn open_headers(
+    env: &Env,
+    meta: Db,
+    dir: &Path,
+    writable: bool,
+) -> anyhow::Result<Option<(Headers, bool)>> {
+    let id = |value: &[u8]| u64::from_be_bytes(value.try_into().unwrap_or_default());
+    let id = match writable {
+        true => {
+            let mut txn = env.write_txn()?;
+            match txn.get(meta, HEADERS_ID)?.map(id) {
+                Some(id) => id,
+                None => {
+                    let mut bytes = [0; 8];
+                    getrandom::fill(&mut bytes).expect("the OS has randomness");
+                    let id = u64::from_be_bytes(bytes);
+                    txn.put(meta, HEADERS_ID, &id.to_be_bytes())?;
+                    txn.commit()?;
+                    id
+                }
+            }
+        }
+        false => match env.read_txn()?.get(meta, HEADERS_ID)?.map(id) {
+            Some(id) => id,
+            None => return Ok(None),
+        },
+    };
+    let path = dir.join(HEADERS_FILE);
+    Headers::open(&path, id, writable).with_context(|| format!("Could not open {}", path.display()))
+}
+
+/// Make the headers written durable, before a checkpoint's saved.
+pub(crate) fn sync_headers(headers: Option<&Headers>) -> anyhow::Result<()> {
+    if let Some(headers) = headers {
+        headers
+            .sync()
+            .context("Could not sync the events' headers")?;
+    }
+    Ok(())
+}
+
+/// The commit a `filed` key is of.
+fn filed_commit(key: &[u8]) -> u64 {
+    u64::from_ne_bytes(key.try_into().unwrap_or_default())
+}
+
+/// The `meta` key of the sequence number below which events may have no
+/// [header](Tables::headers) yet, if there is one.
+const HEADERS_BELOW: &[u8] = b"headers_below";
+
+/// How many index changes kept in memory have the writer merge them into
+/// LMDB, a slice at a time between batches.
+const MERGE_AT: usize = 1_500_000;
+
+/// As [`MERGE_AT`], when the store's written in [bulk](Store::bulk).
+const BULK_MERGE_AT: usize = 25_000_000;
+
+/// As [`MERGE_SLICE`], in bulk. LMDB keeps the pages a transaction has
+/// changed in a sorted list, into which each page is inserted: a
+/// transaction slows down with each it changes, quadratically, so many
+/// small ones are quicker than one big one.
+const BULK_MERGE_SLICE: usize = 250_000;
+
+/// About how many index changes the writer merges into LMDB at a time.
+const MERGE_SLICE: usize = 20_000;
+
+/// How long the writer, with nothing to do, leaves index changes in memory
+/// before merging them.
+const MERGE_IDLE: Duration = Duration::from_secs(10);
+
+/// The most events [`Store::fill_headers`] files the headers of at once.
+pub const HEADERS_CHUNK: usize = 4096;
+
+/// The `created_at`, id and author of events, as [`Store::header`] finds them,
+/// from their headers rather than their records: a small table, appended
+/// to in order, so it stays in memory. An event the pending deletions may
+/// hide, or with no header, as before the table was filled, is read from
+/// its record.
+pub struct Briefs<'s, 't> {
+    store: &'s Store,
+    txn: &'t Txn<'t>,
+    headers: Option<&'s Headers>,
+    /// What the pending deletions hide, as the briefs were begun.
+    hidden: Arc<Hidden>,
+    unlinked: bool,
+    now: u32,
+}
+
+impl Briefs<'_, '_> {
+    pub fn get(&mut self, seq: u64) -> Result<Option<Brief>> {
+        let key = seq.to_ne_bytes();
+        let row = match self.headers {
+            Some(headers) if !self.hidden.may_hide(seq) => headers.get(seq),
+            _ => None,
+        };
+        let Some(row) = row else {
+            return Ok(self.store.header(self.txn, seq)?.map(Brief::from));
+        };
+        if self.unlinked && self.txn.get(self.store.tables.unlinked, &key)?.is_some() {
+            return Ok(None);
+        }
+        let Some(pubkey) = row_author(&row, self.now) else {
+            return Ok(None);
+        };
+        Ok(Some(Brief {
+            created_at: u32::from_le_bytes(row[32..36].try_into().expect("4 bytes")),
+            id: row[..32].try_into().expect("32 bytes"),
+            pubkey: *pubkey,
+        }))
+    }
+}
+
+/// Loads events as [`Store::load`] does, many in one transaction: through
+/// one cursor, as events loaded one after another are often on the page of
+/// the last, or next to it, and LMDB looks there before searching from the
+/// root; and, if no records are left by removed events as of the
+/// transaction, without looking for each among them.
+pub struct Loader<'s, 't> {
+    store: &'s Store,
+    txn: &'t Txn<'t>,
+    cursor: Cursor<'t>,
+    /// The seq the cursor is at, if it is at one.
+    at: Option<u64>,
+    /// What the pending deletions hide, as the loader was made.
+    hidden: Arc<Hidden>,
+    unlinked: bool,
+    now: u32,
+}
+
+impl<'t> Loader<'_, 't> {
+    pub fn load(&mut self, seq: u64) -> Result<Option<EventView<'t>>> {
+        Ok(self.load_record(seq)?.map(|(_, view)| view))
+    }
+
+    /// As [`load`](Self::load), with the record read.
+    pub fn load_record(&mut self, seq: u64) -> Result<Option<(&'t [u8], EventView<'t>)>> {
+        let key = seq.to_ne_bytes();
+        let step = match self.at {
+            Some(at) if at == seq + 1 => self.cursor.prev()?,
+            Some(at) if at + 1 == seq => self.cursor.next()?,
+            _ => None,
+        };
+        let found = match step {
+            Some((k, record)) if k == key => Some(record),
+            // Not where it was: a cursor that missed is nowhere, and
+            // stepping from nowhere starts at an end.
+            _ => self.cursor.set(&key)?.map(|(_, record)| record),
+        };
+        self.at = found.map(|_| seq);
+        let Some(record) = found else {
+            return Ok(None);
+        };
+        if self.unlinked && self.txn.get(self.store.tables.unlinked, &key)?.is_some() {
+            return Ok(None);
+        }
+        Ok(EventView::new(record)
+            .filter(|view| !view.is_expired(self.now) && !self.hidden.hides(seq, view))
+            .map(|view| (record, view)))
+    }
+
+    /// Whether a pending deletion covers the event stored under `seq`, as
+    /// of when the loader was made.
+    pub fn hides(&self, seq: u64, view: &EventView) -> bool {
+        self.hidden.hides(seq, view)
+    }
+}
+
+/// Note how long a write took before it was queued, reading ahead.
+fn note_prefetched(record: &[u8], start: Instant) {
+    let prefetched = start.elapsed();
+    METRICS.write_prefetch.observe(prefetched);
+    if prefetched >= SLOW_WRITE {
+        note_slow_prefetch(record, prefetched);
+    }
+}
+
+/// Whether prefetching is worth it: only if it's been reading from the
+/// disk. Until it has for [`Self::COLD_FOR`], one write in
+/// [`Self::SAMPLE`] is still prefetched, to notice when the store stops
+/// fitting in memory.
+struct Prefetching {
+    since: Instant,
+    /// Until when every write is prefetched, in milliseconds since `since`.
+    cold_until: AtomicU64,
+    skipped: AtomicU64,
+}
+
+impl Prefetching {
+    const COLD_FOR: Duration = Duration::from_secs(10);
+    const SAMPLE: u64 = 256;
+
+    /// Warm to begin with: if the store isn't, the first writes sampled
+    /// find out.
+    fn new() -> Prefetching {
+        Prefetching {
+            since: Instant::now(),
+            cold_until: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        self.since.elapsed().as_millis() as u64
+    }
+
+    /// Whether to prefetch the next write.
+    fn wanted(&self) -> bool {
+        self.now() < self.cold_until.load(Ordering::Relaxed)
+            || self
+                .skipped
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(Self::SAMPLE)
+    }
+
+    fn went_to_disk(&self) {
+        let until = self.now() + Self::COLD_FOR.as_millis() as u64;
+        self.cold_until.fetch_max(until, Ordering::Relaxed);
+    }
+}
+
+/// How many times the calling thread has waited for a page from the disk.
+fn major_faults() -> i64 {
+    // SAFETY: plain data, filled in by the kernel.
+    let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+    // SAFETY: a valid pointer to a rusage.
+    match unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) } {
+        0 => usage.ru_majflt,
+        _ => 0,
+    }
+}
+
 /// LMDB allows one writer at a time, so all writes go through a dedicated
 /// thread that batches whatever is queued into a single transaction. Every
 /// [`SWEEP_INTERVAL`] it also removes the events that have expired, a
@@ -2200,11 +3212,14 @@ const FIRST_SWEEP: usize = 64;
 ///
 /// Each event's pages are [prefetched](Store::prefetch) on the blocking
 /// pool before it's queued, so events arriving together have their pages
-/// read in parallel rather than one after another by the writer.
+/// read in parallel rather than one after another by the writer. While the
+/// store fits in memory that only reads everything twice, so then only a
+/// sample is (see [`Prefetching`]).
 #[derive(Clone)]
 pub struct Writer {
     tx: std::sync::mpsc::Sender<Request>,
     store: Arc<Store>,
+    prefetching: Arc<Prefetching>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -2249,12 +3264,13 @@ fn queue(store: &Store, target: Target) -> anyhow::Result<Arc<pending::Pending>>
 }
 
 impl Writer {
-    /// Start the writer. With `indexer`, the search indexer is told after
-    /// each write that changed anything, and what it removed. `stored` is
-    /// handed every batch of events stored, once they're committed.
+    /// Start the writer. With `indexer`, the search indexer is handed what
+    /// each write that changed anything stored and removed. `stored` is
+    /// handed every batch of events stored, just before it's committed: a
+    /// reader that's to see them all must [`Store::settle`] first.
     pub fn spawn(
         store: Arc<Store>,
-        indexer: Option<std::sync::mpsc::Sender<Vec<u64>>>,
+        indexer: Option<std::sync::mpsc::Sender<Written>>,
         stored: impl Fn(Vec<(u64, Arc<Vec<u8>>)>) + Send + 'static,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Request>();
@@ -2262,10 +3278,7 @@ impl Writer {
             if let Some(indexer) = &indexer
                 && (!events.is_empty() || !removed.is_empty())
             {
-                let _ = indexer.send(removed);
-            }
-            if !events.is_empty() {
-                stored(events);
+                let _ = indexer.send((events, removed));
             }
         };
 
@@ -2313,6 +3326,18 @@ impl Writer {
                         tracing::error!("a background turn failed: {err}");
                         false
                     });
+                };
+                let mut last_merge = Instant::now();
+                let merge = |last_merge: &mut Instant, budget: usize| {
+                    let _merge = phase(Phase::Merge);
+                    let merged = match budget {
+                        usize::MAX => store.merge(),
+                        _ => store.merge_step(budget),
+                    };
+                    if let Err(err) = merged {
+                        tracing::error!("merging the index changes kept in memory failed: {err}");
+                    }
+                    *last_merge = Instant::now();
                 };
                 let forget = || {
                     let _forget = phase(Phase::Forget);
@@ -2370,6 +3395,14 @@ impl Writer {
                     if let Some(due) = purger.due(&store) {
                         wait = wait.min(due.saturating_duration_since(Instant::now()));
                     }
+                    if !store.headers_filled() {
+                        wait = Duration::ZERO;
+                    }
+                    if store.merging() {
+                        wait = Duration::ZERO;
+                    } else if store.unmerged() > 0 {
+                        wait = wait.min(MERGE_IDLE.saturating_sub(last_merge.elapsed()));
+                    }
                     let first = match rx.recv_timeout(wait) {
                         Ok(Request::Write(job, at)) => {
                             METRICS.write_queue.dec();
@@ -2388,6 +3421,18 @@ impl Writer {
                         }
                         Ok(Request::Stop) => break,
                         Err(RecvTimeoutError::Timeout) => {
+                            if store.merging()
+                                || store.unmerged() > 0 && last_merge.elapsed() >= MERGE_IDLE
+                            {
+                                merge(&mut last_merge, MERGE_SLICE);
+                            }
+                            if !store.headers_filled() {
+                                let _headers = phase(Phase::Headers);
+                                if let Err(err) = store.fill_headers(HEADERS_CHUNK) {
+                                    tracing::error!("filing old events' headers failed: {err}");
+                                    store.stop_filling_headers();
+                                }
+                            }
                             phase(Phase::Purge).run(|| purger.step(&store, &tell));
                             if trust {
                                 turn(&mut trust);
@@ -2422,9 +3467,13 @@ impl Writer {
                     let taken = Instant::now();
                     let behind = METRICS.writer.take_longest();
                     let records: Vec<Arc<Vec<u8>>> =
-                        batch.iter().map(|(record, _)| record.clone()).collect();
-                    phase(Phase::Batch).run(|| write(&store, batch, &tell));
+                        batch.iter().map(|(record, _, _)| record.clone()).collect();
+                    phase(Phase::Batch).run(|| write(&store, batch, &tell, &stored, false));
                     note_batch(&records, &queued, taken, behind, &mut slow);
+                    let (merge_at, slice) = store.merging_at();
+                    if store.merge_due(merge_at) {
+                        merge(&mut last_merge, slice);
+                    }
                     let queueing = phase(Phase::Queue);
                     for job in deletes {
                         let (target, reply) = *job;
@@ -2448,6 +3497,7 @@ impl Writer {
                     phase(Phase::Purge).run(|| purger.step(&store, &tell));
                 }
                 forget();
+                merge(&mut last_merge, usize::MAX);
                 if let Some(saving) = saving {
                     let _ = saving.join();
                 }
@@ -2465,6 +3515,7 @@ impl Writer {
         Self {
             tx,
             store: prefetching,
+            prefetching: Arc::new(Prefetching::new()),
             thread: Arc::new(Mutex::new(Some(thread))),
         }
     }
@@ -2509,23 +3560,61 @@ impl Writer {
             .map_err(|_| anyhow!("writer thread dropped the request"))?
     }
 
-    /// Store an encoded record.
+    /// Store an encoded record, [prefetching](Self::prefetch) first.
     pub async fn write(&self, record: Arc<Vec<u8>>) -> anyhow::Result<Outcome> {
-        let start = Instant::now();
-        let (store, prefetched) = (self.store.clone(), record.clone());
-        let prefetch = tokio::task::spawn_blocking(move || {
-            let txn = store.read()?;
-            store.prefetch(&txn, &prefetched)
-        });
+        self.write_from(record, Instant::now()).await
+    }
+
+    /// Store an encoded record for a write begun at `start`,
+    /// [prefetching](Self::prefetch) first, if it's worth it, on the
+    /// blocking pool, where many events' pages are read at once.
+    pub async fn write_from(
+        &self,
+        record: Arc<Vec<u8>>,
+        start: Instant,
+    ) -> anyhow::Result<Outcome> {
+        if self.prefetching.wanted() {
+            let (writer, prefetched) = (self.clone(), record.clone());
+            let _ = tokio::task::spawn_blocking(move || writer.prefetch(&prefetched)).await;
+        }
+        note_prefetched(&record, start);
+        self.store(record, start).await
+    }
+
+    /// As [`write_from`](Self::write_from), from a thread that may block,
+    /// reading ahead there, with `answer` told the outcome.
+    pub fn write_now(&self, record: Arc<Vec<u8>>, start: Instant, answer: Answer) {
+        if self.prefetching.wanted() {
+            self.prefetch(&record);
+        }
+        note_prefetched(&record, start);
+        self.queue_to(
+            record,
+            Box::new(move |outcome| {
+                METRICS.writes.since(start);
+                METRICS.write_latency.observe(start.elapsed());
+                answer(outcome);
+            }),
+        );
+    }
+
+    /// Read what storing a record will, so the writer, which reads one
+    /// page after another, finds them in memory. Blocks on the disk if they
+    /// aren't.
+    fn prefetch(&self, record: &[u8]) {
+        let store = &self.store;
+        let faults = major_faults();
         // Only a hint: the writer reads whatever it must anyway.
-        if let Ok(Err(err)) = prefetch.await {
+        if let Err(err) = store.read().and_then(|txn| store.prefetch(&txn, record)) {
             tracing::debug!("prefetching failed: {err}");
         }
-        let prefetched = start.elapsed();
-        METRICS.write_prefetch.observe(prefetched);
-        if prefetched >= SLOW_WRITE {
-            note_slow_prefetch(&record, prefetched);
+        if major_faults() > faults {
+            self.prefetching.went_to_disk();
         }
+    }
+
+    /// Store a record, prefetched or not, for a write begun at `start`.
+    async fn store(&self, record: Arc<Vec<u8>>, start: Instant) -> anyhow::Result<Outcome> {
         let outcome = self
             .queue(record)?
             .await
@@ -2544,16 +3633,29 @@ impl Writer {
         record: Arc<Vec<u8>>,
     ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<Outcome>>> {
         let (reply, rx) = oneshot::channel();
+        self.queue_to(
+            record,
+            Box::new(move |outcome| {
+                let _ = reply.send(outcome);
+            }),
+        );
+        Ok(rx)
+    }
+
+    /// Queue a record to be stored, as [`queue`](Self::queue) does, with
+    /// `answer` told the outcome, there or here if the writer's gone.
+    pub fn queue_to(&self, record: Arc<Vec<u8>>, answer: Answer) {
+        let keys = self.store.keys_of_record(&record);
         METRICS.write_queue.inc();
-        if self
+        if let Err(err) = self
             .tx
-            .send(Request::Write((record, reply), Instant::now()))
-            .is_err()
+            .send(Request::Write((record, keys, answer), Instant::now()))
         {
             METRICS.write_queue.dec();
-            bail!("writer thread is gone");
+            if let Request::Write((_, _, answer), _) = err.0 {
+                answer(Err(anyhow!("writer thread is gone")));
+            }
         }
-        Ok(rx)
     }
 }
 
@@ -2598,6 +3700,43 @@ pub mod tests {
         assert_eq!(kind_of(b"nonsense"), "?");
     }
 
+    /// An event goes out live before it's committed, and a reader that
+    /// settles then reads it.
+    #[test]
+    fn settling_reads_what_went_live() {
+        let (_dir, store) = open();
+        let store = Arc::new(store);
+        let event = signed(1, 100, 1, vec![], "live");
+        let (answer, _) = oneshot::channel::<anyhow::Result<Outcome>>();
+        let job: WriteJob = (
+            Arc::new(record::encode(&event)),
+            None,
+            Box::new(move |outcome| {
+                let _ = answer.send(outcome);
+            }),
+        );
+        let (readers, read) = std::sync::mpsc::channel();
+        let live = |events: Vec<(u64, Arc<Vec<u8>>)>| {
+            let seq = events[0].0;
+            assert!(store.load(&store.read().unwrap(), seq).unwrap().is_none());
+            let store = store.clone();
+            readers
+                .send(std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(store.settle());
+                    store.load(&store.read().unwrap(), seq).unwrap().is_some()
+                }))
+                .unwrap();
+            // The commit waits on this: a reader that didn't settle would
+            // read first.
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        write(&store, vec![job], &|_| {}, &live, false);
+        assert!(read.recv().unwrap().join().unwrap());
+    }
+
     /// An event that can't be stored is refused alone, not with the rest
     /// of its batch.
     #[test]
@@ -2613,10 +3752,15 @@ pub mod tests {
             .iter()
             .map(|event| {
                 let (reply, rx) = oneshot::channel();
-                ((Arc::new(record::encode(event)), reply), rx)
+                let answer: Answer = Box::new(move |outcome| {
+                    let _ = reply.send(outcome);
+                });
+                let record = Arc::new(record::encode(event));
+                let keys = store.keys_of_record(&record);
+                ((record, keys, answer), rx)
             })
             .unzip();
-        write(&store, jobs, &|_| {});
+        write(&store, jobs, &|_| {}, &|_| {}, false);
         let outcomes: Vec<_> = replies
             .into_iter()
             .map(|mut rx| rx.try_recv().unwrap().ok())
@@ -2687,6 +3831,8 @@ pub mod tests {
 
     /// Every entry of every table but `meta`, to compare stores.
     pub fn everything(store: &Store) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        // What's kept in memory too.
+        store.merge().unwrap();
         let t = store.tables;
         let txn = store.read().unwrap();
         [
@@ -2724,11 +3870,38 @@ pub mod tests {
             }
             entries
         })
+        .chain([header_rows(store)])
         .collect()
+    }
+
+    /// The header row of each stored event, by its sequence number, as a
+    /// table's entries. Rows past them are never read.
+    fn header_rows(store: &Store) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let txn = store.read().unwrap();
+        let mut cursor = txn.cursor(store.tables.events).unwrap();
+        let mut rows = Vec::new();
+        let mut entry = cursor.first().unwrap();
+        while let Some((key, _)) = entry {
+            let seq = u64::from_ne_bytes(key.try_into().unwrap());
+            if let Some(row) = store.headers().unwrap().get(seq) {
+                rows.push((key.to_vec(), row.to_vec()));
+            }
+            entry = cursor.next().unwrap();
+        }
+        rows
+    }
+
+    /// Clear every header row, as a store from before them has none.
+    fn clear_headers(store: &Store) {
+        let next = store.next_seq(&store.read().unwrap()).unwrap();
+        for seq in 1..next {
+            store.del_header(&seq.to_ne_bytes());
+        }
     }
 
     /// Every index entry of every table, to check removals leave nothing.
     fn entries(store: &Store) -> usize {
+        store.merge().unwrap();
         let t = store.tables;
         let txn = store.read().unwrap();
         [
@@ -2749,7 +3922,8 @@ pub mod tests {
         ]
         .iter()
         .map(|&db| txn.len(db).unwrap())
-        .sum()
+        .sum::<usize>()
+            + header_rows(store).len()
     }
 
     #[test]
@@ -2772,17 +3946,17 @@ pub mod tests {
         );
         assert_eq!(put(&store, &event), Outcome::Stored(1));
         assert_eq!(put(&store, &event), Outcome::Duplicate);
-        // events, ids, created, kinds, authors, author_kinds, three tags,
-        // and the names of those three as facets.
-        assert_eq!(entries(&store), 12);
+        // events, headers, ids, created, kinds, authors, author_kinds,
+        // three tags, and the names of those three as facets.
+        assert_eq!(entries(&store), 13);
 
         let mut txn = store.write().unwrap();
         assert!(store.remove(&mut txn, 1).unwrap());
         txn.commit().unwrap();
         // Its record reads as gone, though it's only unlinked, until it's
-        // forgotten in a transaction of its own.
+        // forgotten in a transaction of its own, with its header.
         assert!(store.stored(&store.read().unwrap(), 1).unwrap().is_none());
-        assert_eq!(entries(&store), 2);
+        assert_eq!(entries(&store), 3);
         assert_eq!(store.forget().unwrap(), 1);
         assert_eq!(entries(&store), 0);
 
@@ -2865,6 +4039,229 @@ pub mod tests {
         assert!(has(&store, &profiles[1]) && has(&store, &reaction));
     }
 
+    /// Briefs say what headers do, of events stored, removed, hidden by a
+    /// pending deletion, and expired.
+    #[test]
+    fn briefs_say_what_headers_do() {
+        let (_dir, store) = open();
+        let now = crate::event::now();
+        let notes: Vec<Event> = (0..8)
+            .map(|i| signed(1, 100 + i, 1, vec![], &i.to_string()))
+            .collect();
+        for note in &notes {
+            put(&store, note);
+        }
+        let expiring = signed(
+            1,
+            100,
+            1,
+            vec![vec!["expiration", &(now - 5).to_string()]],
+            "",
+        );
+        put_at(&store, &expiring, now - 20);
+        put(
+            &store,
+            &signed(1, 200, 5, vec![vec!["e", &notes[1].id]], ""),
+        );
+        // Hidden as it's stored, its target removed only later.
+        let pending = signed(1, 201, 5, vec![vec!["e", &notes[4].id]], "");
+        store
+            .write_batch([record::encode(&pending).as_slice()], now)
+            .unwrap();
+        let txn = store.read().unwrap();
+        let mut briefs = store.briefs(&txn).unwrap();
+        let mut seen = 0;
+        for seq in 0..20 {
+            let header = store.header(&txn, seq).unwrap().map(Brief::from);
+            seen += usize::from(header.is_some());
+            assert_eq!(briefs.get(seq).unwrap(), header, "{seq}");
+        }
+        assert_eq!(seen, 8);
+    }
+
+    /// Index changes not merged when the store closes are filed again when
+    /// it opens, and read as they did; merged, they leave LMDB as merging
+    /// them before closing would.
+    #[test]
+    fn keeps_unmerged_index_changes_across_a_restart() {
+        // Signed once: signatures differ each time, and so would records.
+        let notes: Vec<Event> = (0..30)
+            .map(|i| signed(i % 4 + 1, 100 + u64::from(i), 1, vec![vec!["t", "x"]], ""))
+            .collect();
+        let others = [
+            signed(1, 200, 5, vec![vec!["e", &notes[0].id]], ""),
+            signed(2, 100, 0, vec![], "old"),
+            signed(2, 300, 0, vec![], "new"),
+        ];
+        // With `cut`, a merge is begun partway, and left unfinished.
+        let events = |store: &Store, cut: bool| {
+            for (i, event) in notes.iter().chain(&others).enumerate() {
+                put(store, event);
+                if cut && i == 20 {
+                    // Past `ids`, into `created`, whose count is seen.
+                    assert!(store.merge_step(30).unwrap() > 0);
+                    assert!(store.merging());
+                }
+            }
+        };
+        let seen = |store: &Store| {
+            let txn = store.read().unwrap();
+            let t = store.tables;
+            let key = store
+                .tag_keys(
+                    &EventView::new(&record::encode(&signed(
+                        1,
+                        100,
+                        1,
+                        vec![vec!["t", "x"]],
+                        "",
+                    )))
+                    .unwrap(),
+                )
+                .remove(0);
+            let mut tagged = Vec::new();
+            each_stamp(&txn, t.tags, &key, 0, u32::MAX, |stamp| {
+                tagged.push(stamp_seq(stamp));
+                true
+            })
+            .unwrap();
+            (
+                count_key(&txn, t.created, CREATED).unwrap(),
+                count_key(&txn, t.kinds, &0u16.to_be_bytes()).unwrap(),
+                tagged,
+            )
+        };
+        let (merged_dir, merged) = open();
+        events(&merged, false);
+        let expected = seen(&merged);
+        assert_eq!(expected.0, 31);
+        let raw = everything(&merged);
+        drop(merged);
+        drop(merged_dir);
+
+        for cut in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_in(dir.path());
+            events(&store, cut);
+            assert!(store.unmerged() > 0);
+            assert_eq!(seen(&store), expected);
+            drop(store);
+            let store = open_in(dir.path());
+            assert!(store.unmerged() > 0);
+            assert_eq!(store.merging(), cut);
+            assert_eq!(seen(&store), expected);
+            assert!(!has(&store, &notes[0]) && has(&store, &notes[1]));
+            assert_eq!(everything(&store), raw);
+            assert_eq!(store.unmerged(), 0);
+        }
+    }
+
+    /// A tag key's authors sketch the same from headers as from records.
+    #[test]
+    fn sketches_alike_from_headers() {
+        let (_dir, store) = open();
+        let now = crate::event::now();
+        for i in 0..40u8 {
+            put(
+                &store,
+                &signed(i % 7 + 1, 100, 1, vec![vec!["t", "x"]], &i.to_string()),
+            );
+        }
+        let expiration = (now - 5).to_string();
+        let expiring = vec![vec!["t", "x"], vec!["expiration", &expiration]];
+        put_at(&store, &signed(9, 100, 1, expiring, ""), now - 20);
+        let tagged = record::encode(&signed(1, 100, 1, vec![vec!["t", "x"]], ""));
+        let key = store.tag_keys(&EventView::new(&tagged).unwrap()).remove(0);
+        let sketch = |store: &Store| {
+            store
+                .sketch_from_events(&store.read().unwrap(), &key)
+                .unwrap()
+        };
+        let from_headers = sketch(&store);
+        assert_ne!(from_headers, [0; hll::REGISTERS]);
+        clear_headers(&store);
+        assert_eq!(sketch(&store), from_headers);
+    }
+
+    /// A store from before there were headers has them filed for its
+    /// events a chunk at a time, while new ones get theirs as they're
+    /// stored, and its briefs say the same all along.
+    #[test]
+    fn files_the_headers_of_events_stored_before_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_in(dir.path());
+        let notes: Vec<Event> = (0..10)
+            .map(|i| signed(1, 100 + i, 1, vec![], &i.to_string()))
+            .collect();
+        for note in &notes {
+            put(&store, note);
+        }
+        let filled = everything(&store);
+        drop(store);
+        std::fs::remove_file(dir.path().join(HEADERS_FILE)).unwrap();
+
+        let store = open_in(dir.path());
+        assert!(!store.headers_filled());
+        let later = signed(2, 300, 1, vec![], "later");
+        put(&store, &later);
+        let briefs = |store: &Store| {
+            let txn = store.read().unwrap();
+            let mut briefs = store.briefs(&txn).unwrap();
+            (1..=11)
+                .map(|seq| briefs.get(seq).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = briefs(&store);
+        assert!(before.iter().all(Option::is_some));
+        while store.fill_headers(3).unwrap() {
+            assert_eq!(briefs(&store), before);
+        }
+        assert!(store.headers_filled() && !store.fill_headers(3).unwrap());
+        assert_eq!(briefs(&store), before);
+        let txn = store.read().unwrap();
+        assert!(txn.get(store.tables.meta, HEADERS_BELOW).unwrap().is_none());
+        drop(txn);
+        assert_eq!(header_rows(&store).len(), 11);
+        // As if they'd always had them.
+        let headers = |all: &[Vec<(Vec<u8>, Vec<u8>)>]| all.last().unwrap()[..10].to_vec();
+        assert_eq!(headers(&everything(&store)), headers(&filled));
+        drop(store);
+        assert!(open_in(dir.path()).headers_filled());
+    }
+
+    /// A loader loads what loading one at a time does, whichever way it
+    /// steps from seq to seq, through gaps and past the ends.
+    #[test]
+    fn loads_as_loading_one_at_a_time_does() {
+        let (_dir, store) = open();
+        let notes: Vec<Event> = (0..20)
+            .map(|i| signed(1, 100 + i, 1, vec![], &i.to_string()))
+            .collect();
+        for note in &notes {
+            put(&store, note);
+        }
+        for i in [3, 4, 11, 19] {
+            put(
+                &store,
+                &signed(1, 200, 5, vec![vec!["e", &notes[i].id]], ""),
+            );
+        }
+        let txn = store.read().unwrap();
+        let mut loader = store.loader(&txn).unwrap();
+        let order = [
+            10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 12, 13, 11, 12, 30, 29, 28, 21, 20,
+            19, 18, 17, 16, 2, 15, 14, 13, 40, 0, 1,
+        ];
+        for seq in order {
+            let one = store.load(&txn, seq).unwrap().map(|view| *view.id());
+            assert_eq!(
+                loader.load(seq).unwrap().map(|view| *view.id()),
+                one,
+                "{seq}"
+            );
+        }
+    }
+
     /// A reaction filed under every `p` tag, as once they were, is taken
     /// out of all but its last's; anything else is left as it is.
     #[test]
@@ -2908,17 +4305,11 @@ pub mod tests {
             0
         );
         assert_eq!(store.drop_stale_tag_keys(&mut txn, note_seq).unwrap(), 0);
-        assert!(txn.cursor(t.tags).unwrap().set(&key(7)).unwrap().is_none());
+        assert_eq!(count_key(&txn, t.tags, &key(7)).unwrap(), 0);
         assert!(txn.get(t.hll, &key(7)).unwrap().is_none());
-        assert!(txn.cursor(t.tags).unwrap().set(&key(1)).unwrap().is_some());
+        assert!(count_key(&txn, t.tags, &key(1)).unwrap() > 0);
         let target_key = tag_key("p", &tag_value(&target), Some(7));
-        assert!(
-            txn.cursor(t.tags)
-                .unwrap()
-                .set(&target_key)
-                .unwrap()
-                .is_some()
-        );
+        assert!(count_key(&txn, t.tags, &target_key).unwrap() > 0);
     }
 
     #[test]
@@ -3056,6 +4447,7 @@ pub mod tests {
         assert_eq!(current(&store, &v3), Some(2));
 
         let t = store.tables;
+        store.merge().unwrap();
         let txn = store.read().unwrap();
         // Only the current version is indexed, but every one has history.
         assert_eq!(txn.len(t.created).unwrap(), 1);
@@ -3122,6 +4514,7 @@ pub mod tests {
         assert_eq!(store.len(&store.read().unwrap()).unwrap(), 5);
         assert_eq!(current(&store, &versions[24]), Some(25));
         // The current version is still the one indexed.
+        store.merge().unwrap();
         assert_eq!(store.read().unwrap().len(store.tables.tags).unwrap(), 1);
         drop(store);
 
@@ -3310,13 +4703,7 @@ pub mod tests {
         assert_eq!(current(&store, &old), Some(4));
         let txn = store.read().unwrap();
         let key = tag_key("t", &tag_value("old"), Some(0));
-        assert!(
-            txn.cursor(store.tables.tags)
-                .unwrap()
-                .set(&key)
-                .unwrap()
-                .is_some()
-        );
+        assert!(count_key(&txn, store.tables.tags, &key).unwrap() > 0);
         drop(txn);
 
         // With nothing left, the address is empty.

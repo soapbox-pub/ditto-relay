@@ -725,7 +725,11 @@ fn walk<'t>(
     mut visit: impl FnMut(Item<'t>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut cursor = txn.cursor(table.db)?;
-    let mut entry = cursor.set_range(&range.start)?;
+    // An integer key can't be empty: from the first.
+    let mut entry = match range.start.is_empty() {
+        true => cursor.first()?,
+        false => cursor.set_range(&range.start)?,
+    };
     while let Some((key, value)) = entry {
         if let Some(end) = &range.end
             && txn.cmp(table.db, key, end).is_ge()
@@ -774,7 +778,14 @@ fn walk<'t>(
 }
 
 /// The ranges of table `n` that [`split`]'s `bounds` begin.
-fn ranges_of(n: usize, bounds: Vec<Vec<u8>>) -> Vec<Range> {
+fn ranges_of(n: usize, mut bounds: Vec<Vec<u8>>) -> Vec<Range> {
+    // From the table's start, not its first key when it was split: a
+    // transaction begun before may see keys before it, or the table not
+    // yet empty.
+    match bounds.first_mut() {
+        Some(first) => first.clear(),
+        None => bounds.push(Vec::new()),
+    }
     let ends = bounds.iter().skip(1).map(|end| Some(end.clone()));
     // The last bound is the table's last key, in the last range.
     let ends: Vec<_> = ends
@@ -1125,6 +1136,45 @@ mod tests {
             }
         }
         txn.commit().unwrap();
+    }
+
+    /// A live copy is of the store as `reading` sees it, though keys at a
+    /// table's start, or all of one's, go after it began.
+    #[test]
+    fn copies_live_as_of_the_transaction_read() {
+        let from = tempfile::tempdir().unwrap();
+        fill(from.path());
+        let env = Env::open(from.path(), 1 << 28, 8, 16).unwrap();
+        // Every table, as the copy's of those opened.
+        env.create_db("dups", DbFlags::DUP_FIXED).unwrap();
+        env.create_db("empty", DbFlags::DUP_FIXED).unwrap();
+        let ints = env.create_db("ints", DbFlags::INTEGER_KEY).unwrap();
+        let one = env.create_db("one", DbFlags::PLAIN).unwrap();
+        env.create_db("plain", DbFlags::PLAIN).unwrap();
+        let want = contents(from.path());
+        let reading = env.read_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
+        txn.del(one, b"only", None).unwrap();
+        let mut cursor = txn.cursor(ints).unwrap();
+        let firsts: Vec<Vec<u8>> = (0..3)
+            .map(|i| match i {
+                0 => cursor.first(),
+                _ => cursor.next(),
+            })
+            .map(|entry| entry.unwrap().unwrap().0.to_vec())
+            .collect();
+        drop(cursor);
+        for key in firsts {
+            txn.del(ints, &key, None).unwrap();
+        }
+        txn.commit().unwrap();
+        for threads in [1, 8] {
+            let into = tempfile::tempdir().unwrap();
+            let dest = env.create_like(0, into.path()).unwrap();
+            copy_live(&env, 0, &reading, &dest, threads, &mut |_| {}).unwrap();
+            drop(dest);
+            assert_eq!(contents(into.path()), want);
+        }
     }
 
     #[test]

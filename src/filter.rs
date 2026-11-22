@@ -3,7 +3,6 @@
 
 use serde_json::Value;
 
-use crate::event::is_hex64;
 use crate::facets::Condition;
 use crate::record::{EventView, tag_value};
 use crate::search;
@@ -409,12 +408,10 @@ fn list<'a>(name: &str, value: &'a Value, max: usize) -> Result<&'a Vec<Value>, 
 fn hex_list(name: &str, value: &Value, max: usize) -> Result<Vec<[u8; 32]>, String> {
     let mut out = Vec::new();
     for value in list(name, value, max)? {
-        let hex = value
+        let bytes = value
             .as_str()
-            .filter(|hex| is_hex64(hex))
+            .and_then(crate::event::decode_hex::<32>)
             .ok_or_else(|| format!("invalid: {name} must be 64-character lowercase hex"))?;
-        let mut bytes = [0; 32];
-        hex::decode_to_slice(hex, &mut bytes).expect("checked hex");
         out.push(bytes);
     }
     out.sort_unstable();
@@ -672,6 +669,8 @@ mod tests {
         for filter in [
             json!([]),
             json!({"ids": ["abc"]}),
+            json!({"ids": ["AB".repeat(32)]}),
+            json!({"authors": ["ag".repeat(32)]}),
             json!({"kinds": ["1"]}),
             json!({"limit": -1}),
             json!({"#t": [1]}),

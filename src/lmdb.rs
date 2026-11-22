@@ -26,6 +26,7 @@
 //!
 //! All the `unsafe` in the crate lives here.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::marker::PhantomData;
@@ -34,9 +35,11 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+
+use crate::memtable::Snap;
 use lmdb_master_sys as ffi;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -874,6 +877,26 @@ impl Env {
         })
     }
 
+    /// Unmap the pages of environment `env`'s file that are mapped in.
+    /// They stay in the page cache, and are faulted in from there again if
+    /// read. A write copies the pages it changes from the map, so writing
+    /// alone leaves every page it touched mapped, counting in the relay's
+    /// memory, though it may never read them again. Only a hint, so
+    /// failing is no error.
+    pub fn release(&self, env: usize) {
+        let envs = self.envs.load();
+        let handle = &envs[env];
+        let (Some((base, len)), Ok(usage)) = (handle.map, self.usage(env)) else {
+            return;
+        };
+        let used = (usage.used as usize).min(len);
+        // SAFETY: within the env's map, which `envs` keeps open, and shared
+        // and of a file: what's read there after is read from the file.
+        unsafe {
+            libc::madvise(base as *mut libc::c_void, used, libc::MADV_DONTNEED);
+        }
+    }
+
     /// Have the kernel start reading the `len` bytes of environment
     /// `env`'s file from where `at`, read from its map, is, so that reading
     /// on from there in order doesn't wait on the disk a page at a time:
@@ -959,19 +982,77 @@ impl Env {
         Ok(RwTxn { txn, journal })
     }
 
+    /// A write transaction in environment `env` alone.
+    pub fn write_txn_in(&self, env: usize) -> Result<RwTxn<'_>> {
+        let txn = self.begin(0, Some(env))?;
+        let journal = self
+            .journal
+            .load_full()
+            .filter(|journal| journal.env == env)
+            .map(|journal| Recording {
+                journal,
+                ops: Vec::new(),
+            });
+        Ok(RwTxn { txn, journal })
+    }
+
+    /// A write transaction whose writes to `deferrer`'s environment are
+    /// made by its thread, in a transaction of its own there, while this
+    /// one goes on: there, this one only reads, what's committed and what
+    /// it wrote. Committing it commits that first.
+    pub fn write_txn_deferring<'env>(&'env self, deferrer: &'env Deferrer) -> Result<RwTxn<'env>> {
+        let mut txn = self.begin_reading(0, Some(deferrer.env))?;
+        txn.deferred = Some(Deferred {
+            env: deferrer.env,
+            deferrer,
+            written: HashMap::new(),
+            done: false,
+        });
+        let journal = self
+            .journal
+            .load_full()
+            .filter(|journal| journal.env != deferrer.env)
+            .map(|journal| Recording {
+                journal,
+                ops: Vec::new(),
+            });
+        Ok(RwTxn { txn, journal })
+    }
+
     /// A transaction in each environment, or with `only`, in that one, in
     /// the order they were opened.
     fn begin(&self, flags: u32, only: Option<usize>) -> Result<Txn<'_>> {
+        self.begin_with(flags, only, None)
+    }
+
+    /// A write transaction in each environment but `reading`, where it's a
+    /// read transaction.
+    fn begin_reading(&self, flags: u32, reading: Option<usize>) -> Result<Txn<'_>> {
+        self.begin_with(flags, None, reading)
+    }
+
+    fn begin_with(
+        &self,
+        flags: u32,
+        only: Option<usize>,
+        reading: Option<usize>,
+    ) -> Result<Txn<'_>> {
         loop {
             let mut txn = Txn {
                 ptrs: [ptr::null_mut(); MAX_ENVS],
                 envs: self.envs.load_full(),
+                overlay: None,
+                deferred: None,
                 _env: PhantomData,
             };
             for (n, slot) in txn.ptrs.iter_mut().enumerate().take(txn.envs.len()) {
                 if only.is_some_and(|only| only != n) {
                     continue;
                 }
+                let flags = match reading == Some(n) {
+                    true => ffi::MDB_RDONLY,
+                    false => flags,
+                };
                 // SAFETY: the env is open; the transaction is freed by Txn's
                 // drop or commit, those already begun too if this fails.
                 check(unsafe {
@@ -1045,10 +1126,34 @@ pub struct Txn<'env> {
     ptrs: [*mut ffi::MDB_txn; MAX_ENVS],
     /// The environments it's in, held open until it ends.
     envs: Envs,
+    /// What of the indexes is kept in memory, as of the commit read.
+    overlay: Option<Snap>,
+    /// The environment whose writes are deferred, if any.
+    deferred: Option<Deferred<'env>>,
     _env: PhantomData<&'env Env>,
 }
 
 impl Txn<'_> {
+    /// What's been written to `db`, if its writes are deferred.
+    fn written(&self, db: Db) -> Option<&Written> {
+        let deferred = self
+            .deferred
+            .as_ref()
+            .filter(|deferred| deferred.env == db.env)?;
+        Some(deferred.written.get(&db.dbi).unwrap_or(&NOTHING_WRITTEN))
+    }
+
+    /// That `db`'s writes aren't deferred, so that what's read of it
+    /// whole, not by key, is what's been written.
+    fn not_deferred(&self, db: Db) {
+        assert!(
+            self.deferred
+                .as_ref()
+                .is_none_or(|deferred| deferred.env != db.env),
+            "a table whose writes are deferred, read but by key"
+        );
+    }
+
     /// The transaction in `db`'s environment.
     fn of(&self, db: Db) -> *mut ffi::MDB_txn {
         let ptr = self.ptrs[db.env];
@@ -1059,7 +1164,29 @@ impl Txn<'_> {
         ptr
     }
 
+    /// What of the indexes is kept in memory, as of the commit read: see
+    /// [`crate::memtable`].
+    pub fn overlay(&self) -> Option<&Snap> {
+        self.overlay.as_ref()
+    }
+
+    pub fn set_overlay(&mut self, snap: Snap) {
+        self.overlay = Some(snap);
+    }
+
+    /// The id of the first environment's transaction: of the commit read,
+    /// or, writing, of the commit it will be.
+    pub fn id(&self) -> u64 {
+        // SAFETY: a live transaction.
+        unsafe { ffi::mdb_txn_id(self.ptrs[0]) as u64 }
+    }
+
     pub fn get(&self, db: Db, key: &[u8]) -> Result<Option<&[u8]>> {
+        if let Some(written) = self.written(db)
+            && let Some(value) = written.get(key)
+        {
+            return Ok(value.as_deref());
+        }
         let (mut k, mut v) = (val(key), empty());
         // SAFETY: a live transaction; the value is valid while `self` is borrowed.
         Ok(
@@ -1069,6 +1196,7 @@ impl Txn<'_> {
     }
 
     pub fn cursor(&self, db: Db) -> Result<Cursor<'_>> {
+        self.not_deferred(db);
         let mut ptr = ptr::null_mut();
         // SAFETY: a live transaction; the cursor is closed on drop, before the txn ends.
         check(unsafe { ffi::mdb_cursor_open(self.of(db), db.dbi, &mut ptr) })?;
@@ -1087,6 +1215,7 @@ impl Txn<'_> {
 
     /// How many entries `db` holds, counting each duplicate.
     pub fn len(&self, db: Db) -> Result<usize> {
+        self.not_deferred(db);
         // SAFETY: MDB_stat is plain data, filled in by LMDB.
         let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
         check(unsafe { ffi::mdb_stat(self.of(db), db.dbi, &mut stat) })?;
@@ -1119,6 +1248,12 @@ impl<'env> std::ops::Deref for RoTxn<'env> {
     }
 }
 
+impl std::ops::DerefMut for RoTxn<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 pub struct RwTxn<'env> {
     txn: Txn<'env>,
     /// The changes to keep in the journal, if one's kept.
@@ -1144,6 +1279,18 @@ impl<'env> RwTxn<'env> {
         RwTxn { txn, journal: None }
     }
 
+    pub fn set_overlay(&mut self, snap: Snap) {
+        self.txn.set_overlay(snap);
+    }
+
+    /// The writes deferred, if `db`'s are.
+    fn deferring(&mut self, db: Db) -> Option<&mut Deferred<'env>> {
+        self.txn
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.env == db.env)
+    }
+
     /// Where to note a change to `db`, if the journal's kept of its
     /// environment.
     fn recording(&mut self, db: Db) -> Option<&mut Vec<u8>> {
@@ -1166,6 +1313,49 @@ impl<'env> RwTxn<'env> {
         self.put_flags(db, key, value, ffi::MDB_NODUPDATA)
     }
 
+    /// In a `DUP_FIXED` table, store `values`, packed, each `size` bytes,
+    /// under `key`, in one go: LMDB finds the key once, not once a value.
+    /// Those it has already are left as they are.
+    pub fn put_dups(&mut self, db: Db, key: &[u8], values: &[u8], size: usize) -> Result<()> {
+        self.txn.not_deferred(db);
+        if size == 0 || values.is_empty() || !values.len().is_multiple_of(size) {
+            return Err(Error(libc::EINVAL));
+        }
+        let count = values.len() / size;
+        let mut cursor = ptr::null_mut();
+        // SAFETY: a live write transaction; the cursor is closed below.
+        check(unsafe { ffi::mdb_cursor_open(self.txn.of(db), db.dbi, &mut cursor) })?;
+        let mut k = val(key);
+        // MDB_MULTIPLE: the first the size and where, the second how many.
+        let mut data = [
+            ffi::MDB_val {
+                mv_size: size,
+                mv_data: values.as_ptr() as *mut _,
+            },
+            ffi::MDB_val {
+                mv_size: count,
+                mv_data: ptr::null_mut(),
+            },
+        ];
+        // SAFETY: a live cursor of a live write transaction; LMDB reads
+        // `count` values of `size` bytes from `values`, and writes into
+        // `data[1]` how many it stored.
+        let code =
+            unsafe { ffi::mdb_cursor_put(cursor, &mut k, data.as_mut_ptr(), ffi::MDB_MULTIPLE) };
+        // SAFETY: opened above, and not used after.
+        unsafe { ffi::mdb_cursor_close(cursor) };
+        check(code)?;
+        if data[1].mv_size != count {
+            return Err(Error(ffi::MDB_PROBLEM));
+        }
+        if let Some(ops) = self.recording(db) {
+            for value in values.chunks_exact(size) {
+                record_put(ops, db.dbi, key, value);
+            }
+        }
+        Ok(())
+    }
+
     /// Store `value` under `key`, which must sort after every key in the
     /// table. LMDB then fills pages rather than splitting them in half.
     /// Returns `false`, writing nothing, if it doesn't.
@@ -1174,6 +1364,10 @@ impl<'env> RwTxn<'env> {
     }
 
     fn put_flags(&mut self, db: Db, key: &[u8], value: &[u8], flags: u32) -> Result<bool> {
+        if let Some(deferred) = self.deferring(db) {
+            deferred.put(db, key, value, flags);
+            return Ok(true);
+        }
         let (mut k, mut v) = (val(key), val(value));
         // SAFETY: a live write transaction, and `&mut self` keeps no reads alive.
         match unsafe { ffi::mdb_put(self.txn.of(db), db.dbi, &mut k, &mut v, flags) } {
@@ -1190,6 +1384,7 @@ impl<'env> RwTxn<'env> {
 
     /// A cursor that walks `db` deleting as it goes, for sweeping a table.
     pub fn sweeper(&mut self, db: Db) -> Result<Sweeper<'_>> {
+        self.txn.not_deferred(db);
         let mut ptr = ptr::null_mut();
         // SAFETY: a live write transaction, borrowed mutably while the
         // cursor lives; it's closed on drop.
@@ -1203,6 +1398,7 @@ impl<'env> RwTxn<'env> {
 
     /// A cursor that appends to `db`, for writing a table in order.
     pub fn appender(&mut self, db: Db) -> Result<Appender<'_>> {
+        self.txn.not_deferred(db);
         let mut ptr = ptr::null_mut();
         // SAFETY: a live write transaction, borrowed mutably while the
         // cursor lives; it's closed on drop.
@@ -1217,6 +1413,17 @@ impl<'env> RwTxn<'env> {
     /// Remove a key and all its values, or with `value`, just that one value
     /// of a duplicate-sorted key. Returns whether anything was there.
     pub fn del(&mut self, db: Db, key: &[u8], value: Option<&[u8]>) -> Result<bool> {
+        if self.txn.written(db).is_some() {
+            assert!(
+                value.is_none(),
+                "a value deleted from a table whose writes are deferred"
+            );
+            let there = self.txn.get(db, key)?.is_some();
+            if there {
+                self.deferring(db).expect("deferred").del(db, key);
+            }
+            return Ok(there);
+        }
         let mut k = val(key);
         let mut v = value.map(val);
         let v_ptr = v.as_mut().map_or(ptr::null_mut(), |v| v as *mut _);
@@ -1231,6 +1438,7 @@ impl<'env> RwTxn<'env> {
 
     /// Remove every entry of a table, keeping the table.
     pub fn clear(&mut self, db: Db) -> Result<()> {
+        self.txn.not_deferred(db);
         // SAFETY: a live write transaction; 0 empties the table without
         // closing its handle.
         check(unsafe { ffi::mdb_drop(self.txn.of(db), db.dbi, 0) })?;
@@ -1252,6 +1460,15 @@ impl<'env> RwTxn<'env> {
     }
 
     fn commit_each(&mut self) -> Result<()> {
+        // What's deferred first: the environments opened later are of what
+        // those opened earlier point to.
+        if let Some(deferred) = &mut self.txn.deferred {
+            let reading = std::mem::replace(&mut self.txn.ptrs[deferred.env], ptr::null_mut());
+            // SAFETY: a read transaction, not used after.
+            unsafe { ffi::mdb_txn_abort(reading) };
+            deferred.done = true;
+            deferred.deferrer.commit()?;
+        }
         for (n, slot) in self.txn.ptrs.iter_mut().enumerate().rev() {
             if slot.is_null() {
                 continue;
@@ -1273,6 +1490,233 @@ impl<'env> RwTxn<'env> {
             }
         }
         Ok(())
+    }
+}
+
+/// What's been written to a table whose writes are deferred, by key: none
+/// if it's deleted.
+type Written = HashMap<Box<[u8]>, Option<Arc<[u8]>>>;
+
+static NOTHING_WRITTEN: std::sync::LazyLock<Written> = std::sync::LazyLock::new(HashMap::new);
+
+/// A thread making the writes of write transactions to one environment, in
+/// a transaction of its own there, while they go on with the others: see
+/// [`Env::write_txn_deferring`].
+pub struct Deferrer {
+    env: usize,
+    ops: Option<mpsc::Sender<Op>>,
+    committed: Mutex<mpsc::Receiver<Result<()>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How much a [`Deferrer`] puts before committing on its own, when it has
+/// nothing else to do.
+const COMMIT_AHEAD: usize = 64 << 10;
+
+/// A write to make, or what to do with those made.
+enum Op {
+    Put {
+        db: Db,
+        key: Box<[u8]>,
+        value: Arc<[u8]>,
+        flags: u32,
+    },
+    Del {
+        db: Db,
+        key: Box<[u8]>,
+    },
+    Commit,
+    Abort,
+}
+
+impl Deferrer {
+    /// A thread making the deferred writes to environment `env` of `envs`.
+    pub fn spawn(envs: Arc<Env>, env: usize) -> std::io::Result<Deferrer> {
+        let (ops, received) = mpsc::channel();
+        let (done, committed) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("lmdb-deferred".into())
+            .spawn(move || {
+                let mut txn: Option<RwTxn> = None;
+                // The first write that failed, failing the commit.
+                let mut failed = None;
+                // The deletions, made only as the writes are committed.
+                let mut dels = Vec::new();
+                // How much has been put since the last commit.
+                let mut unsaved = 0;
+                let mut next = None;
+                loop {
+                    let op = match next.take() {
+                        Some(op) => op,
+                        None => match received.recv() {
+                            Ok(op) => op,
+                            Err(_) => return,
+                        },
+                    };
+                    match op {
+                        Op::Commit => {
+                            let result = match (failed.take(), txn.take()) {
+                                (Some(err), _) => Err(err),
+                                (None, txn) => (|| {
+                                    let mut txn = match txn {
+                                        Some(txn) => txn,
+                                        None if dels.is_empty() => return Ok(()),
+                                        None => envs.write_txn_in(env)?,
+                                    };
+                                    for op in dels.drain(..) {
+                                        apply_deferred(&mut txn, op)?;
+                                    }
+                                    txn.commit()
+                                })(),
+                            };
+                            dels.clear();
+                            unsaved = 0;
+                            if done.send(result).is_err() {
+                                return;
+                            }
+                        }
+                        Op::Abort => {
+                            txn = None;
+                            failed = None;
+                            dels.clear();
+                            unsaved = 0;
+                        }
+                        _ if failed.is_some() => {}
+                        op @ Op::Del { .. } => dels.push(op),
+                        op => {
+                            if let Op::Put { value, .. } = &op {
+                                unsaved += value.len();
+                            }
+                            let begun = match &mut txn {
+                                Some(txn) => txn,
+                                None => match envs.write_txn_in(env) {
+                                    Ok(begun) => txn.insert(begun),
+                                    Err(err) => {
+                                        failed = Some(err);
+                                        continue;
+                                    }
+                                },
+                            };
+                            if let Err(err) = apply_deferred(begun, op) {
+                                failed = Some(err);
+                                continue;
+                            }
+                            // With enough put and nothing more to do, the
+                            // pages are written now, rather than all as the
+                            // writer waits on the commit. What's put before
+                            // its index is, is read by no one meanwhile, and
+                            // if it isn't, is put again or dropped on
+                            // opening; what's deleted waits for the commit.
+                            if unsaved >= COMMIT_AHEAD {
+                                match received.try_recv() {
+                                    Ok(op) => next = Some(op),
+                                    Err(mpsc::TryRecvError::Empty) => {
+                                        if let Some(Err(err)) = txn.take().map(RwTxn::commit) {
+                                            failed = Some(err);
+                                        }
+                                        unsaved = 0;
+                                    }
+                                    Err(mpsc::TryRecvError::Disconnected) => return,
+                                }
+                            }
+                        }
+                    }
+                }
+            })?;
+        Ok(Deferrer {
+            env,
+            ops: Some(ops),
+            committed: Mutex::new(committed),
+            thread: Some(thread),
+        })
+    }
+
+    fn send(&self, op: Op) {
+        // Gone only if the thread panicked, which the commit tells.
+        let _ = self.ops.as_ref().expect("open").send(op);
+    }
+
+    /// Commit the writes sent, waiting for it.
+    fn commit(&self) -> Result<()> {
+        let committed = self.committed.lock().expect("unpoisoned");
+        self.send(Op::Commit);
+        committed.recv().unwrap_or(Err(Error(ffi::MDB_PANIC)))
+    }
+}
+
+impl Drop for Deferrer {
+    fn drop(&mut self) {
+        drop(self.ops.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Make a deferred write.
+fn apply_deferred(txn: &mut RwTxn, op: Op) -> Result<()> {
+    match op {
+        Op::Put {
+            db,
+            key,
+            value,
+            flags,
+        } => {
+            if !txn.put_flags(db, &key, &value, flags)? && flags & ffi::MDB_APPEND != 0 {
+                txn.put(db, &key, &value)?;
+            }
+        }
+        Op::Del { db, key } => {
+            txn.del(db, &key, None)?;
+        }
+        Op::Commit | Op::Abort => unreachable!("not a write"),
+    }
+    Ok(())
+}
+
+/// A write transaction's writes to the environment a [`Deferrer`] makes
+/// them in, sent to it, and kept by key to be read back.
+struct Deferred<'env> {
+    env: usize,
+    deferrer: &'env Deferrer,
+    /// What's been written, by table.
+    written: HashMap<ffi::MDB_dbi, Written>,
+    /// Whether it's been committed.
+    done: bool,
+}
+
+impl Deferred<'_> {
+    fn put(&mut self, db: Db, key: &[u8], value: &[u8], flags: u32) {
+        let value: Arc<[u8]> = Arc::from(value);
+        self.written
+            .entry(db.dbi)
+            .or_default()
+            .insert(key.into(), Some(value.clone()));
+        self.deferrer.send(Op::Put {
+            db,
+            key: key.into(),
+            value,
+            flags,
+        });
+    }
+
+    fn del(&mut self, db: Db, key: &[u8]) {
+        self.written
+            .entry(db.dbi)
+            .or_default()
+            .insert(key.into(), None);
+        self.deferrer.send(Op::Del {
+            db,
+            key: key.into(),
+        });
+    }
+}
+
+impl Drop for Deferred<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.deferrer.send(Op::Abort);
+        }
     }
 }
 
@@ -1586,6 +2030,68 @@ mod tests {
 
     /// A transaction spans every environment: committed together, and
     /// dropped together.
+    /// A transaction deferring one environment's writes reads them back,
+    /// deletes them only as it commits, commits them before the rest, and
+    /// dropped, makes none of the deletions.
+    #[test]
+    fn defers_one_environments_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let mut env = Env::open(dir.path(), 1 << 24, 4, 16).unwrap();
+        env.attach(&other, 1 << 24, 4, 16).unwrap();
+        let main = env.create_db("main", DbFlags::PLAIN).unwrap();
+        let records = env
+            .create_db_in(1, "records", DbFlags::INTEGER_KEY)
+            .unwrap();
+        let env = Arc::new(env);
+        let deferrer = Deferrer::spawn(env.clone(), 1).unwrap();
+        let key = |n: u64| n.to_ne_bytes();
+
+        let mut txn = env.write_txn_in(1).unwrap();
+        txn.put(records, &key(1), b"kept").unwrap();
+        txn.put(records, &key(2), b"deleted").unwrap();
+        txn.commit().unwrap();
+
+        let mut txn = env.write_txn_deferring(&deferrer).unwrap();
+        txn.put(main, b"a", b"1").unwrap();
+        assert!(txn.append(records, &key(3), b"three").unwrap());
+        let big = vec![7; COMMIT_AHEAD * 2];
+        assert!(txn.append(records, &key(4), &big).unwrap());
+        assert_eq!(txn.get(records, &key(3)).unwrap(), Some(&b"three"[..]));
+        assert_eq!(txn.get(records, &key(1)).unwrap(), Some(&b"kept"[..]));
+        assert!(txn.del(records, &key(2), None).unwrap());
+        assert!(txn.del(records, &key(3), None).unwrap());
+        assert!(!txn.del(records, &key(9), None).unwrap());
+        assert_eq!(txn.get(records, &key(2)).unwrap(), None);
+        assert_eq!(txn.get(records, &key(3)).unwrap(), None);
+        txn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        assert_eq!(txn.get(main, b"a").unwrap(), Some(&b"1"[..]));
+        assert_eq!(txn.get(records, &key(1)).unwrap(), Some(&b"kept"[..]));
+        assert_eq!(txn.get(records, &key(2)).unwrap(), None);
+        assert_eq!(txn.get(records, &key(3)).unwrap(), None);
+        assert_eq!(txn.get(records, &key(4)).unwrap(), Some(&big[..]));
+        drop(txn);
+
+        // Dropped: what's put may stay, past what the rest points to, as a
+        // crash may leave it; what's deleted does.
+        let mut txn = env.write_txn_deferring(&deferrer).unwrap();
+        txn.put(main, b"b", b"2").unwrap();
+        txn.append(records, &key(5), &big).unwrap();
+        assert!(txn.del(records, &key(1), None).unwrap());
+        drop(txn);
+        let mut txn = env.write_txn().unwrap();
+        assert_eq!(txn.get(main, b"b").unwrap(), None);
+        assert_eq!(txn.get(records, &key(1)).unwrap(), Some(&b"kept"[..]));
+        // Put again over what was left.
+        txn.put(records, &key(5), b"five").unwrap();
+        txn.commit().unwrap();
+        let txn = env.read_txn().unwrap();
+        assert_eq!(txn.get(records, &key(5)).unwrap(), Some(&b"five"[..]));
+    }
+
     #[test]
     fn spans_environments() {
         let dir = tempfile::tempdir().unwrap();
@@ -1733,6 +2239,45 @@ mod tests {
         assert_eq!(cursor.last_dup().unwrap().unwrap().1, 30u16.to_be_bytes());
         assert!(cursor.set(b"x").unwrap().is_none());
         assert_eq!(txn.len(db).unwrap(), 4);
+    }
+
+    /// Values put in one go land in order among those a key has, new or
+    /// not, inline or in a tree of their own, with those it had left be.
+    #[test]
+    fn puts_many_values_at_once() {
+        let (_dir, env) = open();
+        let db = env.create_db("dups", DbFlags::DUP_FIXED).unwrap();
+        let packed = |ns: &[u32]| ns.iter().flat_map(|n| n.to_be_bytes()).collect::<Vec<u8>>();
+        let mut txn = env.write_txn().unwrap();
+        txn.put_dup(db, b"one", &50u32.to_be_bytes()).unwrap();
+        for n in 0..3000u32 {
+            txn.put_dup(db, b"many", &(n * 2).to_be_bytes()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let mut txn = env.write_txn().unwrap();
+        for key in [&b"one"[..], b"many", b"new"] {
+            txn.put_dups(db, key, &packed(&[9001, 31, 50, 7, 7001]), 4)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        let mut cursor = txn.cursor(db).unwrap();
+        let mut values = |key: &[u8]| {
+            let mut got = cursor.set(key).unwrap().unwrap().1.to_vec();
+            while let Some((_, v)) = cursor.next_dup().unwrap() {
+                got.extend_from_slice(v);
+            }
+            got
+        };
+        assert_eq!(values(b"one"), packed(&[7, 31, 50, 7001, 9001]));
+        assert_eq!(values(b"new"), packed(&[7, 31, 50, 7001, 9001]));
+        let mut many: Vec<u32> = (0..3000).map(|n| n * 2).collect();
+        many.extend([7, 31, 7001, 9001]);
+        many.sort();
+        assert_eq!(values(b"many"), packed(&many));
+        assert_eq!(txn.len(db).unwrap(), 5 + 5 + 3004);
     }
 
     /// Deleting as it walks, and seeking what's after, it sees every entry

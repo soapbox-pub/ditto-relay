@@ -8,11 +8,11 @@
 //! skipped: deleting those from the index keeps it small, but nothing
 //! depends on it. Old versions are never indexed.
 //!
-//! One thread, the [`Indexer`], writes the index. It reads what's been
-//! stored since it last looked straight from the LMDB, so catching up after
-//! a restart — or rebuilding from nothing — is the same as keeping up. The
-//! writer tells it when there's something new and what was removed, and it
-//! commits at most every so often, recording in the commit how far it got.
+//! One thread, the [`Indexer`], writes the index. The writer hands it the
+//! events it stores and tells it what it removed, and it commits at most
+//! every so often, recording in the commit how far it got. What it wasn't
+//! handed, as after a restart, or when rebuilding from nothing, it reads
+//! straight from the LMDB.
 //!
 //! Events stored since the last commit aren't searchable yet, so a search
 //! also checks the newest of them by hand. Everything a search's LMDB
@@ -53,7 +53,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Bound, RangeInclusive};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,7 +85,7 @@ use crate::lmdb::Txn;
 use crate::query::{MAX_EXAMINED, TooExpensive};
 use crate::rank::WALK_BUDGET;
 use crate::record::{Content, Element, EventView};
-use crate::store::{IndexedTags, Store};
+use crate::store::{IndexedTags, Store, Written};
 
 /// The name the analyzer is registered under.
 const ANALYZER: &str = "nostr";
@@ -138,8 +138,14 @@ const MAX_NAMES: usize = 512;
 /// terms are looked up by their first this many characters, then checked.
 const MAX_PREFIX: usize = 20;
 
-/// The indexer's memory, split between its threads.
-const WRITER_MEMORY: usize = 64 << 20;
+/// The indexer's memory catching up with many events, split between its
+/// threads.
+const CATCH_UP_MEMORY: usize = 64 << 20;
+
+/// The indexer's memory keeping up, on one thread. With less, it writes
+/// smaller segments, which cost more to merge: storing a flood of events
+/// took 4% more CPU with 16 MiB, and no less with more than this.
+const KEEP_UP_MEMORY: usize = 64 << 20;
 
 /// The most sequence numbers indexed per commit.
 const CATCH_UP_CHUNK: usize = 400_000;
@@ -533,8 +539,14 @@ impl SearchIndex {
             columns: Mutex::default(),
             indexed_tags: store.indexed_tags.clone(),
         });
+        let catching_up = store_next_seq.saturating_sub(next_seq) >= CATCH_UP_SPLIT;
+        let writer = match catching_up {
+            true => index.writer(CATCH_UP_MEMORY)?,
+            false => index.writer_with_num_threads(1, KEEP_UP_MEMORY)?,
+        };
         let indexer = Indexer {
-            writer: index.writer(WRITER_MEMORY)?,
+            writer: Some(writer),
+            catching_up,
             search: search.clone(),
             next_seq,
             store_id,
@@ -1344,7 +1356,10 @@ pub fn newest_first(a: &EventView, b: &EventView) -> std::cmp::Ordering {
 
 /// Writes the index. See the [module docs](self).
 pub struct Indexer {
-    writer: IndexWriter,
+    /// Only ever none while one is swapped for another.
+    writer: Option<IndexWriter>,
+    /// Whether the writer has the memory to catch up with many events.
+    catching_up: bool,
     search: Arc<SearchIndex>,
     /// The sequence number to index from next.
     next_seq: u64,
@@ -1363,6 +1378,12 @@ impl Indexer {
     /// waits on the disk for each page in turn.
     pub fn catch_up(&mut self, store: &Store, max: usize) -> anyhow::Result<bool> {
         let end = store.next_seq(&*store.read()?)?;
+        self.catch_up_to(store, end, max)
+    }
+
+    /// Index what's been stored from where it got to up to `end`, up to
+    /// `max` sequence numbers' worth. Returns whether there's more.
+    fn catch_up_to(&mut self, store: &Store, end: u64, max: usize) -> anyhow::Result<bool> {
         let from = self.next_seq;
         let to = end.min(from.saturating_add(max as u64));
         let threads = match to - from >= CATCH_UP_SPLIT {
@@ -1370,7 +1391,7 @@ impl Indexer {
             false => 1,
         };
         let share = (to - from).div_ceil(threads);
-        let (writer, search) = (&self.writer, &*self.search);
+        let (writer, search) = (self.writer(), &*self.search);
         std::thread::scope(|scope| {
             let shares: Vec<_> = (0..threads)
                 .map(|n| from + n * share)
@@ -1389,9 +1410,41 @@ impl Indexer {
         Ok(to < end)
     }
 
+    /// Index the events a write stored as they were handed over, rather
+    /// than read back from the LMDB, whose pages they'd keep in memory, then
+    /// forget what it removed. Those stored before them it wasn't handed,
+    /// such as old versions, are read from the LMDB.
+    fn index_written(&mut self, store: &Store, (events, removed): Written) -> anyhow::Result<()> {
+        let mut txn = None;
+        for (seq, record) in events {
+            if seq < self.next_seq {
+                continue;
+            }
+            if seq > self.next_seq {
+                txn = None;
+                while self.catch_up_to(store, seq, CATCH_UP_CHUNK)? {}
+            }
+            let txn = match &mut txn {
+                Some(txn) => txn,
+                None => txn.insert(store.read()?),
+            };
+            // Old versions, kept as history, aren't searchable.
+            if let Some(view) = EventView::new(&record)
+                && store.is_current(txn, seq, &view)?
+                && let Some(doc) = self.search.document(seq, &view)
+            {
+                self.writer().add_document(doc)?;
+            }
+            self.next_seq = seq + 1;
+            self.dirty = true;
+        }
+        self.remove(&removed);
+        Ok(())
+    }
+
     pub fn remove(&mut self, seqs: &[u64]) {
         for &seq in seqs {
-            self.writer
+            self.writer()
                 .delete_term(Term::from_field_u64(self.search.fields.seq, seq));
             self.dirty = true;
         }
@@ -1408,13 +1461,33 @@ impl Indexer {
             store: self.store_id.clone(),
             excluded_kinds: self.search.excluded_kinds.clone(),
         };
-        let mut commit = self.writer.prepare_commit()?;
+        let writer = self.writer.as_mut().expect("a writer");
+        let mut commit = writer.prepare_commit()?;
         commit.set_payload(&serde_json::to_string(&payload)?);
         commit.commit()?;
         self.search.reader.reload()?;
         self.search.forget_merged();
         self.search.indexed.store(self.next_seq, Ordering::Release);
         self.dirty = false;
+        Ok(())
+    }
+
+    fn writer(&self) -> &IndexWriter {
+        self.writer.as_ref().expect("a writer")
+    }
+
+    /// Swap the writer for one with only the memory keeping up takes, if
+    /// it has more, as one catching up with many events does.
+    fn keep_up(&mut self) -> anyhow::Result<()> {
+        if !self.catching_up {
+            return Ok(());
+        }
+        let writer = self.writer.take().expect("a writer");
+        let index = writer.index().clone();
+        // One writer at a time: the other's let go of first.
+        writer.wait_merging_threads()?;
+        self.writer = Some(index.writer_with_num_threads(1, KEEP_UP_MEMORY)?);
+        self.catching_up = false;
         Ok(())
     }
 
@@ -1427,10 +1500,9 @@ impl Indexer {
     }
 
     /// Run on a thread of its own, committing at most every `interval`.
-    /// Send it the sequence numbers of removed events (or none) after each
-    /// write.
-    pub fn spawn(mut self, store: Arc<Store>, interval: Duration) -> Sender<Vec<u64>> {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u64>>();
+    /// Send it what each write stored and removed.
+    pub fn spawn(mut self, store: Arc<Store>, interval: Duration) -> Sender<Written> {
+        let (tx, rx) = std::sync::mpsc::channel::<Written>();
         std::thread::Builder::new()
             .name("search-indexer".into())
             .spawn(move || {
@@ -1445,22 +1517,29 @@ impl Indexer {
     fn run(
         &mut self,
         store: &Store,
-        rx: &Receiver<Vec<u64>>,
+        rx: &Receiver<Written>,
         interval: Duration,
     ) -> anyhow::Result<()> {
         self.catch_up_all(store)?;
         tracing::info!("search index caught up to {}", self.next_seq);
-        while let Ok(removed) = rx.recv() {
-            self.remove(&removed);
-            let deadline = Instant::now() + interval;
-            while let Ok(removed) =
-                rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            {
-                self.remove(&removed);
+        self.keep_up()?;
+        loop {
+            match rx.recv_timeout(interval) {
+                Ok(written) => {
+                    self.index_written(store, written)?;
+                    let deadline = Instant::now() + interval;
+                    while let Ok(written) =
+                        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        self.index_written(store, written)?;
+                    }
+                    self.commit()?;
+                }
+                // Anything stored that wasn't handed over, once all's quiet.
+                Err(RecvTimeoutError::Timeout) => self.catch_up_all(store)?,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
-            self.catch_up_all(store)?;
         }
-        Ok(())
     }
 }
 
@@ -2021,6 +2100,79 @@ mod tests {
         f.index_all();
         assert!(f.search(json!({"search": "older"})).is_empty());
         assert_eq!(f.index.reader.searcher().num_docs(), 1);
+    }
+
+    #[test]
+    fn indexes_what_its_handed() {
+        let mut f = fixture();
+        let write = |events: &[&Event]| {
+            let records: Vec<_> = events.iter().map(|e| record::encode(e)).collect();
+            let batch = f
+                .store
+                .write_batch(records.iter().map(Vec::as_slice), 0)
+                .unwrap();
+            let stored = batch
+                .outcomes
+                .iter()
+                .zip(records)
+                .filter_map(|(outcome, record)| match outcome {
+                    crate::store::Outcome::Stored(seq) => Some((*seq, Arc::new(record))),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (stored, batch.removed)
+        };
+        let profile = |at, name: &str| signed(1, at, 0, vec![], &json!({"name": name}).to_string());
+        let (first, second) = (profile(100, "first"), profile(300, "second"));
+        let note = signed(2, 100, 1, vec![], "handed over");
+        let written = write(&[&first, &note]);
+        // An old version, archived, and a note the indexer isn't handed:
+        // read from the store.
+        let (older, unhanded) = (profile(50, "older"), signed(3, 100, 1, vec![], "unhanded"));
+        let (archived, _) = write(&[&older, &unhanded]);
+        assert_eq!(archived.len(), 1);
+        let replaced = write(&[&second]);
+        assert_eq!(replaced.1, [1]);
+
+        f.indexer.index_written(&f.store, written).unwrap();
+        f.indexer.index_written(&f.store, replaced).unwrap();
+        f.indexer.commit().unwrap();
+        assert_eq!(f.index.indexed(), 6);
+        assert_eq!(f.search(json!({"search": "handed"})), [note.id.as_str()]);
+        assert_eq!(
+            f.search(json!({"search": "unhanded"})),
+            [unhanded.id.as_str()]
+        );
+        assert_eq!(f.search(json!({"search": "second"})), [second.id.as_str()]);
+        assert!(f.search(json!({"search": "first"})).is_empty());
+        assert!(f.search(json!({"search": "older"})).is_empty());
+        // The notes and the current profile.
+        assert_eq!(f.index.reader.searcher().num_docs(), 3);
+    }
+
+    #[test]
+    fn keeps_up_with_less_memory_once_caught_up() {
+        let mut f = fixture();
+        assert!(!f.indexer.catching_up);
+        for n in 0..CATCH_UP_SPLIT {
+            put(&f.store, &signed(1, 100 + n, 1, vec![], "backlog"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (index, mut indexer) =
+            SearchIndex::open(dir.path(), EXCLUDED_KINDS.into(), &f.store).unwrap();
+        assert!(indexer.catching_up);
+        indexer.catch_up_all(&f.store).unwrap();
+        indexer.keep_up().unwrap();
+        assert!(!indexer.catching_up);
+        let later = signed(1, 200, 1, vec![], "later");
+        put(&f.store, &later);
+        indexer.catch_up_all(&f.store).unwrap();
+        f.index = index;
+        assert_eq!(f.search(json!({"search": "later"})), [later.id.as_str()]);
+        assert_eq!(
+            f.search(json!({"search": "backlog"})).len(),
+            CATCH_UP_SPLIT as usize
+        );
     }
 
     #[test]

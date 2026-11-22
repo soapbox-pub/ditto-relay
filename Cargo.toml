@@ -15,19 +15,32 @@ arc-swap = "1"
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-cli-extra", "ephemeral-keystore", "vanguards", "hs-pow-full", "static-sqlite"] }
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
+bytes = "1"
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+crc32fast = "1.5"
+foldhash = "0.2"
 futures-util = "0.3.34"
 getrandom = "0.4"
+hashbrown = "0.16"
 hex = "0.4.3"
+# The WebSocket upgrade, done by hand: see src/relay/ws.rs.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 # Certificates from Let's Encrypt, or any ACME CA, for [tls].
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 libc = "0.2.190"
 # Raw LMDB, wrapped in src/lmdb.rs. heed can't seek or count within a key's
 # sorted duplicates, which the indexes are built on.
 lmdb-master-sys = "0.2.6"
+memmap2 = "0.9"
+# The allocator: musl's, which the release binaries would have, is slow
+# with many threads.
+mimalloc = { version = "0.1", default-features = false }
 # The certificate a TLS-ALPN-01 challenge is answered with.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 roaring = "0.11.5"
+# Event ids are hashed with its sha256, in assembly, as rustls already has it.
+ring = "0.17.14"
 # The TLS clients connect with when [tls] is on, and Arti speaks to Tor
 # relays with, which leaves choosing its cryptography to the application.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -37,6 +50,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Arti's settings in the config file, with keys it doesn't know refused.
 serde_ignored = "0.1"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha1 = "0.10"
+smallvec = "1.16"
 sha2 = "0.11.0"
 tantivy = "0.26"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "process", "io-util", "io-std", "fs", "time"] }
@@ -126,6 +141,9 @@ web-time-compat          = { git = "https://git.shakespeare.diy/npub1q3sle0kvfse
 # its mdb.c.
 lmdb-master-sys          = { path = "vendor/lmdb-master-sys" }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 rand = "0.10.3"
 tempfile = "3.27.0"
@@ -140,3 +158,8 @@ tokio-tungstenite = "0.29.0"
 strip = "symbols"
 lto = "fat"
 codegen-units = 1
+
+# libsecp256k1 optimised in debug builds too: the tests sign and check
+# thousands of events, many times slower unoptimised.
+[profile.dev.package.secp256k1-sys]
+opt-level = 3

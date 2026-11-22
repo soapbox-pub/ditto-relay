@@ -576,7 +576,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(store.len(&store.read().unwrap()).unwrap(), 1);
-        let removed: usize = told.try_iter().map(|seqs| seqs.len()).sum();
+        let removed: usize = told.try_iter().map(|(_, seqs)| seqs.len()).sum();
         assert_eq!(removed, count as usize);
 
         // A bad filter is the relay's to refuse, and says why.
@@ -717,6 +717,8 @@ mod tests {
         for i in 0..50 {
             put(&store, &signed(1, 100 + i, 1, vec![], "x"));
         }
+        // Counted in LMDB, as the copy is.
+        store.merge().unwrap();
         let writer = Writer::spawn(store.clone(), None, |_| {});
         let path = socket_path(dir.path());
         let shutdown = CancellationToken::new();

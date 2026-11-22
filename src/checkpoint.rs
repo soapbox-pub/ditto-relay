@@ -40,8 +40,13 @@ use crate::lmdb::{Env, Meta};
 pub const FILE: &str = "checkpoint";
 
 /// How often the writer makes a checkpoint: about as many seconds of writes
-/// as a crash of the machine can lose.
-pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// as a crash of the machine can lose. Pages freed since the last one can't
+/// be used again until the next is durable, so under a flood of writes the
+/// files grow by about as much as is written meanwhile.
+pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a checkpoint may take before it's warned of.
+pub const SLOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 const MAGIC: &[u8; 8] = b"DRCKPT02";
 

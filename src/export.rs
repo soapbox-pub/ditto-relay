@@ -13,9 +13,12 @@
 //! writer from reusing pages, as a transaction held all along would.
 
 use std::io::Write;
+use std::path::Path;
 
 use crate::delete;
 use crate::filter::Filter;
+use crate::lmdb::{DbFlags, Env};
+use crate::record::EventView;
 use crate::store::Store;
 
 /// The most events read in a transaction.
@@ -85,6 +88,60 @@ pub fn export(
     Ok(written)
 }
 
+/// Write to `out` every event in the records file in `dir`, a store's
+/// `bodies`, in the order stored, reading nothing else of the store: so
+/// that a store whose main file is lost or damaged can be stored anew by
+/// importing them. Old versions, expired events, and what deletions cover
+/// are among them, as the store kept them; importing sorts that out again.
+/// Tells `progress` how many so far, and the last sequence number read,
+/// every so often. Returns how many it wrote, and how many records it
+/// couldn't read. A damaged table can lead the walk back to where it's
+/// been: sequence numbers only rise, so one that doesn't stops it.
+pub fn salvage(
+    dir: &Path,
+    map_size: usize,
+    from: u64,
+    out: &mut impl Write,
+    mut progress: impl FnMut(u64, u64),
+) -> anyhow::Result<(u64, u64)> {
+    let env = Env::open_read_only(dir, map_size, 2, 16)?;
+    let events = env.create_db("events", DbFlags::INTEGER_KEY)?;
+    let txn = env.read_txn()?;
+    let mut cursor = txn.cursor(events)?;
+    let (mut written, mut unreadable) = (0, 0);
+    let mut read_ahead = 0usize;
+    let mut last = None;
+    let mut entry = cursor.set_range(&from.to_ne_bytes())?;
+    while let Some((key, record)) = entry {
+        let seq = u64::from_ne_bytes(key.try_into()?);
+        if last.is_some_and(|last| seq <= last) {
+            anyhow::bail!(
+                "the records are damaged: after {} came {seq}, having written {written}",
+                last.unwrap_or_default()
+            );
+        }
+        last = Some(seq);
+        let at = record.as_ptr() as usize;
+        if at.abs_diff(read_ahead) > READ_AHEAD / 2 {
+            env.will_need(0, record, READ_AHEAD);
+            read_ahead = at;
+        }
+        match EventView::new(record) {
+            Some(view) => {
+                writeln!(out, "{}", view.to_json())?;
+                written += 1;
+                if written % CHUNK as u64 == 0 {
+                    progress(written, seq);
+                }
+            }
+            None => unreadable += 1,
+        }
+        entry = cursor.next()?;
+    }
+    out.flush()?;
+    Ok((written, unreadable))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +160,49 @@ mod tests {
             .collect();
         assert_eq!(lines.len() as u64, written);
         lines
+    }
+
+    #[test]
+    fn salvages_every_record_from_the_records_file_alone() {
+        let (dir, store) = open();
+        let profile = signed(1, 100, 0, vec![], "old profile");
+        let newer = signed(1, 200, 0, vec![], "new profile");
+        let note = signed(2, 100, 1, vec![], "note");
+        for event in [&profile, &newer, &note] {
+            put(&store, event);
+        }
+        store.checkpoint().unwrap();
+        drop(store);
+        // Without the main file at all.
+        std::fs::remove_file(dir.path().join("data.mdb")).unwrap();
+        let mut out = Vec::new();
+        let (written, unreadable) = salvage(
+            &dir.path().join(crate::store::BODIES_DIR),
+            1 << 30,
+            0,
+            &mut out,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!((written, unreadable), (3, 0));
+        let ids: Vec<String> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(ids, [profile.id, newer.id, note.id]);
+        // From the third on.
+        let mut out = Vec::new();
+        let bodies = dir.path().join(crate::store::BODIES_DIR);
+        assert_eq!(
+            salvage(&bodies, 1 << 30, 3, &mut out, |_, _| {}).unwrap(),
+            (1, 0)
+        );
     }
 
     #[test]

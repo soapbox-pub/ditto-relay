@@ -19,16 +19,20 @@
 //! thread and back cost more than the rest of a small query.
 
 use std::collections::{HashMap, HashSet};
+
+use smallvec::SmallVec;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::auth::Viewer;
 use crate::filter::Filter;
 use crate::metrics::METRICS;
 use crate::record::EventView;
 use crate::store::{MAX_INDEXED_TAG, tag_key};
+
+use super::queue::Queue;
+use super::ws::Direct;
 
 pub type ConnId = u64;
 
@@ -38,33 +42,51 @@ pub struct Outbound {
     pub sub: Arc<str>,
     /// Its sequence number, if it was stored (ephemeral events aren't).
     pub seq: Option<u64>,
-    pub json: Arc<str>,
+    pub json: Arc<String>,
 }
 
 /// The way to a connection. Its queue is bounded: a connection that falls
 /// so far behind that it fills up is told to go, rather than buffering
 /// without end.
+///
+/// With a [`Direct`] way to its client too, an event for a subscription
+/// that's [live](Hub::go_live) is sent from the shard's thread, rather
+/// than handed to the connection's task to send, as long as nothing else
+/// is in its queue: waking the tasks of all those an event goes to, one
+/// after another, took longer than sending it.
 #[derive(Clone)]
 pub struct Link {
-    tx: mpsc::Sender<Outbound>,
-    overflow: CancellationToken,
+    queue: Arc<Queue<Outbound>>,
+    capacity: usize,
+    direct: Option<Direct>,
 }
 
 impl Link {
-    pub fn new(capacity: usize) -> (Link, mpsc::Receiver<Outbound>, CancellationToken) {
-        let (tx, rx) = mpsc::channel(capacity);
-        let overflow = CancellationToken::new();
+    /// With the queue the connection reads, whose end says it fell behind.
+    pub fn new(capacity: usize, direct: Option<Direct>) -> (Link, Arc<Queue<Outbound>>) {
+        let queue = Queue::new();
         let link = Link {
-            tx,
-            overflow: overflow.clone(),
+            queue: queue.clone(),
+            capacity,
+            direct,
         };
-        (link, rx, overflow)
+        (link, queue)
     }
 
-    fn send(&self, message: Outbound) {
-        if self.tx.try_send(message).is_err() {
-            self.overflow.cancel();
+    fn send(&self, installed: &Installed, seq: Option<u64>, json: &Arc<String>) {
+        if let (Some(floor), Some(direct)) = (installed.live, &self.direct)
+            && self.queue.all_handled()
+        {
+            // Stored events its query could see were sent with it.
+            if seq.is_none_or(|seq| seq >= floor) && !direct.event(&installed.quoted, json) {
+                self.queue.overflow();
+            }
+            return;
         }
+        let sub = installed.sub.clone();
+        let json = json.clone();
+        self.queue
+            .push_within(Outbound { sub, seq, json }, self.capacity);
     }
 }
 
@@ -79,7 +101,7 @@ pub struct Live {
     /// Its sequence number, if it was stored (ephemeral events aren't).
     pub seq: Option<u64>,
     /// Its JSON, written by whichever shard needs it first.
-    json: OnceLock<Arc<str>>,
+    json: OnceLock<Arc<String>>,
 }
 
 impl Live {
@@ -162,6 +184,13 @@ impl Hub {
         self.monitors(conn).unsubscribe(conn, sub);
     }
 
+    /// Note that a subscription's query's results are sent, those stored
+    /// from `floor` on not among them: what comes for it next may be sent
+    /// [directly](Link).
+    pub fn go_live(&self, conn: ConnId, sub: &Arc<str>, floor: u64) {
+        self.monitors(conn).go_live(conn, sub, floor);
+    }
+
     /// Hand events to every shard, waiting if one is behind. Not for async
     /// code: the writer calls it from its own thread.
     pub fn broadcast(&self, events: Vec<Live>) {
@@ -204,8 +233,13 @@ struct Installed {
     sub_key: u64,
     conn: ConnId,
     sub: Arc<str>,
+    /// `sub`, as JSON.
+    quoted: Arc<str>,
     filter: Filter,
     viewer: Option<Viewer>,
+    /// Once its query's results are sent, the sequence number from which
+    /// stored events weren't among them.
+    live: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -228,9 +262,9 @@ struct Monitors {
     conns: HashMap<ConnId, Connection>,
     filters: HashMap<u64, Installed>,
     next_key: u64,
-    buckets: HashMap<Bucket, HashSet<u64>>,
+    buckets: Index<Bucket>,
     /// Keyed by [`tag_key`] without a kind.
-    tags: HashMap<Vec<u8>, HashSet<u64>>,
+    tags: Index<Vec<u8>>,
 }
 
 /// Where a filter is filed: the field the fewest events can match, of
@@ -296,6 +330,7 @@ impl Monitors {
         }
         self.next_key += 1;
         let sub_key = self.next_key;
+        let quoted: Arc<str> = super::quoted(&sub).into();
         let mut keys = Vec::new();
         for filter in filters.into_iter().filter(|f| !f.never) {
             self.next_key += 1;
@@ -316,14 +351,31 @@ impl Monitors {
                 sub_key,
                 conn,
                 sub: sub.clone(),
+                quoted: quoted.clone(),
                 filter,
                 viewer: viewer.clone(),
+                live: None,
             };
             self.filters.insert(key, installed);
             keys.push(key);
         }
         let connection = self.conns.get_mut(&conn).expect("connected");
         connection.subs.insert(sub, keys);
+    }
+
+    /// Note that `sub`'s query's results are sent, those from `floor` on
+    /// not among them, if it's still open.
+    fn go_live(&mut self, conn: ConnId, sub: &Arc<str>, floor: u64) {
+        let Some(keys) = self.conns.get(&conn).and_then(|c| c.subs.get(sub)) else {
+            return;
+        };
+        for key in keys {
+            if let Some(installed) = self.filters.get_mut(key)
+                && Arc::ptr_eq(&installed.sub, sub)
+            {
+                installed.live = Some(floor);
+            }
+        }
     }
 
     fn unsubscribe(&mut self, conn: ConnId, sub: &str) {
@@ -354,7 +406,12 @@ impl Monitors {
 
     /// Send a new event to every subscription it matches, writing its JSON
     /// into `json` if no one has yet. Returns how many.
-    fn broadcast(&self, event: &EventView, seq: Option<u64>, json: &OnceLock<Arc<str>>) -> usize {
+    fn broadcast(
+        &self,
+        event: &EventView,
+        seq: Option<u64>,
+        json: &OnceLock<Arc<String>>,
+    ) -> usize {
         let mut candidates: Vec<u64> = Vec::new();
         let buckets = [
             Bucket::Id(*event.id()),
@@ -363,8 +420,8 @@ impl Monitors {
             Bucket::Other,
         ];
         for bucket in buckets {
-            if let Some(set) = self.buckets.get(&bucket) {
-                candidates.extend(set);
+            if let Some(keys) = self.buckets.get(&bucket) {
+                keys.extend_into(&mut candidates);
             }
         }
         if !self.tags.is_empty() {
@@ -375,8 +432,8 @@ impl Monitors {
                 }
                 value.clear();
                 element.encode(&mut value);
-                if let Some(set) = self.tags.get(&tag_key(name, &value, None)) {
-                    candidates.extend(set);
+                if let Some(keys) = self.tags.get(&tag_key(name, &value, None)) {
+                    keys.extend_into(&mut candidates);
                 }
             }
         }
@@ -401,20 +458,78 @@ impl Monitors {
                 continue;
             };
             sent.insert(installed.sub_key);
-            let json = json.get_or_init(|| event.to_json().into()).clone();
-            let sub = installed.sub.clone();
-            connection.link.send(Outbound { sub, seq, json });
+            let json = json.get_or_init(|| event.to_json().into());
+            connection.link.send(installed, seq, json);
         }
         sent.len()
     }
 }
 
-/// Take `key` out of the set filed under `at`, and the set with it once
-/// it's empty.
-fn unfile<K: Eq + std::hash::Hash>(index: &mut HashMap<K, HashSet<u64>>, at: K, key: u64) {
-    if let Some(set) = index.get_mut(&at) {
-        set.remove(&key);
-        if set.is_empty() {
+/// Filters' keys, by where they're filed. A REQ for many ids or authors
+/// files under each, and most are filed under alone: a few are kept in a
+/// list, as many in a set.
+type Index<K> = HashMap<K, Keys, foldhash::fast::RandomState>;
+
+enum Keys {
+    Few(SmallVec<[u64; 2]>),
+    Many(HashSet<u64, foldhash::fast::RandomState>),
+}
+
+/// The most keys kept in a list.
+const FEW: usize = 16;
+
+impl Default for Keys {
+    fn default() -> Self {
+        Keys::Few(SmallVec::new())
+    }
+}
+
+impl Keys {
+    fn insert(&mut self, key: u64) {
+        match self {
+            Keys::Few(few) if few.contains(&key) => {}
+            Keys::Few(few) if few.len() < FEW => few.push(key),
+            Keys::Few(few) => {
+                let mut many: HashSet<u64, _> = few.drain(..).collect();
+                many.insert(key);
+                *self = Keys::Many(many);
+            }
+            Keys::Many(many) => {
+                many.insert(key);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: u64) {
+        match self {
+            Keys::Few(few) => few.retain(|k| *k != key),
+            Keys::Many(many) => {
+                many.remove(&key);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Keys::Few(few) => few.is_empty(),
+            Keys::Many(many) => many.is_empty(),
+        }
+    }
+
+    fn extend_into(&self, out: &mut Vec<u64>) {
+        match self {
+            Keys::Few(few) => out.extend_from_slice(few),
+            Keys::Many(many) => out.extend(many),
+        }
+    }
+}
+
+/// Take `key` out of those filed under `at`, and `at` with it once none
+/// are.
+fn unfile<K: Eq + std::hash::Hash>(index: &mut Index<K>, at: K, key: u64) {
+    if let Some(keys) = index.get_mut(&at) {
+        keys.remove(key);
+        if keys.is_empty() {
             index.remove(&at);
         }
     }
@@ -442,9 +557,9 @@ mod tests {
         monitors.broadcast(&view, Some(1), &OnceLock::new())
     }
 
-    fn received(rx: &mut mpsc::Receiver<Outbound>) -> Vec<String> {
+    fn received(rx: &mut Arc<Queue<Outbound>>) -> Vec<String> {
         let mut subs = Vec::new();
-        while let Ok(outbound) = rx.try_recv() {
+        while let Some(outbound) = rx.pop() {
             subs.push(outbound.sub.to_string());
         }
         subs
@@ -453,7 +568,7 @@ mod tests {
     #[test]
     fn sends_each_subscription_an_event_once() {
         let mut monitors = Monitors::default();
-        let (link, mut rx, _) = Link::new(16);
+        let (link, mut rx) = Link::new(16, None);
         monitors.connect(1, link);
 
         let tags = vec![vec!["t", "a"], vec!["t", "b"], vec!["title", "Hi"]];
@@ -492,9 +607,30 @@ mod tests {
     }
 
     #[test]
+    fn files_many_subscriptions_under_one_key() {
+        let mut monitors = Monitors::default();
+        let (link, mut rx) = Link::new(64, None);
+        monitors.connect(1, link);
+        for n in 0..FEW + 4 {
+            let filter = filters(&[json!({"kinds": [1], "since": n})]);
+            monitors.subscribe(1, format!("s{n}").into(), filter, None);
+        }
+        assert_eq!(deliver(&monitors, &signed(1, 100, 1, vec![], "")), FEW + 4);
+        assert_eq!(received(&mut rx).len(), FEW + 4);
+        for n in 0..FEW + 4 {
+            monitors.unsubscribe(1, &format!("s{n}"));
+            assert_eq!(
+                deliver(&monitors, &signed(1, 100, 1, vec![], "")),
+                FEW + 3 - n
+            );
+        }
+        assert!(monitors.buckets.is_empty());
+    }
+
+    #[test]
     fn matches_search_text() {
         let mut monitors = Monitors::default();
-        let (link, mut rx, _) = Link::new(16);
+        let (link, mut rx) = Link::new(16, None);
         monitors.connect(1, link);
         let search = [json!({"kinds": [1], "search": "hello"})];
         monitors.subscribe(1, "s".into(), filters(&search), None);
@@ -508,7 +644,7 @@ mod tests {
         let hub = Hub::spawn(2);
         let mut receivers = Vec::new();
         for conn in 1..=3 {
-            let (link, rx, _) = Link::new(16);
+            let (link, rx) = Link::new(16, None);
             hub.connect(conn, link);
             let kinds = filters(&[json!({"kinds": [1]})]);
             hub.subscribe(conn, "s".into(), kinds, None);
@@ -528,7 +664,7 @@ mod tests {
             .unwrap();
 
         for rx in &mut receivers[..2] {
-            let outbound = rx.recv().await.unwrap();
+            let outbound = rx.next().await.unwrap();
             assert_eq!((&*outbound.sub, outbound.seq), ("s", Some(1)));
             assert_eq!(serde_json::from_str::<Event>(&outbound.json).unwrap(), note);
         }
@@ -544,20 +680,60 @@ mod tests {
             .await
             .unwrap();
         for rx in &mut receivers {
-            assert_eq!(&*rx.recv().await.unwrap().sub, "sync");
-            assert!(rx.try_recv().is_err());
+            assert_eq!(&*rx.next().await.unwrap().sub, "sync");
+            assert!(rx.pop().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn sends_directly_once_live_and_caught_up() {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let writer = super::super::ws::Writer::new(Box::new(server));
+        let mut monitors = Monitors::default();
+        let (link, rx) = Link::new(16, Some(writer.direct()));
+        monitors.connect(1, link);
+        let sub: Arc<str> = "s".into();
+        monitors.subscribe(1, sub.clone(), filters(&[json!({"kinds": [1]})]), None);
+        let send = |monitors: &Monitors, n: u64, seq: u64| {
+            let record = encode(&signed(1, n, 1, vec![], ""));
+            let view = EventView::new(&record).unwrap();
+            monitors.broadcast(&view, Some(seq), &OnceLock::new());
+        };
+
+        // Not live: queued.
+        send(&monitors, 1, 1);
+        monitors.go_live(1, &sub, 5);
+        // Live, but one's queued yet: queued behind it.
+        send(&monitors, 2, 6);
+        assert_eq!(rx.pop().map(|o| o.seq), Some(Some(1)));
+        rx.handled();
+        assert_eq!(rx.pop().map(|o| o.seq), Some(Some(6)));
+        rx.handled();
+        // Caught up: sent, but for what its query saw.
+        send(&monitors, 3, 4);
+        send(&monitors, 4, 7);
+        assert!(rx.pop().is_none());
+        drop(monitors);
+        drop(writer);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        let text = String::from_utf8_lossy(&got[4..]);
+        assert_eq!(got[..2], [0x81, 126]);
+        assert!(text.starts_with("[\"EVENT\",\"s\",{"), "{text}");
+        assert_eq!(text.matches("EVENT").count(), 1);
+        assert!(text.contains("\"created_at\":4"), "{text}");
     }
 
     #[test]
     fn signals_a_connection_that_falls_behind() {
         let mut monitors = Monitors::default();
-        let (link, _rx, overflow) = Link::new(1);
+        let (link, rx) = Link::new(1, None);
         monitors.connect(1, link);
         monitors.subscribe(1, "s".into(), filters(&[json!({})]), None);
         deliver(&monitors, &signed(1, 1, 1, vec![], ""));
-        assert!(!overflow.is_cancelled());
+        assert!(!rx.state_overflowed());
         deliver(&monitors, &signed(1, 2, 1, vec![], ""));
-        assert!(overflow.is_cancelled());
+        assert!(rx.state_overflowed());
     }
 }

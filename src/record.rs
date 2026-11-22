@@ -218,7 +218,15 @@ pub struct EventView<'a> {
     expiration: Option<u32>,
     analysis: Analysis,
     tags: &'a [u8],
-    content: Content<'a>,
+    content: Body<'a>,
+}
+
+/// An event's content, as read: text as bytes, checked to be UTF-8 only
+/// once it's wanted, as most reads of an event never want it.
+#[derive(Clone, Copy, Debug)]
+enum Body<'a> {
+    Text(&'a [u8]),
+    Decoded(Content<'a>),
 }
 
 /// An event's content, as stored.
@@ -303,6 +311,10 @@ impl<'a> Header<'a> {
         u32::from_le_bytes(self.fixed[129..133].try_into().unwrap())
     }
 
+    pub fn expiration(&self) -> Option<u32> {
+        self.expiration
+    }
+
     /// Whether the event has expired by `now`.
     pub fn is_expired(&self, now: u32) -> bool {
         self.expiration.is_some_and(|at| at <= now)
@@ -335,12 +347,12 @@ impl<'a> EventView<'a> {
         let tags = rest.get(..tags_len)?;
         let content = &rest[tags_len..];
         let content = if fixed[0] & FLAG_BASE64 != 0 {
-            Content::Base64(content)
+            Body::Decoded(Content::Base64(content))
         } else if fixed[0] & FLAG_NIP04 != 0 {
             let (ciphertext, iv) = content.split_last_chunk::<NIP04_IV_LEN>()?;
-            Content::Nip04 { ciphertext, iv }
+            Body::Decoded(Content::Nip04 { ciphertext, iv })
         } else {
-            Content::Text(std::str::from_utf8(content).ok()?)
+            Body::Text(content)
         };
         Some(EventView {
             fixed,
@@ -387,7 +399,12 @@ impl<'a> EventView<'a> {
     }
 
     pub fn content(&self) -> Content<'a> {
-        self.content
+        match self.content {
+            // Records are only made from text that is UTF-8, so this is
+            // only ever damage, read as no text.
+            Body::Text(bytes) => Content::Text(std::str::from_utf8(bytes).unwrap_or_default()),
+            Body::Decoded(content) => content,
+        }
     }
 
     pub fn tags(&self) -> Tags<'a> {
@@ -438,7 +455,8 @@ impl<'a> EventView<'a> {
 
     /// The event as NIP-01 JSON.
     pub fn to_json(self) -> String {
-        let content_len = self.content.text_len();
+        let content = self.content();
+        let content_len = content.text_len();
         let mut out = String::with_capacity(FIXED * 2 + content_len + self.tags.len() * 2 + 96);
         out.push_str("{\"id\":\"");
         push_hex_str(&mut out, self.id());
@@ -451,7 +469,7 @@ impl<'a> EventView<'a> {
         out.push_str(",\"tags\":[");
         push_tags_json(&mut out, self.tags);
         out.push_str("],\"content\":");
-        match self.content {
+        match content {
             Content::Text(text) => push_json_str(&mut out, text),
             // Nothing in base64 needs escaping.
             content => {
@@ -543,6 +561,13 @@ fn push_hex_json(out: &mut String, bytes: &[u8; 32]) {
     }
     // SAFETY: only quotes and ASCII digits are appended, so it stays UTF-8.
     unsafe { out.as_mut_vec() }.extend_from_slice(&json);
+}
+
+/// Bytes as lowercase hex.
+pub fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    push_hex_str(&mut out, bytes);
+    out
 }
 
 fn push_hex_str(out: &mut String, bytes: &[u8]) {
@@ -1174,6 +1199,8 @@ mod tests {
         assert!(EventView::new(&[0; 10]).is_none());
         let mut record = encode(&signed(2, 1, 1, vec![], "x"));
         *record.last_mut().unwrap() = 0xff;
-        assert!(EventView::new(&record).is_none());
+        // Text is checked only once it's read: damaged, it reads as none.
+        let view = EventView::new(&record).unwrap();
+        assert_eq!(view.content(), Content::Text(""));
     }
 }

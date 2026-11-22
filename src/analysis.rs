@@ -5,7 +5,9 @@
 //! a second guess differing from the first.
 //!
 //! Text shorter than [`MIN_TEXT`] characters is too little to tell either
-//! by, and only the first [`MAX_TEXT`] are read. A language is only
+//! by, and only the first [`MAX_TEXT`] are read. Nor is text that isn't
+//! [prose]: in hex, base64, JSON or identifiers, whatlang finds languages,
+//! Welsh most of all, and with confidence. A language is only
 //! recorded when whatlang is at least [`MIN_CONFIDENCE`] sure of it. VADER
 //! only knows English, so only text whatlang thinks is English gets a
 //! sentiment. Reactions are read by what they react with: `+`, `-`, or an
@@ -121,6 +123,8 @@ fn is_prose(kind: u16) -> bool {
             | 16
             | 1059
             | 9735
+            // Ephemeral gift wraps (Concord).
+            | 21059
             | 10000..=10102
             | 30000..=30030
             | 31234
@@ -150,7 +154,7 @@ pub fn analyze(view: &EventView) -> Analysis {
         Some((end, _)) => &text[..end],
         None => &text,
     };
-    if text.chars().nth(MIN_TEXT - 1).is_none() {
+    if text.chars().nth(MIN_TEXT - 1).is_none() || !prose(text) {
         return Analysis::default();
     }
     let Some(info) = whatlang::detect(text) else {
@@ -161,6 +165,38 @@ pub fn analyze(view: &EventView) -> Analysis {
         language: language.filter(|_| info.confidence() >= MIN_CONFIDENCE),
         sentiment: (info.lang() == Lang::Eng).then(|| score(text)),
     }
+}
+
+/// The fewest words of letters text has to have to be taken for prose.
+const MIN_WORDS: usize = 3;
+
+/// The longest a word of prose is taken to be, in characters.
+const MAX_WORD: usize = 24;
+
+/// Whether text looks like something people wrote: [`MIN_WORDS`] words or
+/// more, each mostly letters, making up at least half of it; or, if it's
+/// mostly letters outside ASCII, as in scripts written without spaces,
+/// whatever it is. Hex, base64, JSON and identifiers aren't, nor a link
+/// alone.
+fn prose(text: &str) -> bool {
+    let (mut words, mut in_words, mut total) = (0, 0, 0);
+    for token in text.split_whitespace() {
+        let chars = token.chars().count();
+        let letters = token.chars().filter(|c| c.is_alphabetic()).count();
+        total += chars;
+        if letters >= 2 && chars <= MAX_WORD && letters * 5 >= chars * 4 {
+            words += 1;
+            in_words += chars;
+        }
+    }
+    if words >= MIN_WORDS && in_words * 2 >= total {
+        return true;
+    }
+    let beyond_ascii = text
+        .chars()
+        .filter(|c| c.is_alphabetic() && !c.is_ascii())
+        .count();
+    beyond_ascii * 2 > text.chars().count()
 }
 
 /// VADER's take. It knows emoji, but not with a variation selector.
@@ -455,6 +491,25 @@ mod tests {
         // Too short to tell, or too unsure.
         assert_eq!(language(1, "gm"), None);
         assert_eq!(language(1, "lol same lol"), None);
+        // Not prose, though whatlang finds Welsh in each.
+        for content in [
+            "4254564502abf0900300000000504573221d60fea56def0da76226897c1b2ac4b3fe0d653aeec3f1707f6bea31",
+            "yoftgBsrZJiDSsNG4iK/H2UB8iPOpK7tuyp5iwFM0XArGuCuy6cEgMaHYFIkXnW3MCu10OQpt/pFifd2cwsYOKY/Gq",
+            "[[\"e\",\"2b4710f465ffc9bfc1235243ae96848225b7186bb90e84851ad4b41cd455c997\"]]",
+            "sp_4c43bd1d.e1224e8942ec4b3fec57e986.12.DRRHAW437KI2FWKX6FB76NKXVZN6WZ2SMT22CVSUWKNRNJLBAY",
+            "https://example.com/a/long/path/to/something",
+        ] {
+            assert_eq!(analyzed(1, content), Analysis::default(), "{content}");
+        }
+        // Prose with a link in it is still prose.
+        assert_eq!(
+            language(
+                1,
+                "Look at this lovely picture of the mountains https://example.com/a.jpg"
+            )
+            .as_deref(),
+            Some("en")
+        );
         // Nobody wrote a follow list.
         let follows = analyzed(3, "Nostr is the future of social media");
         assert_eq!(follows, Analysis::default());

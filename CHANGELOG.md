@@ -6,6 +6,108 @@ it is tagged.
 
 ## [2.5.2]
 
+- `ditto-relay salvage` writes every event in a database's records file as
+  JSON lines, reading nothing else of the database: for a database whose
+  main file is lost or damaged, which can then be stored anew by importing
+  them. `--from` begins at a sequence number, as where one stopped.
+- `import`, with the relay stopped, keeps 25,000,000 index changes in
+  memory before merging them, rather than 1,500,000, and merges them in
+  transactions of 250,000.
+- Events are stored faster: about 40% more a second, on a third less CPU.
+  A new event's signature check, encoding and the read-ahead for the
+  writer are done in one trip to the blocking pool rather than three,
+  which under a flood of events grew it to hundreds of threads. Queries
+  answered while events pour in keep their speed, and a message bigger
+  than 64 KiB is parsed off the threads every connection shares. The
+  read-ahead itself is only done while the database doesn't fit in
+  memory.
+- Queries take about 40% less CPU. A query's events are read through one
+  cursor, each `EVENT` message is built in one go, and the events queries
+  returned lately are kept in memory, up to 128 MiB, so one asked for
+  again is neither looked up nor written out anew. Whether it may be
+  returned is still decided each time.
+- NIP-77 syncs of busy inboxes run about 2.5 times as fast, and COUNTs
+  of a tag, with their HyperLogLog sketches, about twice as fast. Each
+  event's id, `created_at`, expiration and author are now kept apart from
+  it, in a `headers` file in the database's directory, a row for each
+  event at a place its sequence number gives, which syncs, sketches and
+  `distinct:author` counts read instead of the events. In a database from
+  before, or if the file's lost, the writer files the headers of the
+  events already stored, the newest first, whenever it has nothing else
+  to do; until it's done, those are read as before.
+- New events' signatures are checked many at once: BIP-340 batch
+  verification, on libsecp256k1's own arithmetic, by a few threads that
+  each take every event waiting. A batch that fails is checked a
+  signature at a time, so every verdict is libsecp256k1's. Storing a
+  flood of events takes about a third less CPU, and the batches made are
+  counted in `signature_batches_total` and `signatures_batched_total`.
+- The pubkeys that signed events lately are kept parsed, so checking a
+  signature by a key that signs often, as Concord's plane keys do, skips
+  a tenth of the work.
+- The indexes' new entries are kept in memory, and merged into the
+  database once 1,500,000 are, in order, rather than put in one by one.
+  Storing a flood of events goes about 15% faster on 13% less CPU,
+  writes a fifth as much to disk, and leaves a database file an eighth
+  the size, in a relay using a quarter of the memory. Queries read the
+  entries in memory with those in the database. Each commit's changes
+  are kept beside it in a `filed` table until they're merged, and filed
+  again in memory if the relay stops before then. The writer merges
+  them a slice of about 20,000 at a time between batches of writes, so
+  no write waits on a whole merge: the time it takes is
+  `writer_phase_seconds_total{phase="merge"}`.
+- An event published, with no write policy plugin, goes from the
+  connection to the threads checking signatures, to the writer, and back,
+  without a task of its own, and the OKs of those stored together are
+  sent together: storing a flood of events takes 11% less CPU, and goes
+  8% faster.
+- The search indexer is handed the events the relay stores rather than
+  reading them back from the database, which kept the pages of every one
+  in the relay's memory: 100 MB less after storing 200,000 events. It
+  keeps up on one thread with 16 MB, rather than four with 64, which it
+  takes only to catch up with many events, as when rebuilding.
+- Checkpoints are made every second the relay writes, rather than every
+  10 seconds: a crash of the machine loses at most about a second of
+  writes. Pages LMDB frees can be used again once the next checkpoint is
+  durable, so the database's files grew by about as much as was written
+  in 10 seconds: after storing a flood of events they're 40% smaller, and
+  the relay holds 20% less memory.
+- After each checkpoint the relay unmaps the database's pages it has
+  mapped in. They stay in the page cache, and are read from there again
+  as they're needed; LMDB maps in every page a write copies, so storing
+  events alone left all of them counted in the relay's memory: 740 MB
+  after storing 200,000 events, 410 MB now.
+- Only text that looks like prose has its language and sentiment guessed:
+  three words of letters or more, making up at least half of it. In hex,
+  base64, JSON and identifiers, whatlang found languages, Welsh most of
+  all, often confidently: in recent Dreamith events, the most common after
+  English, all of it misread. It's also a third less work.
+- Kind 21059, Concord's ephemeral gift wraps, is taken for ciphertext, as
+  kind 1059 is: no language or sentiment is guessed of it.
+- A new event for a subscription whose stored events are all sent is sent
+  to it by the thread that matched it, rather than handed to its
+  connection to send: those of an event that 20 subscriptions get are sent
+  without waiting on 20 connections to be woken one after another, on
+  less CPU. Ephemeral events go to live subscriptions as soon as their
+  signatures are checked, without a task of their own.
+- New events go out to live subscriptions just before they're committed,
+  rather than after: a REQ, COUNT, or NIP-77 sync waits for the commit
+  under way, if any, before reading, so none is missed or counted twice.
+- A quiet connection holds no read buffer while it waits, and its queues,
+  of the events of its subscriptions and the answers to those it
+  publishes, hold nothing while they're empty: a connection takes 5 KB of
+  memory rather than 27.
+- WebSocket connections are the relay's own, rather than tungstenite's,
+  through axum: frames are read into one buffer and unmasked in place,
+  and what's sent is framed straight into one buffer, an EVENT message's
+  JSON copied once, then written at once. Queries take 9-16% less CPU,
+  and sending to live subscriptions 4% less.
+- The relay allocates memory with mimalloc rather than the C library's
+  allocator: the release binaries' musl's is slow with many threads.
+  Storing a flood of events goes about 6% faster on 5% less CPU, and
+  queries take 11-15% less.
+- A stored event's text is checked to be UTF-8 only when it's read, not
+  each time the event is, which was about 6% of a query's CPU.
+
 - A write's time is split, in metrics, into reading ahead what storing it
   reads (`write_prefetch_seconds`), waiting in the queue
   (`write_queue_wait_seconds`), and its batch (`write_batch_seconds`). A
@@ -20,13 +122,48 @@ it is tagged.
   events. How many COUNTs were answered this way is
   `counts_shared_total`.
 - Small queries are answered faster: a REQ that reads up to 128 events, a
-  COUNT the database keeps or of up to 128 events, and a NEG-OPEN covering
-  up to 128 events are answered as they arrive, rather than queued for a
-  thread of their own. Looking up an event by id, or the newest of a kind,
+  COUNT the database keeps or that sketches up to 1,024 events' authors,
+  and the messages of a NIP-77 sync covering up to 4,096 events are
+  answered as they arrive, rather than queued for a thread of their own. Looking up an event by id, or the newest of a kind,
   now answers about twice as many requests a second.
 - An event sent again once it's stored is recognized sooner, before
   waiting for a thread to check its signature: about twice as many resent
   events are answered a second.
+- `ditto-relay repack` no longer fails, leaving the old file in place,
+  when the first keys of a table, or all of them, are deleted as it
+  copies it, as the records of removed events often are.
+- The writer, which stores events one after another, spends about 11%
+  less CPU an event, so a relay stores about 10% more events a second.
+  The index entries in memory are kept in order only for `facets`, the
+  one index read by ranges of keys; the tag keys an event is filed under
+  are worked out as it's queued, off the writer; and a tally of each
+  tag key's events since the relay started spares looking them up to
+  decide whether to start its HyperLogLog sketch. So after a restart, a
+  key short of 1,000 events gets its sketch only once 1,000 more come.
+- An event's id is hashed with ring's SHA-256, in assembly, rather than
+  the sha2 crate's Rust: on processors without SHA instructions, as Intel
+  Xeons before Ice Lake are, storing events takes 8% less CPU, and goes
+  6% faster.
+- Merging the index entries kept in memory into the database puts a
+  key's new values in one go, so LMDB finds the key once rather than once
+  a value: about 5% more events stored a second.
+- Events' records are stored by a thread of their own, in a transaction
+  of its own in the records file, as the writer files them in the
+  indexes; it commits as it goes, and the writer's commit waits for the
+  rest. The writer takes 11% less CPU an event, and with many clients
+  sending at once, about 7% more events are stored a second. What's
+  committed is as before: an event's record before its indexes, so a
+  query never finds the one without the other. A record of a batch that
+  then fails may be left past the last event stored, as a crash may
+  leave one; it's written over, or dropped on opening.
+- The search index's writer keeping up has 64 MiB of memory rather than
+  16, so it writes bigger segments, which cost less to merge: storing
+  events takes 4% less CPU, and the relay's memory use is no higher.
+- The filter that rules out deletions keeps each key's bits in one cache
+  line. Its file, `deletions.bloom`, is of another shape, so the first
+  start after upgrading builds it anew from the deletions stored; until
+  it's done, checking whether an event was deleted searches the
+  database.
 
 ## [2.5.1]
 

@@ -195,11 +195,7 @@ pub fn tagged(store: &Store, txn: &Txn, name: &str, value: &[u8], kinds: &[u16])
 
 /// How many stamps an index has under a key.
 fn count(txn: &Txn, db: Db, key: &[u8]) -> Result<u64> {
-    let mut cursor = txn.cursor(db)?;
-    Ok(match cursor.set(key)? {
-        Some(_) => cursor.count()? as u64,
-        None => 0,
-    })
+    Ok(crate::store::count_key(txn, db, key)? as u64)
 }
 
 #[cfg(test)]

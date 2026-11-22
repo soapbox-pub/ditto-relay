@@ -91,6 +91,9 @@ pub struct Metrics {
     pub events_failed: Counter,
     /// Refused by the write policy plugin, but said to be accepted.
     pub events_shadow_rejected: Counter,
+    /// Batches of signatures checked, and the signatures in them.
+    pub signature_batches: Counter,
+    pub signatures_batched: Counter,
     /// Time spent waiting on the write policy plugin.
     pub plugin: Timer,
     /// Time from handing an event to the writer to hearing back.
@@ -142,6 +145,8 @@ pub static METRICS: Metrics = Metrics {
     connections: Gauge::new(),
     events_accepted: Counter::new(),
     events_duplicate: Counter::new(),
+    signature_batches: Counter::new(),
+    signatures_batched: Counter::new(),
     events_rejected: Counter::new(),
     events_failed: Counter::new(),
     events_shadow_rejected: Counter::new(),
@@ -241,16 +246,22 @@ pub enum Phase {
     Purge,
     /// Queueing or cancelling a deletion asked for.
     Queue,
+    /// Filing the headers of events stored before they had them.
+    Headers,
+    /// Merging the index changes kept in memory into LMDB.
+    Merge,
 }
 
 impl Phase {
-    const ALL: [Phase; 6] = [
+    const ALL: [Phase; 8] = [
         Phase::Forget,
         Phase::Expiry,
         Phase::Batch,
         Phase::Turn,
         Phase::Purge,
         Phase::Queue,
+        Phase::Headers,
+        Phase::Merge,
     ];
 
     pub fn name(self) -> &'static str {
@@ -261,6 +272,8 @@ impl Phase {
             Phase::Turn => "turn",
             Phase::Purge => "purge",
             Phase::Queue => "queue",
+            Phase::Headers => "headers",
+            Phase::Merge => "merge",
         }
     }
 }
@@ -521,6 +534,18 @@ pub fn render(store: &Store, search: Option<&SearchIndex>) -> anyhow::Result<Str
                 m.events_shadow_rejected.get() as f64,
             ),
         ],
+    );
+    out.one(
+        "signature_batches_total",
+        "counter",
+        "Batches of new events' signatures checked together.",
+        m.signature_batches.get() as f64,
+    );
+    out.one(
+        "signatures_batched_total",
+        "counter",
+        "New events' signatures checked in those batches.",
+        m.signatures_batched.get() as f64,
     );
     out.timer("plugin_call", "Write policy plugin calls", &m.plugin);
     out.timer("write", "Events handed to the writer", &m.writes);
