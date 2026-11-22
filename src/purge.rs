@@ -450,6 +450,11 @@ impl Purger {
         };
         let start = Instant::now();
         let sweeping = matches!(self.jobs[i].work, Work::Sweep(_));
+        // A sweep walks LMDB's tables: what it removes must be there, not
+        // kept in memory still.
+        if sweeping && store.unmerged() > 0 {
+            store.merge()?;
+        }
         let done = self.chunk_of(store, i, tell)?;
         self.timed(start, sweeping);
         let job = &self.jobs[i];
@@ -1120,6 +1125,7 @@ impl Sweep {
         for &seq in &seqs {
             // Those removed in the first pass are gone by now.
             count += u64::from(txn.del(store.tables.events, &seq.to_ne_bytes(), None)?);
+            store.del_header(&seq.to_ne_bytes());
         }
         removed.extend(&seqs);
         self.pass = match (seqs.last(), seqs.len() < budget) {

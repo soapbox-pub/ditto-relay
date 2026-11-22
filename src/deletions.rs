@@ -30,12 +30,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
-const MAGIC: &[u8; 8] = b"DRRDEL01";
+const MAGIC: &[u8; 8] = b"DRRDEL02";
 const HEADER: usize = 40;
 
 /// Bits set per key. With ten bits a key, about 1% of the keys not in the
 /// filter aren't ruled out.
 const HASHES: u64 = 7;
+
+/// The bits of a block, a cache line: all of a key's are in one, so that
+/// checking one is a single read from memory rather than one a bit, a
+/// little more often ruling out a key it lacks.
+const BLOCK: u64 = 512;
 
 /// Words written to the file at once; runs of zero words are left as holes.
 const CHUNK: usize = 8192;
@@ -54,7 +59,7 @@ impl Filter {
     /// An empty filter of `bits` bits, a power of two. Its memory is only
     /// taken up as keys land on it.
     pub fn new(bits: u64) -> Filter {
-        assert!(bits.is_power_of_two() && bits >= 64);
+        assert!(bits.is_power_of_two() && bits >= BLOCK);
         const { assert!(align_of::<u64>() == align_of::<AtomicU64>()) };
         // Zeroed memory from the allocator is untouched pages, unlike
         // building the atomics one by one.
@@ -77,9 +82,9 @@ impl Filter {
     fn positions(&self, key: &[u8]) -> impl Iterator<Item = usize> {
         let hash = Sha256::digest(key);
         let a = u64::from_le_bytes(hash[..8].try_into().unwrap());
-        let b = u64::from_le_bytes(hash[8..16].try_into().unwrap()) | 1;
-        let mask = self.len() - 1;
-        (0..HASHES).map(move |i| (a.wrapping_add(i.wrapping_mul(b)) & mask) as usize)
+        let b = u64::from_le_bytes(hash[8..16].try_into().unwrap());
+        let block = (a & (self.len() / BLOCK - 1)) * BLOCK;
+        (0..HASHES).map(move |i| (block + ((b >> (9 * i)) & (BLOCK - 1))) as usize)
     }
 
     pub fn add(&self, key: &[u8]) {
@@ -186,6 +191,20 @@ mod tests {
             .filter(|n| filter.rules_out(&n.to_be_bytes()))
             .count();
         assert!(ruled_out > 990, "{ruled_out}");
+    }
+
+    #[test]
+    fn rules_out_most_it_lacks_at_ten_bits_a_key() {
+        let filter = Filter::new(1 << 20);
+        for n in 0..(1u32 << 20) / 10 {
+            filter.add(&n.to_be_bytes());
+        }
+        filter.set_ready();
+        let lacked = 100_000u32;
+        let missed = (0..lacked)
+            .filter(|n| !filter.rules_out(&(n + (1 << 30)).to_be_bytes()))
+            .count();
+        assert!(missed < lacked as usize / 50, "{missed}");
     }
 
     #[test]

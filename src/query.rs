@@ -37,6 +37,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
 
 use secp256k1::Keypair;
 use tokio_util::sync::CancellationToken;
@@ -44,13 +45,15 @@ use tokio_util::sync::CancellationToken;
 use crate::event::KindClass;
 use crate::filter::Filter;
 use crate::hll::{self, Registers};
-use crate::lmdb::{Cursor, Db, Entry, Result, Txn};
+use crate::json_cache::Kept;
+use crate::lmdb::{Db, Result, Txn};
+use crate::memtable::Down;
 use crate::metrics::METRICS;
 use crate::record::EventView;
 use crate::search::SearchIndex;
 use crate::store::{
-    CREATED, MAX_SEQ, STAMP_LEN, Stamp, Store, address, each_stamp, entry_kind, stamp,
-    stamp_created_at, stamp_seq, tag_key, tag_key_kind,
+    CREATED, MAX_SEQ, STAMP_LEN, Stamp, Store, address, count_key, each_stamp, entries_down,
+    entry_kind, keys_from, stamp, stamp_created_at, stamp_seq, tag_key, tag_key_kind,
 };
 
 /// The most author × kind keys a filter may be planned over together, if
@@ -93,7 +96,7 @@ pub struct Results {
     /// Anything below it was visible to the query.
     pub next_seq: u64,
     /// Matching events as JSON, each filter's newest first.
-    pub events: Vec<String>,
+    pub events: Vec<Arc<String>>,
 }
 
 /// Run a REQ's filters. Each one's limit defaults to `default_limit` and is
@@ -115,7 +118,10 @@ pub fn run(
 ) -> anyhow::Result<Results> {
     let txn = store.read()?;
     let next_seq = store.next_seq(&txn)?;
-    let mut seen = HashSet::new();
+    // An event two filters match goes once; one filter finds it once.
+    let mut seen: Option<HashSet<u64, foldhash::fast::RandomState>> =
+        (filters.len() > 1).then(HashSet::default);
+    let mut seen = |seq| seen.as_mut().is_none_or(|seen| seen.insert(seq));
     // Asked twice, an assertion is the same event.
     let mut asserted = HashSet::new();
     let now = crate::event::now();
@@ -129,26 +135,48 @@ pub fn run(
             continue;
         }
         let window = crate::rank::windowed(store, filter);
-        let mut found = find(store, search, &txn, &window, limit, cancel)?;
-        if let Cow::Owned(window) = &window {
-            fill_back(
-                store, search, &txn, filter, window, limit, &mut found, cancel,
-            )?;
-        }
+        let left = match filter.search.is_none() && filter.ids.is_none() {
+            // Found as run_filter would, but taking those kept from there.
+            true => {
+                let plan = plan(store, &txn, filter)?;
+                let (found, examined) =
+                    hits(store, &txn, filter, &plan, limit, MAX_EXAMINED, cancel)?;
+                if examined > MAX_EXAMINED {
+                    METRICS.filters_cut_short.inc();
+                }
+                let found = newest_found(found, limit);
+                let left = limit - found.len().min(limit);
+                for found in found {
+                    if seen(found.seq) {
+                        events.push(found.json(store, &visible)?);
+                    }
+                }
+                left
+            }
+            false => {
+                let mut found = find(store, search, &txn, &window, limit, cancel)?;
+                if let Cow::Owned(window) = &window {
+                    fill_back(
+                        store, search, &txn, filter, window, limit, &mut found, cancel,
+                    )?;
+                }
+                let left = limit - found.len().min(limit);
+                for (seq, view) in found {
+                    if !visible(&view) {
+                        return Err(Restricted.into());
+                    }
+                    if seen(seq) {
+                        events.push(json(store, seq, &view));
+                    }
+                }
+                left
+            }
+        };
         let filter = &*window;
-        let left = limit - found.len().min(limit);
-        for (seq, view) in found {
-            if !visible(&view) {
-                return Err(Restricted.into());
-            }
-            if seen.insert(seq) {
-                events.push(view.to_json());
-            }
-        }
         if let Some(keypair) = keypair {
             for (id, json) in crate::nip85::run(store, &txn, keypair, filter, left, now)? {
                 if asserted.insert(id) {
-                    events.push(json);
+                    events.push(json.into());
                 }
             }
         }
@@ -161,6 +189,11 @@ pub fn run(
 
 /// The most records a REQ answered by [`quick`] may examine.
 pub const QUICK_BUDGET: usize = 128;
+
+/// How many events [`quick_count`] may read the headers of, for a tag's
+/// sketch, and [`quick_ids`] the ids of, for each record a REQ may
+/// examine: a header is a read of memory, a tenth or so of a record.
+pub const COUNT_LOADS_PER_RECORD: usize = 8;
 
 /// Run a REQ's filters as [`run`] does, if that takes examining at most
 /// `budget` records, or `None` if it would take more. A query that small
@@ -223,28 +256,34 @@ pub fn quick(
     // Nothing runs long enough here to need stopping.
     let never = CancellationToken::new();
     let mut left = budget;
-    let mut seen = HashSet::new();
+    let mut seen: Option<HashSet<u64, foldhash::fast::RandomState>> =
+        (plans.len() > 1).then(HashSet::default);
+    let mut seen = |seq| seen.as_mut().is_none_or(|seen| seen.insert(seq));
     let mut events = Vec::new();
     for (filter, limit, plan) in plans {
         let found = match plan {
             None => run_filter(store, &txn, filter, limit, &never)?,
             Some(plan) => {
-                let mut found = Vec::new();
                 // Ties with the last can take it past what was reckoned.
-                let examined = scan(store, &txn, filter, &plan, limit, left, &never, &mut found)?;
+                let (found, examined) = hits(store, &txn, filter, &plan, limit, left, &never)?;
                 if examined > left {
                     return Ok(None);
                 }
                 left -= examined;
-                newest_first(found, limit)
+                for found in newest_found(found, limit) {
+                    if seen(found.seq) {
+                        events.push(found.json(store, &visible)?);
+                    }
+                }
+                continue;
             }
         };
         for (seq, view) in found {
             if !visible(&view) {
                 return Err(Restricted.into());
             }
-            if seen.insert(seq) {
-                events.push(view.to_json());
+            if seen(seq) {
+                events.push(json(store, seq, &view));
             }
         }
     }
@@ -528,17 +567,33 @@ pub fn every_id(
         let plan = plan(store, txn, filter)?;
         let mut seqs = Vec::new();
         walk_up_to(txn, filter, &plan, max, cancel, |seq| seqs.push(seq))?;
-        seqs.sort_unstable();
-        seqs.dedup();
-        store.read_ahead(&seqs);
+        // One key's are in the order of their stamps, as a sync wants them,
+        // and each once: those read from disk are read in order.
+        let read_ahead = !plan.exact || !store.headers_filled();
+        if plan.keys.len() > 1 || read_ahead {
+            seqs.sort_unstable();
+            seqs.dedup();
+        }
+        // Headers are in memory; records may not be.
+        if read_ahead {
+            store.read_ahead(&seqs);
+        }
         METRICS.events_examined.add(seqs.len() as u64);
-        for (i, seq) in seqs.into_iter().enumerate() {
+        let mut briefs = store.briefs(txn)?;
+        for (i, &seq) in seqs.iter().enumerate() {
+            // A key's events are all over the headers: each a wait on
+            // memory, unless asked for ahead.
+            if plan.exact
+                && let Some(&ahead) = seqs.get(i + PREFETCH_AHEAD)
+            {
+                store.prefetch_header(ahead);
+            }
             if i % CANCEL_CHECK == 0 && cancel.is_cancelled() {
                 return Err(Cancelled.into());
             }
             if plan.exact {
-                if let Some(header) = store.header(txn, seq)? {
-                    found.push((header.created_at(), *header.id()));
+                if let Some(brief) = briefs.get(seq)? {
+                    found.push((brief.created_at, brief.id));
                 }
             } else if let Some(view) = store.load(txn, seq)?.filter(|view| filter.matches(view)) {
                 found.push((view.created_at(), *view.id()));
@@ -554,6 +609,9 @@ pub fn every_id(
     }
     Ok(found)
 }
+
+/// How many events ahead [`every_id`] asks for headers to be read.
+const PREFETCH_AHEAD: usize = 16;
 
 /// Newest first; on a tie, the lowest id first (NIP-01). Up to `limit`.
 fn newest_first(mut found: Vec<(u64, EventView<'_>)>, limit: usize) -> Vec<(u64, EventView<'_>)> {
@@ -697,17 +755,12 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
     for (name, values) in &filter.tags {
         // The keys of the kinds each value is filed under, as wanted.
         let mut keys = Vec::new();
-        let mut cursor = txn.cursor(t.tags)?;
         for value in values {
             let prefix = tag_key(name, value, None);
-            let mut entry = cursor.set_range(&prefix)?;
-            while let Some((key, _)) = entry
-                && key.starts_with(&prefix)
-            {
-                if filter.wants_kind(tag_key_kind(key)) {
-                    keys.push(key.to_vec());
+            for key in keys_from(txn, t.tags, &prefix, &prefix)? {
+                if filter.wants_kind(tag_key_kind(&key)) {
+                    keys.push(key);
                 }
-                entry = cursor.next_nodup()?;
             }
         }
         let exact = filter.authors.is_none() && filter.tags.len() == 1 && filter.search.is_none();
@@ -734,15 +787,10 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
             continue;
         };
         let mut keys = Vec::new();
-        let mut cursor = txn.cursor(t.facets)?;
-        let mut entry = cursor.set_range(&start)?;
-        while let Some((key, _)) = entry
-            && key.starts_with(&prefix)
-        {
-            if filter.wants_kind(tag_key_kind(key)) {
-                keys.push(key.to_vec());
+        for key in keys_from(txn, t.facets, &start, &prefix)? {
+            if filter.wants_kind(tag_key_kind(&key)) {
+                keys.push(key);
             }
-            entry = cursor.next_nodup()?;
         }
         candidates.push(Plan {
             db: t.facets,
@@ -786,14 +834,11 @@ fn plan(store: &Store, txn: &Txn, filter: &Filter) -> Result<Plan> {
 
 /// How many entries a plan would walk, at worst. Stops counting at `bound`.
 fn cost(txn: &Txn, plan: &Plan, bound: usize) -> Result<usize> {
-    let mut cursor = txn.cursor(plan.db)?;
     let mut total = 0usize;
     for key in &plan.keys {
-        if cursor.set(key)?.is_some() {
-            total = total.saturating_add(cursor.count()?);
-            if total >= bound {
-                break;
-            }
+        total = total.saturating_add(count_key(txn, plan.db, key)?);
+        if total >= bound {
+            break;
         }
     }
     Ok(total)
@@ -801,7 +846,7 @@ fn cost(txn: &Txn, plan: &Plan, bound: usize) -> Result<usize> {
 
 /// One key's stamps, newest first, of the kinds wanted.
 struct Source<'t, 'p> {
-    cursor: Cursor<'t>,
+    entries: Down<'t>,
     kinds: Option<&'p [u16]>,
 }
 
@@ -813,33 +858,21 @@ impl<'t, 'p> Source<'t, 'p> {
         key: &[u8],
         until: u32,
     ) -> Result<Option<(Stamp, Source<'t, 'p>)>> {
-        let mut cursor = txn.cursor(plan.db)?;
-        let entry = match cursor.get_both_range(key, &stamp(until, MAX_SEQ))? {
-            Some(_) => cursor.prev_dup()?,
-            None => match cursor.set(key)? {
-                Some(_) => cursor.last_dup()?,
-                None => None,
-            },
-        };
+        // Past every entry of that stamp, kinded or not.
+        let from = [&stamp(until, MAX_SEQ)[..], &[0xff; 2]].concat();
         let mut source = Source {
-            cursor,
+            entries: entries_down(txn, plan.db, key, &from)?,
             kinds: plan.kinds.as_deref(),
         };
-        Ok(source.wanted(entry)?.map(|stamp| (stamp, source)))
+        Ok(source.next()?.map(|stamp| (stamp, source)))
     }
 
+    /// The next stamp, newest first, of a kind wanted.
     fn next(&mut self) -> Result<Option<Stamp>> {
-        let entry = self.cursor.prev_dup()?;
-        self.wanted(entry)
-    }
-
-    /// The stamp of `entry`, or the newest before it, of a kind wanted.
-    fn wanted(&mut self, mut entry: Option<Entry<'t>>) -> Result<Option<Stamp>> {
-        while let Some((_, value)) = entry {
-            if wants(self.kinds, value) {
+        while let Some(value) = self.entries.next()? {
+            if wants(self.kinds, &value) {
                 return Ok(value[..STAMP_LEN].try_into().ok());
             }
-            entry = self.cursor.prev_dup()?;
         }
         Ok(None)
     }
@@ -859,6 +892,151 @@ fn scan<'t>(
     cancel: &CancellationToken,
     found: &mut Vec<(u64, EventView<'t>)>,
 ) -> Result<usize> {
+    let mut loader = store.loader(txn)?;
+    let distinct = filter.search.as_ref().is_some_and(|s| s.distinct_author);
+    let mut authors = HashSet::new();
+    walk_index(
+        txn,
+        filter,
+        plan,
+        limit,
+        max_examined,
+        cancel,
+        found,
+        |seq| {
+            let Some(view) = loader.load(seq)? else {
+                return Ok(None);
+            };
+            let wanted = (plan.exact || filter.matches(&view))
+                && (!distinct || authors.insert(*view.pubkey()));
+            Ok(wanted.then_some(view))
+        },
+    )
+}
+
+/// The JSON of an event loaded, [kept](Store::json) if it's written out.
+fn json(store: &Store, seq: u64, view: &EventView) -> Arc<String> {
+    match store.json.get(seq) {
+        Some(kept) => kept.json.clone(),
+        None => view.to_json().into(),
+    }
+}
+
+/// An event a query found, as [`hits`] finds them.
+struct Found<'t> {
+    seq: u64,
+    created_at: u32,
+    id: [u8; 32],
+    hit: Hit<'t>,
+}
+
+enum Hit<'t> {
+    /// Loaded from the store, with its record.
+    Stored(&'t [u8], EventView<'t>),
+    /// [Kept](Store::json) from a query before.
+    Kept(Arc<Kept>),
+}
+
+impl Found<'_> {
+    /// The event, for the connection to check it may see it, and its JSON.
+    fn json(
+        self,
+        store: &Store,
+        visible: &impl Fn(&EventView) -> bool,
+    ) -> std::result::Result<Arc<String>, Restricted> {
+        let kept = match self.hit {
+            Hit::Stored(record, view) => {
+                if !visible(&view) {
+                    return Err(Restricted);
+                }
+                return Ok(store
+                    .json
+                    .keep(self.seq, record, view.to_json())
+                    .json
+                    .clone());
+            }
+            Hit::Kept(kept) => kept,
+        };
+        let view = EventView::new(&kept.record).expect("a stored record");
+        match visible(&view) {
+            true => Ok(kept.json.clone()),
+            false => Err(Restricted),
+        }
+    }
+}
+
+/// Find a plan's newest matches as [`scan`] does, but take those [kept]
+/// from queries before from there, rather than looking them up in the
+/// store. Whether each is returned is decided the same either way.
+///
+/// [kept]: Store::json
+#[allow(clippy::too_many_arguments)]
+fn hits<'t>(
+    store: &Store,
+    txn: &'t Txn,
+    filter: &Filter,
+    plan: &Plan,
+    limit: usize,
+    max_examined: usize,
+    cancel: &CancellationToken,
+) -> Result<(Vec<Found<'t>>, usize)> {
+    let mut loader = store.loader(txn)?;
+    let now = crate::event::now();
+    // The limit's worth, and a few tied with the last.
+    let mut found = Vec::with_capacity(limit.min(MAX_EXAMINED) + 8);
+    let examined = walk_index(
+        txn,
+        filter,
+        plan,
+        limit,
+        max_examined,
+        cancel,
+        &mut found,
+        |seq| {
+            let wanted = |view: &EventView| plan.exact || filter.matches(view);
+            if let Some(kept) = store.json.get(seq) {
+                let view = EventView::new(&kept.record).expect("a stored record");
+                if view.is_expired(now) || loader.hides(seq, &view) || !wanted(&view) {
+                    return Ok(None);
+                }
+                let (created_at, id) = (view.created_at(), *view.id());
+                return Ok(Some(Found {
+                    seq,
+                    created_at,
+                    id,
+                    hit: Hit::Kept(kept),
+                }));
+            }
+            Ok(loader
+                .load_record(seq)?
+                .filter(|(_, view)| wanted(view))
+                .map(|(record, view)| Found {
+                    seq,
+                    created_at: view.created_at(),
+                    id: *view.id(),
+                    hit: Hit::Stored(record, view),
+                }))
+        },
+    )?;
+    let found = found.into_iter().map(|(_, found)| found).collect();
+    Ok((found, examined))
+}
+
+/// Walk a plan's index entries newest first, from `filter.until` to
+/// `filter.since`, handing each event's seq to `take` and keeping what it
+/// returns, until the limit, ties with the last kept included, or
+/// `max_examined`. Returns how many it examined, as [`scan`] does.
+#[allow(clippy::too_many_arguments)]
+fn walk_index<T>(
+    txn: &Txn,
+    filter: &Filter,
+    plan: &Plan,
+    limit: usize,
+    max_examined: usize,
+    cancel: &CancellationToken,
+    found: &mut Vec<(u64, T)>,
+    mut take: impl FnMut(u64) -> Result<Option<T>>,
+) -> Result<usize> {
     let mut sources = Vec::new();
     let mut heap = BinaryHeap::new();
     for key in &plan.keys {
@@ -868,9 +1046,10 @@ fn scan<'t>(
         }
     }
 
-    let distinct = filter.search.as_ref().is_some_and(|s| s.distinct_author);
-    let mut authors = HashSet::new();
     let mut last = None;
+    // When the last kept was made: its entry's, as an event's entries are
+    // stamped with it.
+    let mut last_kept = None;
     let mut examined = 0;
     while let Some((stamp, i)) = heap.pop() {
         if let Some(next) = sources[i].next()? {
@@ -888,10 +1067,7 @@ fn scan<'t>(
         last = Some(stamp);
         // Past the limit, keep going only through a tie with the last one.
         if found.len() >= limit
-            && (found.len() >= limit + MAX_TIES
-                || found
-                    .last()
-                    .is_some_and(|(_, v)| created_at < v.created_at()))
+            && (found.len() >= limit + MAX_TIES || last_kept.is_some_and(|at| created_at < at))
         {
             break;
         }
@@ -904,17 +1080,26 @@ fn scan<'t>(
         }
 
         let seq = stamp_seq(&stamp);
-        let Some(view) = store.load(txn, seq)? else {
-            continue;
-        };
-        if (plan.exact || filter.matches(&view)) && (!distinct || authors.insert(*view.pubkey())) {
-            found.push((seq, view));
+        if let Some(kept) = take(seq)? {
+            found.push((seq, kept));
+            last_kept = Some(created_at);
         }
     }
     METRICS
         .events_examined
         .add(examined.min(max_examined) as u64);
     Ok(examined)
+}
+
+/// Found events newest first, ties lowest id first, as many as `limit`.
+fn newest_found(mut found: Vec<Found<'_>>, limit: usize) -> Vec<Found<'_>> {
+    found.sort_unstable_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    found.truncate(limit);
+    found
 }
 
 /// What a NIP-45 count found.
@@ -987,7 +1172,18 @@ pub fn quick_ids(
     let entries = match &filter.ids {
         Some(ids) => ids.len(),
         None if filter.never => 0,
-        None => cost(&txn, &plan(store, &txn, filter)?, budget.saturating_add(1))?,
+        None => {
+            let plan = plan(store, &txn, filter)?;
+            // What an exact plan finds, every_id reads the headers of.
+            let budget = match plan.exact && store.headers_filled() {
+                true => budget * COUNT_LOADS_PER_RECORD,
+                false => budget,
+            };
+            match cost(&txn, &plan, budget.saturating_add(1))? {
+                entries if entries > budget => return Ok(None),
+                _ => 0,
+            }
+        }
     };
     if entries > budget {
         return Ok(None);
@@ -1033,11 +1229,10 @@ pub fn quick_count(
         if plan.db != store.tables.tags || !unbounded {
             return Ok(None);
         }
-        let mut cursor = txn.cursor(plan.db)?;
         let mut loads = 0usize;
         for key in &plan.keys {
-            if txn.get(store.tables.hll, key)?.is_none() && cursor.set(key)?.is_some() {
-                loads = loads.saturating_add(cursor.count()?);
+            if txn.get(store.tables.hll, key)?.is_none() {
+                loads = loads.saturating_add(count_key(&txn, plan.db, key)?);
                 if loads > budget {
                     return Ok(None);
                 }
@@ -1047,12 +1242,9 @@ pub fn quick_count(
     let never = CancellationToken::new();
     let count = match unbounded {
         true => {
-            let mut cursor = txn.cursor(plan.db)?;
             let mut total = 0;
             for key in &plan.keys {
-                if cursor.set(key)?.is_some() {
-                    total += cursor.count()? as u64;
-                }
+                total += count_key(&txn, plan.db, key)? as u64;
             }
             total
         }
@@ -1129,12 +1321,9 @@ fn count_unless_cancelled(
     // LMDB's counts are of every kind.
     let unbounded = filter.since == 0 && filter.until == u32::MAX && plan.kinds.is_none();
     let count = if plan.disjoint && unbounded {
-        let mut cursor = txn.cursor(plan.db)?;
         let mut total = 0;
         for key in &plan.keys {
-            if cursor.set(key)?.is_some() {
-                total += cursor.count()? as u64;
-            }
+            total += count_key(&txn, plan.db, key)? as u64;
         }
         total
     } else if plan.disjoint {
@@ -1293,7 +1482,9 @@ fn count_authors(
     }
     let mut seqs: Vec<u64> = seqs.into_iter().collect();
     seqs.sort_unstable();
-    store.read_ahead(&seqs);
+    if !store.headers_filled() {
+        store.read_ahead(&seqs);
+    }
     METRICS.events_examined.add(seqs.len() as u64);
 
     // NIP-45 sketches a single filter's authors, which these all are.
@@ -1303,17 +1494,18 @@ fn count_authors(
     };
     let mut registers = [0; hll::REGISTERS];
     let mut authors = HashSet::new();
+    let mut briefs = store.briefs(txn)?;
     for (i, &seq) in seqs.iter().enumerate() {
         if i % CANCEL_CHECK == 0 && cancel.is_cancelled() {
             return Err(Cancelled.into());
         }
-        let Some(header) = store.header(txn, seq)? else {
+        let Some(brief) = briefs.get(seq)? else {
             continue;
         };
-        if authors.insert(*header.pubkey())
+        if authors.insert(brief.pubkey)
             && let Some(offset) = offset
         {
-            hll::add(&mut registers, offset, header.pubkey());
+            hll::add(&mut registers, offset, &brief.pubkey);
         }
     }
     Ok(Count {
@@ -1484,10 +1676,28 @@ mod tests {
         );
         let since = parsed(&[json!({"kinds": [1], "since": 100})]);
         assert!(quick_count(&store, &since, QUICK_BUDGET).unwrap().is_none());
+        // Ids are read from headers, eight to a record of the budget.
         assert!(
-            quick_ids(&store, &all[0], 1000, |_| true, QUICK_BUDGET)
-                .unwrap()
-                .is_none()
+            quick_ids(
+                &store,
+                &all[0],
+                1000,
+                |_| true,
+                201 / COUNT_LOADS_PER_RECORD
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            quick_ids(
+                &store,
+                &all[0],
+                1000,
+                |_| true,
+                201 / COUNT_LOADS_PER_RECORD + 1
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
@@ -2022,6 +2232,50 @@ mod tests {
         store.expire(&mut txn, now, 100).unwrap();
         txn.commit().unwrap();
         assert_eq!(count_of(&store, json!({"kinds": [1]})).count, 1);
+    }
+
+    /// Events kept from a query before are returned only as loading them
+    /// would be: not once a deletion hides them, nor to a connection that
+    /// may not see them.
+    #[test]
+    fn decides_on_kept_events_as_on_stored_ones() {
+        let (_dir, store) = open();
+        let notes: Vec<Event> = (0..5).map(|i| signed(1, 100 + i, 1, vec![], "")).collect();
+        for note in &notes {
+            put(&store, note);
+        }
+        let dm = signed(1, 50, 4, vec![], "");
+        put(&store, &dm);
+        let all = ids(&store, &[json!({"kinds": [1, 4]})], 100);
+        assert_eq!(all.len(), 6);
+        assert!(store.json.get(1).is_some());
+        assert_eq!(ids(&store, &[json!({"kinds": [1, 4]})], 100), all);
+
+        // Hidden as it's stored, removed only later.
+        let deletion = signed(1, 300, 5, vec![vec!["e", &notes[2].id]], "");
+        let record = crate::record::encode(&deletion);
+        store
+            .write_batch([record.as_slice()], crate::event::now())
+            .unwrap();
+        let left = ids(&store, &[json!({"kinds": [1, 4]})], 100);
+        assert_eq!(left.len(), 5);
+        assert!(!left.contains(&notes[2].id));
+
+        let filters = parsed(&[json!({"kinds": [1, 4]})]);
+        let no_dms = |view: &EventView| view.kind() != 4;
+        let ran = run(
+            &store,
+            None,
+            None,
+            &filters,
+            100,
+            100,
+            no_dms,
+            &Default::default(),
+        );
+        assert!(ran.err().unwrap().is::<Restricted>());
+        let quickly = quick(&store, None, &filters, 100, 100, no_dms, QUICK_BUDGET);
+        assert!(quickly.err().unwrap().is::<Restricted>());
     }
 
     #[test]

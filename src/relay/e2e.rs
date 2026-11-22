@@ -298,7 +298,7 @@ async fn serves_wss() {
 async fn takes_messages_bigger_than_its_read_buffer() {
     let relay = Relay::start().await;
     let mut client = relay.connect().await;
-    let big = note(1, &"long post ".repeat(10 * super::READ_BUFFER / 8));
+    let big = note(1, &"long post ".repeat(10 * super::ws::READ_AHEAD / 8));
     assert_eq!(client.publish(&big).await, (true, String::new()));
     // And one small after, from what's left in the buffer.
     let small = note(2, "short");

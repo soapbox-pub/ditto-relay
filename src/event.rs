@@ -1,9 +1,10 @@
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// A NIP-01 event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,16 +71,34 @@ impl Event {
 
     /// The sha256 of the NIP-01 serialization.
     pub fn compute_id(&self) -> [u8; 32] {
-        let serialized = serde_json::to_vec(&(
-            0,
-            &self.pubkey,
-            self.created_at,
-            self.kind,
-            &self.tags,
-            &self.content,
-        ))
+        // Hashed as it's serialized, rather than serialized, then hashed.
+        // By ring, whose assembly is about twice as quick as the sha2
+        // crate's Rust on processors without SHA instructions, and every
+        // stored event's id is hashed.
+        struct Hashing(ring::digest::Context);
+        impl std::io::Write for Hashing {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut hashing = Hashing(ring::digest::Context::new(&ring::digest::SHA256));
+        serde_json::to_writer(
+            &mut hashing,
+            &(
+                0,
+                &self.pubkey,
+                self.created_at,
+                self.kind,
+                &self.tags,
+                &self.content,
+            ),
+        )
         .expect("event serialization cannot fail");
-        Sha256::digest(&serialized).into()
+        hashing.0.finish().as_ref().try_into().expect("32 bytes")
     }
 
     /// An event signed by `keypair`.
@@ -112,8 +131,14 @@ impl Event {
 
     /// Check the id and signature. The returned error is suitable for an `OK` message.
     pub fn verify(&self) -> Result<(), String> {
+        self.signed()?.check()
+    }
+
+    /// Check everything but the signature itself, as [`verify`](Self::verify)
+    /// does, and what checking it takes.
+    pub fn signed(&self) -> Result<Signed, String> {
         let id = decode_hex::<32>(&self.id).ok_or("invalid: id must be 64 lowercase hex chars")?;
-        let pubkey = decode_hex::<32>(&self.pubkey)
+        let x = decode_hex::<32>(&self.pubkey)
             .ok_or("invalid: pubkey must be 64 lowercase hex chars")?;
         let sig =
             decode_hex::<64>(&self.sig).ok_or("invalid: sig must be 128 lowercase hex chars")?;
@@ -126,12 +151,56 @@ impl Event {
             return Err("invalid: event id does not match".into());
         }
 
-        let pubkey = XOnlyPublicKey::from_byte_array(pubkey)
-            .map_err(|_| "invalid: bad pubkey".to_string())?;
-        Signature::from_byte_array(sig)
-            .verify(&id, &pubkey)
+        let pubkey = parsed(x).ok_or("invalid: bad pubkey")?;
+        Ok(Signed { id, x, pubkey, sig })
+    }
+}
+
+/// An event's id, which matches it, its pubkey, which is one, and its
+/// signature, which is to be checked: see [`crate::batch`] for many.
+#[derive(Debug, Clone)]
+pub struct Signed {
+    pub id: [u8; 32],
+    /// The pubkey as the event has it.
+    pub x: [u8; 32],
+    pub pubkey: XOnlyPublicKey,
+    pub sig: [u8; 64],
+}
+
+impl Signed {
+    /// Whether the signature is good, as an `OK` message's error if not.
+    pub fn check(&self) -> Result<(), String> {
+        Signature::from_byte_array(self.sig)
+            .verify(&self.id, &self.pubkey)
             .map_err(|_| "invalid: bad signature".to_string())
     }
+}
+
+/// Pubkeys parsed lately, as parsing one finds its point, which takes a
+/// tenth of checking a signature, and some sign event after event: the
+/// keys of Concord's planes sign most of its gift wraps. Split by the first
+/// byte, each part forgotten whole once it's full.
+static PARSED: LazyLock<Box<[Parsed]>> =
+    LazyLock::new(|| (0..PARSED_SHARDS).map(|_| Mutex::default()).collect());
+
+type Parsed = Mutex<HashMap<[u8; 32], XOnlyPublicKey>>;
+
+const PARSED_SHARDS: usize = 16;
+const PARSED_PER_SHARD: usize = 1024;
+
+/// The point of an x-only pubkey, or None if it isn't one.
+fn parsed(pubkey: [u8; 32]) -> Option<XOnlyPublicKey> {
+    let shard = &PARSED[usize::from(pubkey[0]) % PARSED_SHARDS];
+    if let Some(parsed) = shard.lock().expect("unpoisoned").get(&pubkey) {
+        return Some(*parsed);
+    }
+    let parsed = XOnlyPublicKey::from_byte_array(pubkey).ok()?;
+    let mut shard = shard.lock().expect("unpoisoned");
+    if shard.len() >= PARSED_PER_SHARD {
+        shard.clear();
+    }
+    shard.insert(pubkey, parsed);
+    Some(parsed)
 }
 
 /// The current Unix time, as event timestamps are stored.
@@ -144,12 +213,68 @@ pub fn now() -> u32 {
 
 /// Decode a lowercase hex string of exactly `N` bytes.
 pub fn decode_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
-    if s.len() != N * 2 || !is_lower_hex(s) {
+    let (pairs, []) = s.as_bytes().as_chunks::<2>() else {
+        return None;
+    };
+    if pairs.len() != N {
         return None;
     }
     let mut out = [0u8; N];
-    hex::decode_to_slice(s, &mut out).ok()?;
-    Some(out)
+    let mut bad = 0;
+    for (byte, &[high, low]) in out.iter_mut().zip(pairs) {
+        let (high, low) = (LOWER_HEX[usize::from(high)], LOWER_HEX[usize::from(low)]);
+        bad |= high | low;
+        *byte = high << 4 | low & 0xf;
+    }
+    (bad & 0xf0 == 0).then_some(out)
+}
+
+/// Each byte's value as a lowercase hex digit, or 0xff if it isn't one.
+const LOWER_HEX: [u8; 256] = {
+    let mut values = [0xff; 256];
+    let mut i = 0;
+    while i < 10 {
+        values[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 6 {
+        values[b'a' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    values
+};
+
+/// Hex digits, of either case, as the bytes they spell, if they do.
+pub fn decode_hex_vec(s: &str) -> Option<Vec<u8>> {
+    const BAD: u8 = 0xff;
+    const VALUES: [u8; 256] = {
+        let mut values = [BAD; 256];
+        let mut i = 0;
+        while i < 10 {
+            values[b'0' as usize + i] = i as u8;
+            i += 1;
+        }
+        let mut i = 0;
+        while i < 6 {
+            values[b'a' as usize + i] = 10 + i as u8;
+            values[b'A' as usize + i] = 10 + i as u8;
+            i += 1;
+        }
+        values
+    };
+    let (pairs, rest) = s.as_bytes().as_chunks::<2>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pairs.len());
+    let mut bad = 0;
+    for &[high, low] in pairs {
+        let (high, low) = (VALUES[usize::from(high)], VALUES[usize::from(low)]);
+        bad |= high | low;
+        out.push(high << 4 | low & 0xf);
+    }
+    (bad & 0xf0 == 0).then_some(out)
 }
 
 /// Whether `s` is exactly 64 lowercase hex digits: an id or a pubkey.
@@ -165,6 +290,38 @@ fn is_lower_hex(s: &str) -> bool {
 pub mod tests {
     use super::*;
     use secp256k1::Keypair;
+
+    #[test]
+    fn decodes_hex_as_the_hex_crate_does() {
+        for s in [
+            "",
+            "00",
+            "0aFf",
+            "abc",
+            "zz",
+            "0g",
+            "ÿÿ",
+            "0123456789abcdefABCDEF",
+        ] {
+            assert_eq!(decode_hex_vec(s), hex::decode(s).ok(), "{s:?}");
+        }
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(decode_hex_vec(&hex::encode(&bytes)), Some(bytes.clone()));
+        assert_eq!(
+            decode_hex_vec(&hex::encode_upper(&bytes)),
+            Some(bytes.clone())
+        );
+        // Fixed lengths are lowercase only, as ids, pubkeys and sigs are.
+        assert_eq!(decode_hex::<2>("0aff"), Some([0x0a, 0xff]));
+        for s in ["0AFF", "0aff00", "0af", "0agf", "", "ÿÿ"] {
+            assert_eq!(decode_hex::<2>(s), None, "{s:?}");
+        }
+        let encoded = hex::encode(&bytes[..32]);
+        assert_eq!(
+            decode_hex::<32>(&encoded).map(|b| b.to_vec()),
+            Some(bytes[..32].to_vec())
+        );
+    }
 
     /// Build a signed event with a deterministic key derived from `seed`.
     pub fn signed(
@@ -258,6 +415,33 @@ pub mod tests {
             "hello\n\"world\"",
         );
         assert_eq!(ev.verify(), Ok(()));
+    }
+
+    /// A pubkey parsed before checks signatures as one parsed anew; one
+    /// that isn't a point is refused every time.
+    #[test]
+    fn checks_alike_with_pubkeys_parsed_before() {
+        let ev = signed(1, 1700000000, 1, vec![], "hello");
+        assert_eq!(ev.verify(), Ok(()));
+        assert_eq!(ev.verify(), Ok(()));
+        let mut forged = signed(1, 1700000001, 1, vec![], "hello");
+        forged.sig = ev.sig.clone();
+        assert_eq!(forged.verify(), Err("invalid: bad signature".into()));
+
+        let x = (1..=255u8)
+            .map(|b| {
+                let mut x = [0; 32];
+                x[31] = b;
+                x
+            })
+            .find(|x| XOnlyPublicKey::from_byte_array(*x).is_err())
+            .unwrap();
+        let mut off = ev.clone();
+        off.pubkey = hex::encode(x);
+        off.id = hex::encode(off.compute_id());
+        for _ in 0..2 {
+            assert_eq!(off.verify(), Err("invalid: bad pubkey".into()));
+        }
     }
 
     #[test]

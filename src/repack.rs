@@ -409,6 +409,7 @@ fn swap(
                 drop(env.replace(which, old));
                 // The checkpoint saved may be the copy's: one of the old file.
                 let checkpointed = checkpoint::begin(env).and_then(|metas| {
+                    crate::store::sync_headers(store.headers())?;
                     checkpoint::finish(env, store.dir(), &store.files(), store.boot_id(), &metas)
                 });
                 if let Err(err) = checkpointed {
@@ -546,7 +547,7 @@ mod tests {
             writing.join().unwrap();
             assert!(
                 said.iter().any(|line| line.starts_with("caught up")),
-                "{said:?}"
+                "{said:?}: {repacked:?}"
             );
             (repacked.unwrap(), during)
         });
@@ -648,6 +649,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = filled(dir.path());
         let old = dir.path().join(OLD_DIR);
+        store.merge().unwrap();
         let txn = store.read().unwrap();
         let held = everything(&store);
         repack(&store, false, 2, &mut |_| {}).unwrap();

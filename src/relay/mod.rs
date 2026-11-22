@@ -5,18 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use futures_util::stream::SplitSink;
-use futures_util::{SinkExt, StreamExt};
 use secp256k1::Keypair;
 use serde::Serialize;
+use serde::de::IgnoredAny;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -37,9 +34,14 @@ use crate::store::{Outcome, Store, Writer};
 use crate::{key, landing};
 use counts::Counts;
 use monitors::{ConnId, Hub, Link, Live, Outbound};
+use preparers::Preparers;
+use queue::Queue;
 
 mod counts;
 mod monitors;
+mod preparers;
+mod queue;
+mod ws;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -63,9 +65,8 @@ pub struct AppState {
     connections: TaskTracker,
     /// Decides which events to take, if there is one.
     plugin: Option<Plugin>,
-    /// A place per core for checking signatures, which keeps a flood of
-    /// events from taking over the blocking pool.
-    verifiers: Arc<Semaphore>,
+    /// The threads that ready events to store.
+    preparers: Arc<Preparers>,
     /// A place per core for queries. A REQ or COUNT waits its turn, rather
     /// than being refused, when every core is busy.
     queries: Arc<Semaphore>,
@@ -109,7 +110,10 @@ impl AppState {
         config: Config,
         keypair: Keypair,
         store: Arc<Store>,
-        search: Option<(Arc<SearchIndex>, std::sync::mpsc::Sender<Vec<u64>>)>,
+        search: Option<(
+            Arc<SearchIndex>,
+            std::sync::mpsc::Sender<crate::store::Written>,
+        )>,
         onion: Option<String>,
     ) -> Self {
         let (search, indexer) = search.unzip();
@@ -141,6 +145,7 @@ impl AppState {
                     .collect(),
             );
         };
+        let writer = Writer::spawn(store.clone(), indexer, stored);
         Self {
             plugin,
             urls,
@@ -150,14 +155,14 @@ impl AppState {
             access: Arc::new(Access::new(&config)),
             config: Arc::new(config),
             keypair,
-            writer: Writer::spawn(store.clone(), indexer, stored),
+            writer,
+            preparers: Arc::new(Preparers::new(cores())),
             store,
             search,
             hub,
             next_conn: Arc::new(AtomicU64::new(1)),
             shutdown: CancellationToken::new(),
             connections: TaskTracker::new(),
-            verifiers: Arc::new(Semaphore::new(cores())),
             queries: Arc::new(Semaphore::new(cores())),
             counts: Counts::default(),
             quick_budget: query::QUICK_BUDGET,
@@ -205,7 +210,7 @@ pub fn router(state: AppState) -> Router {
         .route("/favicon.ico", asset("image/x-icon", landing::FAVICON))
         .route("/icon.png", asset("image/png", landing::ICON))
         .route("/banner.jpg", asset("image/jpeg", landing::BANNER))
-        .with_state(state)
+        .with_state(Arc::new(state))
 }
 
 /// What serves clients that reach the relay at its onion, which have no
@@ -246,17 +251,11 @@ const CORS: [(header::HeaderName, &str); 3] = [
     (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"),
 ];
 
-/// How much of a connection's read buffer is filled at a time. tungstenite
-/// zeroes all of it before every read, and messages are mostly a few hundred
-/// bytes: at its default of 128 KiB, that was a twentieth of what the relay
-/// did. A bigger frame gets room of its own.
-const READ_BUFFER: usize = 8 << 10;
-
 async fn root(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     via: Via,
     headers: HeaderMap,
-    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    ws: Result<ws::Upgrade, axum::http::StatusCode>,
 ) -> Response {
     if let Ok(ws) = ws {
         let max = state.config.max_message_size;
@@ -265,15 +264,10 @@ async fn root(
             Via::Socket(peer) => Peer::Ip(client_ip(&state.config, &headers, peer)),
             Via::Tor => Peer::Tor,
         };
-        return ws
-            .max_message_size(max)
-            .max_frame_size(max)
-            .read_buffer_size(READ_BUFFER)
-            .on_upgrade(move |socket| {
-                let connections = state.connections.clone();
-                connections.track_future(Connection::run(socket, state, peer))
-            })
-            .into_response();
+        return ws.on_upgrade(max, move |reader, writer| {
+            let connections = state.connections.clone();
+            connections.track_future(Connection::run(reader, writer, state, peer))
+        });
     }
 
     let pages = match via {
@@ -410,6 +404,10 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// or otherwise, has gone without closing, and is dropped. Kept well under
 /// the 60 seconds a reverse proxy like nginx waits on a quiet connection
 /// before closing it.
+/// The longest message parsed on the connection's task, rather than on the
+/// blocking pool.
+const PARSE_HERE: usize = 64 * 1024;
+
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Live events waiting to go out to one client. One that falls this far
@@ -425,6 +423,11 @@ const MAX_PENDING: usize = OUTBOUND;
 /// only the connection sending it.
 const MAX_PUBLISHING: usize = 64;
 
+/// How many events a sync may cover for its messages to be answered on the
+/// connection's thread, for each record a REQ answered there may examine:
+/// an event is an id, summed into fingerprints.
+const SYNC_ITEMS_PER_RECORD: usize = 32;
+
 /// How an event a connection published was answered, once it's been
 /// verified, judged, and stored.
 struct Published {
@@ -435,13 +438,50 @@ struct Published {
     shadow: bool,
 }
 
+/// An event the connection published, stored without a task of its own,
+/// to be answered to it: with an error, if it's dropped unanswered, as by
+/// a thread that panicked.
+struct Unanswered {
+    id: Option<String>,
+    answers: Arc<Queue<Published>>,
+}
+
+impl Unanswered {
+    fn id(&self) -> &str {
+        self.id.as_deref().unwrap_or_default()
+    }
+
+    fn answer(mut self, (accepted, msg): (bool, Cow<'static, str>)) {
+        let id = self.id.take().unwrap_or_default();
+        self.answers.push(Published {
+            id,
+            accepted,
+            msg,
+            shadow: false,
+        });
+    }
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.answers.push(Published {
+                id,
+                accepted: false,
+                msg: "error: failed to store event".into(),
+                shadow: false,
+            });
+        }
+    }
+}
+
 struct Subscription {
     /// This REQ's own name: a later REQ of the same id gets a new one, so
     /// results meant for the one it replaced can be told apart.
     name: Arc<str>,
     /// Live events that arrived while the query ran, by sequence number,
     /// held until its EOSE. None once it's sent.
-    pending: Option<Vec<(Option<u64>, Arc<str>)>>,
+    pending: Option<Vec<(Option<u64>, Arc<String>)>>,
     /// Stored events below this sequence number were visible to the
     /// initial query, so they've been sent already (or didn't match).
     floor: u64,
@@ -519,7 +559,8 @@ async fn run_query<T: Send + 'static>(
 }
 
 struct Connection {
-    state: AppState,
+    /// Shared with every other: a connection's own copy was 320 bytes.
+    state: Arc<AppState>,
     id: ConnId,
     /// By subscription id.
     subs: HashMap<String, Subscription>,
@@ -528,13 +569,23 @@ struct Connection {
     /// Stops every query of the connection's once it's gone, or the relay
     /// is shutting down.
     cancel: CancellationToken,
-    sink: SplitSink<WebSocket, Message>,
+    sink: ws::Writer,
     peer: Peer,
     /// What this connection signs to authenticate (NIP-42), once it's
     /// been asked to: when it's refused something for want of it.
     challenge: Option<String>,
     /// The pubkeys the connection has authenticated as.
     authed: Authed,
+    /// Whether what's sent waits in the sink to be flushed with more.
+    corked: bool,
+    /// What the connection's closed with: normally, or as it broke the
+    /// protocol.
+    close_code: u16,
+    /// Where the events it publishes are answered, when they're stored
+    /// without a task of their own: see [`Self::publish`].
+    answers: Arc<Queue<Published>>,
+    /// How many of those are being stored.
+    in_flight: usize,
 }
 
 /// The connection should be torn down.
@@ -547,11 +598,10 @@ enum Disconnect {
 }
 
 impl Connection {
-    async fn run(socket: WebSocket, state: AppState, peer: Peer) {
+    async fn run(mut stream: ws::Reader, sink: ws::Writer, state: Arc<AppState>, peer: Peer) {
         let _connected = Connected::new();
-        let (sink, mut stream) = socket.split();
         let id = state.next_conn.fetch_add(1, Ordering::Relaxed);
-        let (link, mut outbound, overflow) = Link::new(OUTBOUND);
+        let (link, outbound) = Link::new(OUTBOUND, Some(sink.direct()));
         state.hub.connect(id, link);
         let start = tokio::time::Instant::now() + PING_INTERVAL;
         let mut ping = tokio::time::interval_at(start, PING_INTERVAL);
@@ -560,6 +610,8 @@ impl Connection {
         // Events being stored apart from the loop, so a slow write holds up
         // only its own OK, not the connection's queries and live events.
         let mut publishing = JoinSet::new();
+        let answers = Queue::new();
+        let answered = answers.clone();
         let shutdown = state.shutdown.clone();
         let mut conn = Connection {
             cancel: shutdown.child_token(),
@@ -571,37 +623,56 @@ impl Connection {
             peer,
             challenge: None,
             authed: Authed::new(),
+            corked: false,
+            close_code: 1000,
+            answers,
+            in_flight: 0,
         };
 
         loop {
             let result = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = overflow.cancelled() => {
-                    tracing::debug!("dropping a client that fell too far behind");
-                    METRICS.dropped_behind.inc();
-                    break;
-                }
                 _ = ping.tick() => {
                     // One waiting on its own events to be stored isn't silent.
-                    if heard.elapsed() > 2 * PING_INTERVAL && publishing.is_empty() {
+                    if heard.elapsed() > 2 * PING_INTERVAL && publishing.is_empty() && conn.in_flight == 0 {
                         tracing::debug!("dropping a client that went silent");
                         METRICS.dropped_silent.inc();
                         break;
                     }
-                    write_within(conn.sink.send(Message::Ping(Default::default()))).await
+                    conn.sink.ping();
+                    write_within(conn.sink.flush()).await
                 }
-                msg = stream.next(), if publishing.len() < MAX_PUBLISHING => {
+                msg = stream.next(), if publishing.len() + conn.in_flight < MAX_PUBLISHING => {
                     heard = Instant::now();
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            conn.on_message(text.as_str(), &mut queries, &mut publishing).await
-                        }
-                        Some(Ok(Message::Binary(_))) => conn.notice("error: binary messages are not supported").await,
-                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => Ok(()),
-                        Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Disconnect::Gone),
+                    // Boxed: what handling a message takes is most of what
+                    // a connection would hold all the time.
+                    let mut result =
+                        Box::pin(conn.on_frame(msg, &mut queries, &mut publishing)).await;
+                    // The rest read with it.
+                    while result.is_ok()
+                        && publishing.len() + conn.in_flight < MAX_PUBLISHING
+                        && let Some(msg) = stream.try_next()
+                    {
+                        result =
+                            Box::pin(conn.on_frame(Some(msg), &mut queries, &mut publishing))
+                                .await;
                     }
+                    result
                 }
-                Some(outbound) = outbound.recv() => conn.on_outbound(outbound).await,
+                next = outbound.next() => match next {
+                    Some(next) => {
+                        let result = conn.on_outbound(next).await;
+                        outbound.handled();
+                        result
+                    }
+                    None => {
+                        tracing::debug!("dropping a client that fell too far behind");
+                        METRICS.dropped_behind.inc();
+                        break;
+                    }
+                },
+                // What a shard sent directly, and the socket didn't take.
+                _ = conn.sink.wanted() => write_within(conn.sink.flush()).await,
                 Some(done) = queries.join_next(), if !queries.is_empty() => match done {
                     Ok(Done::Req(name, results)) => conn.on_results(name, results).await,
                     Ok(Done::Count(id, count)) => conn.on_count_done(&id, count).await,
@@ -610,11 +681,46 @@ impl Connection {
                     // their panics.
                     Err(_) => Ok(()),
                 },
-                Some(done) = publishing.join_next(), if !publishing.is_empty() => match done {
-                    Ok(published) => conn.on_published(published).await,
-                    // Only aborted when the connection's gone.
-                    Err(_) => Ok(()),
-                },
+                Some(published) = answered.next() => {
+                    // Every one stored by now, sent at once.
+                    conn.corked = true;
+                    let mut next = Some(published);
+                    let mut result = Ok(());
+                    while let Some(published) = next.take()
+                        && result.is_ok()
+                    {
+                        conn.in_flight -= 1;
+                        result = conn.on_published(published).await;
+                        next = answered.pop();
+                    }
+                    conn.corked = false;
+                    match result {
+                        Ok(()) => write_within(conn.sink.flush()).await,
+                        Err(err) => Err(err),
+                    }
+                }
+                Some(done) = publishing.join_next(), if !publishing.is_empty() => {
+                    // The OKs of every event stored by now, sent at once:
+                    // the writer stores many in a batch.
+                    conn.corked = true;
+                    let mut done = Some(done);
+                    let mut result = Ok(());
+                    while let Some(next) = done.take()
+                        && result.is_ok()
+                    {
+                        result = match next {
+                            Ok(published) => conn.on_published(published).await,
+                            // Only aborted when the connection's gone.
+                            Err(_) => Ok(()),
+                        };
+                        done = publishing.try_join_next();
+                    }
+                    conn.corked = false;
+                    match result {
+                        Ok(()) => write_within(conn.sink.flush()).await,
+                        Err(err) => Err(err),
+                    }
+                }
             };
             if let Err(disconnect) = result {
                 if disconnect == Disconnect::Stalled {
@@ -630,7 +736,15 @@ impl Connection {
             let answer = async {
                 while let Some(Ok(published)) = publishing.join_next().await {
                     if conn.on_published(published).await.is_err() {
-                        break;
+                        return;
+                    }
+                }
+                while conn.in_flight > 0
+                    && let Some(published) = answered.next().await
+                {
+                    conn.in_flight -= 1;
+                    if conn.on_published(published).await.is_err() {
+                        return;
                     }
                 }
             };
@@ -641,11 +755,48 @@ impl Connection {
         // running on the blocking pool.
         conn.cancel.cancel();
         conn.state.hub.disconnect(id);
-        let _ = tokio::time::timeout(WRITE_TIMEOUT, conn.sink.close()).await;
+        conn.sink.close(conn.close_code);
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, conn.sink.shutdown()).await;
+    }
+
+    /// A message from the client, or the end of them.
+    async fn on_frame(
+        &mut self,
+        msg: Option<Result<ws::Message, ws::Error>>,
+        queries: &mut JoinSet<Done>,
+        publishing: &mut JoinSet<Published>,
+    ) -> Result<(), Disconnect> {
+        match msg {
+            Some(Ok(ws::Message::Text(text))) => self.on_message(text, queries, publishing).await,
+            Some(Ok(ws::Message::Binary)) => {
+                self.notice("error: binary messages are not supported")
+                    .await
+            }
+            Some(Ok(ws::Message::Ping(payload))) => {
+                self.sink.pong(&payload);
+                self.flush_uncorked().await
+            }
+            Some(Ok(ws::Message::Pong)) => Ok(()),
+            Some(Ok(ws::Message::Close)) | None => Err(Disconnect::Gone),
+            Some(Err(err)) => {
+                tracing::debug!("dropping a client: {err}");
+                self.close_code = err.code();
+                Err(Disconnect::Gone)
+            }
+        }
     }
 
     async fn send_raw(&mut self, text: String) -> Result<(), Disconnect> {
-        write_within(self.sink.send(Message::Text(text.into()))).await
+        self.sink.text(&text);
+        self.flush_uncorked().await
+    }
+
+    /// Send what's framed, unless more is to go with it.
+    async fn flush_uncorked(&mut self) -> Result<(), Disconnect> {
+        match self.corked {
+            true => Ok(()),
+            false => write_within(self.sink.flush()).await,
+        }
     }
 
     async fn send(&mut self, msg: &impl Serialize) -> Result<(), Disconnect> {
@@ -654,7 +805,8 @@ impl Connection {
     }
 
     async fn send_event(&mut self, sub_id: &str, json: &str) -> Result<(), Disconnect> {
-        self.send_raw(event_message(sub_id, json)).await
+        self.sink.event(&quoted(sub_id), json);
+        self.flush_uncorked().await
     }
 
     async fn notice(&mut self, msg: &str) -> Result<(), Disconnect> {
@@ -689,11 +841,28 @@ impl Connection {
 
     async fn on_message(
         &mut self,
-        text: &str,
+        text: ws::Text,
         queries: &mut JoinSet<Done>,
         publishing: &mut JoinSet<Published>,
     ) -> Result<(), Disconnect> {
-        let Ok(Value::Array(mut msg)) = serde_json::from_str::<Value>(text) else {
+        // Most are events: read straight into one, if it's well formed,
+        // rather than into JSON values first.
+        if text.len() <= PARSE_HERE
+            && text.trim_start().starts_with("[\"EVENT\"")
+            && let Ok((_, ev)) = serde_json::from_str::<(IgnoredAny, Event)>(&text)
+        {
+            return self.on_event_parsed(ev, publishing).await;
+        }
+        // A big message takes milliseconds to parse: on the blocking pool,
+        // so it holds up only the connection that sent it.
+        let parsed = match text.len() <= PARSE_HERE {
+            true => serde_json::from_str::<Value>(&text).ok(),
+            false => tokio::task::spawn_blocking(move || serde_json::from_str::<Value>(&text).ok())
+                .await
+                .ok()
+                .flatten(),
+        };
+        let Some(Value::Array(mut msg)) = parsed else {
             return self.notice("invalid: message must be a JSON array").await;
         };
 
@@ -746,7 +915,32 @@ impl Connection {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let ev = match self.check(value) {
+        let ev = serde_json::from_value(value)
+            .map_err(|err| Cow::Owned(format!("invalid: {err}")))
+            .and_then(|ev| self.check(ev));
+        self.publish(id, ev, publishing).await
+    }
+
+    /// As [`on_event`](Self::on_event), with the event read.
+    async fn on_event_parsed(
+        &mut self,
+        ev: Event,
+        publishing: &mut JoinSet<Published>,
+    ) -> Result<(), Disconnect> {
+        let id = ev.id.clone();
+        let ev = self.check(ev);
+        self.publish(id, ev, publishing).await
+    }
+
+    /// Store an event checked, apart from the loop, or say why it isn't.
+    async fn publish(
+        &mut self,
+        id: String,
+        ev: Result<Event, Cow<'static, str>>,
+        publishing: &mut JoinSet<Published>,
+    ) -> Result<(), Disconnect> {
+        let ev = match ev {
+            Ok(ev) if self.state.plugin.is_none() => return self.publish_now(id, ev).await,
             Ok(ev) => ev,
             Err(msg) => {
                 let refused = Published {
@@ -760,18 +954,7 @@ impl Connection {
         };
         let (state, peer, authed) = (self.state.clone(), self.peer, self.authed.clone());
         publishing.spawn(async move {
-            let (accepted, msg, shadow) = match verify(&state, ev).await {
-                Err(msg) => (false, msg, false),
-                Ok(None) => (true, DUPLICATE.into(), false),
-                Ok(Some(ev)) => match ask_plugin(&state, peer, &authed, &ev).await {
-                    Verdict::Accept => {
-                        let (accepted, msg) = accept(&state, &id, ev).await;
-                        (accepted, msg, false)
-                    }
-                    Verdict::Reject(msg) => (false, msg.into(), false),
-                    Verdict::ShadowReject(msg) => (true, msg.into(), true),
-                },
-            };
+            let (accepted, msg, shadow) = publish(&state, peer, &authed, &id, ev).await;
             Published {
                 id,
                 accepted,
@@ -780,6 +963,64 @@ impl Connection {
             }
         });
         Ok(())
+    }
+
+    /// Publish an event without a task of its own: checked and encoded by
+    /// the preparers, which hand it to the writer, which answers it to the
+    /// connection, with others stored with it, or, if it's ephemeral, to
+    /// live subscriptions themselves. With no plugin to ask.
+    async fn publish_now(&mut self, id: String, ev: Event) -> Result<(), Disconnect> {
+        if is_stored(&self.state, &ev) {
+            let published = Published {
+                id,
+                accepted: true,
+                msg: DUPLICATE.into(),
+                shadow: false,
+            };
+            return self.on_published(published).await;
+        }
+        let unanswered = Unanswered {
+            id: Some(id.clone()),
+            answers: self.answers.clone(),
+        };
+        let (writer, hub) = (self.state.writer.clone(), self.state.hub.clone());
+        let readied = self.state.preparers.ready_then(ev, move |ready| {
+            let record = match ready {
+                Ok(record) => record,
+                Err(msg) => return unanswered.answer((false, msg)),
+            };
+            let view = EventView::new(&record).expect("an encoded record");
+            if view.is_expired(event::now()) {
+                return unanswered.answer((false, EXPIRED.into()));
+            }
+            if KindClass::of(view.kind()) == KindClass::Ephemeral {
+                hub.broadcast(vec![Live::new(record, None)]);
+                return unanswered.answer((true, "".into()));
+            }
+            writer.write_now(
+                record,
+                Instant::now(),
+                Box::new(move |outcome| {
+                    let said = said(outcome, unanswered.id());
+                    unanswered.answer(said)
+                }),
+            );
+        });
+        match readied {
+            Ok(()) => {
+                self.in_flight += 1;
+                Ok(())
+            }
+            Err(msg) => {
+                let refused = Published {
+                    id,
+                    accepted: false,
+                    msg,
+                    shadow: false,
+                };
+                self.on_published(refused).await
+            }
+        }
     }
 
     /// Answer an event the connection published.
@@ -807,9 +1048,7 @@ impl Connection {
 
     /// An event, if it's one the relay could take, or a NIP-01 OK message
     /// saying why not. Its signature is checked apart, by [`Self::verify`].
-    fn check(&self, value: Value) -> Result<Event, Cow<'static, str>> {
-        let ev: Event =
-            serde_json::from_value(value).map_err(|err| Cow::Owned(format!("invalid: {err}")))?;
+    fn check(&self, ev: Event) -> Result<Event, Cow<'static, str>> {
         if !event::is_relayed(ev.kind) {
             return Err(format!("blocked: kind {} is not relayed", ev.kind).into());
         }
@@ -877,6 +1116,9 @@ impl Connection {
         self.state
             .hub
             .subscribe(self.id, name.clone(), filters.clone(), viewer.clone());
+        // Events go out live just before they're committed: what's gone out
+        // before the subscription was made is read once it is.
+        self.state.store.settle().await;
         // A small query is answered here and now. The live events that
         // arrive meanwhile wait in the connection's queue, and those it
         // saw are dropped from there.
@@ -905,11 +1147,12 @@ impl Connection {
         queries.spawn(async move {
             let (store, search) = (state.store.clone(), state.search.clone());
             let stop = cancel.clone();
+            let keys = state.clone();
             let results = run_query(&state, &cancel, move || {
                 query::run(
                     &store,
                     search.as_deref(),
-                    config.nip85.then_some(&state.keypair),
+                    config.nip85.then_some(&keys.keypair),
                     &filters,
                     config.default_limit,
                     config.max_limit,
@@ -955,25 +1198,23 @@ impl Connection {
         sub.floor = results.next_seq;
         let pending = sub.pending.take().unwrap_or_default();
         let sink = &mut self.sink;
+        let quoted = quoted(&name);
+        for json in &results.events {
+            sink.event(&quoted, json);
+        }
+        let eose = serde_json::to_string(&("EOSE", &*name)).expect("strings serialize");
+        sink.text(&eose);
+        for (seq, json) in pending {
+            // Stored events the query could see were sent with it.
+            if seq.is_none_or(|seq| seq >= results.next_seq) {
+                sink.event(&quoted, &json);
+            }
+        }
+        // What comes next may be sent straight from the shards, after this.
+        self.state.hub.go_live(self.id, &name, results.next_seq);
         // All of it within one timeout, so a client reading just fast enough
         // to keep each message from timing out can't hold its results long.
-        write_within(async move {
-            for json in &results.events {
-                sink.feed(Message::Text(event_message(&name, json).into()))
-                    .await?;
-            }
-            let eose = serde_json::to_string(&("EOSE", &*name)).expect("strings serialize");
-            sink.feed(Message::Text(eose.into())).await?;
-            for (seq, json) in pending {
-                // Stored events the query could see were sent with it.
-                if seq.is_none_or(|seq| seq >= results.next_seq) {
-                    sink.feed(Message::Text(event_message(&name, &json).into()))
-                        .await?;
-                }
-            }
-            sink.flush().await
-        })
-        .await
+        write_within(sink.flush()).await
     }
 
     /// A REQ's, COUNT's, or sync's filters, with the kinds the connection
@@ -1066,9 +1307,12 @@ impl Connection {
             return self.refuse(id, refusal).await;
         }
 
+        // Every event that's gone out live, counted.
+        self.state.store.settle().await;
         // A count LMDB keeps, or of a few entries, is answered here and now.
         let start = Instant::now();
-        match query::quick_count(&self.state.store, &filters, self.state.quick_budget) {
+        let budget = self.state.quick_budget * query::COUNT_LOADS_PER_RECORD;
+        match query::quick_count(&self.state.store, &filters, budget) {
             Ok(None) => {}
             Ok(Some(count)) => {
                 METRICS.counts.since(start);
@@ -1166,7 +1410,7 @@ impl Connection {
         let Some(msg) = args
             .get(2)
             .and_then(Value::as_str)
-            .and_then(|m| hex::decode(m).ok())
+            .and_then(event::decode_hex_vec)
         else {
             return self
                 .neg_err(id, "invalid: NEG-OPEN requires a hex message")
@@ -1186,10 +1430,13 @@ impl Connection {
                 cancel: cancel.clone(),
             },
         );
-        // A sync of a few events is answered here and now.
+        // Every event that's gone out live, synced.
+        self.state.store.settle().await;
+        // A sync of a few thousand events is answered here and now.
         let start = Instant::now();
         let max = config.negentropy_max_events;
-        let budget = self.state.quick_budget;
+        let budget =
+            self.state.quick_budget * SYNC_ITEMS_PER_RECORD / query::COUNT_LOADS_PER_RECORD;
         let viewer = self.viewer();
         match query::quick_ids(
             &self.state.store,
@@ -1254,13 +1501,20 @@ impl Connection {
         let Some(msg) = args
             .get(1)
             .and_then(Value::as_str)
-            .and_then(|m| hex::decode(m).ok())
+            .and_then(event::decode_hex_vec)
         else {
             self.syncs.remove(id);
             return self
                 .neg_err(id, "invalid: NEG-MSG requires a hex message")
                 .await;
         };
+        // A sync of a few thousand events is answered here and now.
+        if storage.len() <= self.state.quick_budget * SYNC_ITEMS_PER_RECORD {
+            let (name, start) = (sync.name.clone(), Instant::now());
+            let reconciled = reconcile(storage, &msg);
+            METRICS.syncs.since(start);
+            return self.on_reconciled(name, reconciled).await;
+        }
         let (state, name, cancel) = (self.state.clone(), sync.name.clone(), sync.cancel.clone());
         queries.spawn(async move {
             let start = Instant::now();
@@ -1288,7 +1542,9 @@ impl Connection {
         let err = match reconciled {
             Ok(Reconciled { storage, msg }) => {
                 sync.storage = Some(storage);
-                return self.send(&("NEG-MSG", &*name, hex::encode(msg))).await;
+                return self
+                    .send(&("NEG-MSG", &*name, record::encode_hex(&msg)))
+                    .await;
             }
             Err(err) => err,
         };
@@ -1350,36 +1606,59 @@ impl Connection {
     }
 }
 
-/// The event if its id and signature are good, or None if it's stored
-/// already. The lookup runs here and now, as small queries do (see
-/// [`query::quick`]); the signature, which takes a while, on the blocking
-/// pool.
-async fn verify(state: &AppState, ev: Event) -> Result<Option<Event>, Cow<'static, str>> {
-    // Events are resent all the time, and each would cost a signature
-    // check, so look first: one with the stored copy's signature is that
-    // event, verified when it was stored.
+/// Verify, judge, and store an event: whether it's accepted, the OK
+/// message's text, and whether it was shadow-rejected.
+async fn publish(
+    state: &AppState,
+    peer: Peer,
+    authed: &Authed,
+    id: &str,
+    ev: Event,
+) -> (bool, Cow<'static, str>, bool) {
+    if is_stored(state, &ev) {
+        return (true, DUPLICATE.into(), false);
+    }
+    // Checking the signature, many at once, and encoding, which guesses
+    // the language and sentiment, are done by the preparers, off the
+    // runtime's threads, where they'd hold up every other connection's
+    // reads. With a plugin to ask, the signature is checked first, on a
+    // trip of its own.
+    let ev = match &state.plugin {
+        None => ev,
+        Some(_) => {
+            let ev = match state.preparers.check(ev).await {
+                Ok(ev) => ev,
+                Err(msg) => return (false, msg, false),
+            };
+            match ask_plugin(state, peer, authed, &ev).await {
+                Verdict::Accept => ev,
+                Verdict::Reject(msg) => return (false, msg.into(), false),
+                Verdict::ShadowReject(msg) => return (true, msg.into(), true),
+            }
+        }
+    };
+    match state.preparers.ready(ev, state.plugin.is_some()).await {
+        Ok(record) => {
+            let (accepted, msg) = accept(state, id, record, Instant::now()).await;
+            (accepted, msg, false)
+        }
+        Err(msg) => (false, msg, false),
+    }
+}
+
+/// Whether an event is stored already: events are resent all the time,
+/// and each would cost a signature check, so this is looked up first, and
+/// here and now, as small queries are (see [`query::quick`]). One with
+/// the stored copy's signature is that event, verified when it was stored.
+fn is_stored(state: &AppState, ev: &Event) -> bool {
     let id = event::decode_hex::<32>(&ev.id);
     let sig = event::decode_hex::<64>(&ev.sig);
-    if let (Some(id), Some(sig)) = (id, sig) {
-        let store = &state.store;
-        let stored = store.read().and_then(|txn| store.sig_of(&txn, &id));
-        if stored.ok().flatten() == Some(sig) {
-            return Ok(None);
-        }
-    }
-    let Ok(_place) = state.verifiers.acquire().await else {
-        return Err("error: shutting down".into());
+    let (Some(id), Some(sig)) = (id, sig) else {
+        return false;
     };
-    let verified = tokio::task::spawn_blocking(move || {
-        ev.verify()?;
-        Ok(Some(ev))
-    })
-    .await;
-    verified.unwrap_or_else(|err| {
-        tracing::error!("verifying an event panicked: {err}");
-        METRICS.errors_panic.inc();
-        Err("error: failed to check event".into())
-    })
+    let store = &state.store;
+    let stored = store.read().and_then(|txn| store.sig_of(&txn, &id));
+    stored.ok().flatten() == Some(sig)
 }
 
 /// What the write policy plugin makes of an event, if there is one.
@@ -1409,32 +1688,30 @@ async fn ask_plugin(state: &AppState, peer: Peer, authed: &Authed, ev: &Event) -
     verdict
 }
 
-/// Stores an event, or sends it to live subscriptions, with a NIP-01
-/// OK message.
-async fn accept(state: &AppState, id: &str, ev: Event) -> (bool, Cow<'static, str>) {
-    let now = event::now();
-    let ephemeral = ev.kind_class() == KindClass::Ephemeral;
-    // Encoding guesses the event's language and sentiment, which takes
-    // a while for long text.
-    let record = match tokio::task::spawn_blocking(move || record::encode(&ev)).await {
-        Ok(record) => Arc::new(record),
-        Err(err) => {
-            tracing::error!("encoding event {id} panicked: {err}");
-            METRICS.errors_panic.inc();
-            return (false, "error: failed to store event".into());
-        }
-    };
+/// Stores an encoded event, its write begun at `start`, or sends it to
+/// live subscriptions, with a NIP-01 OK message.
+async fn accept(
+    state: &AppState,
+    id: &str,
+    record: Arc<Vec<u8>>,
+    start: Instant,
+) -> (bool, Cow<'static, str>) {
     let view = EventView::new(&record).expect("an encoded record");
-    if view.is_expired(now) {
+    if view.is_expired(event::now()) {
         return (false, EXPIRED.into());
     }
-    if ephemeral {
+    if KindClass::of(view.kind()) == KindClass::Ephemeral {
         state.hub.publish(vec![Live::new(record, None)]).await;
         return (true, "".into());
     }
 
     // The writer sends what it stores to live subscriptions.
-    match state.writer.write(record).await {
+    said(state.writer.write_from(record, start).await, id)
+}
+
+/// What to say of a write's outcome, in an OK message.
+fn said(outcome: anyhow::Result<Outcome>, id: &str) -> (bool, Cow<'static, str>) {
+    match outcome {
         Ok(Outcome::Stored(_)) => (true, "".into()),
         // Kept, but old news: not sent to live subscriptions.
         Ok(Outcome::Archived(_)) => (true, "".into()),
@@ -1465,10 +1742,9 @@ fn visible(viewer: Option<Viewer>) -> impl Fn(&EventView) -> bool {
     move |event| viewer.as_ref().is_none_or(|viewer| viewer.may_see(event))
 }
 
-/// `["EVENT", sub_id, event]`, with the event already serialized.
-fn event_message(sub_id: &str, json: &str) -> String {
-    let sub_id = serde_json::to_string(sub_id).expect("strings serialize");
-    format!("[\"EVENT\",{sub_id},{json}]")
+/// A subscription id as JSON.
+fn quoted(sub_id: &str) -> String {
+    serde_json::to_string(sub_id).expect("strings serialize")
 }
 
 /// A write to a client, within [`WRITE_TIMEOUT`].

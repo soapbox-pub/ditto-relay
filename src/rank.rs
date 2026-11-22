@@ -1740,14 +1740,11 @@ pub fn best_among<'t>(
 fn events_of_kinds(store: &Store, txn: &Txn, filter: &Filter) -> Result<usize> {
     let t = store.tables;
     let Some(kinds) = &filter.kinds else {
-        return txn.len(t.created);
+        return crate::store::count_key(txn, t.created, crate::store::CREATED);
     };
-    let mut cursor = txn.cursor(t.kinds)?;
     let mut events = 0;
     for kind in kinds {
-        if cursor.set(&kind.to_be_bytes())?.is_some() {
-            events += cursor.count()?;
-        }
+        events += crate::store::count_key(txn, t.kinds, &kind.to_be_bytes())?;
     }
     Ok(events)
 }
@@ -2948,8 +2945,9 @@ mod tests {
         settle(&store);
 
         let txn = store.read().unwrap();
-        let now = crate::event::now();
         for _ in 0..300 {
+            // As the relay reckons it for each query.
+            let now = crate::event::now();
             let mut filter = serde_json::Map::new();
             let sort = ["top", "hot", "controversial", "zaps"][rng.random_range(0..4)];
             let text = rng.random_bool(0.5);
@@ -3037,6 +3035,10 @@ mod tests {
                     None => continue,
                 },
             };
+            // Hot ranks decay: compared as of the same second, or not.
+            if crate::event::now() != now {
+                continue;
+            }
             // A hot page short of its limit goes on to older weeks.
             let (got, older) = got.split_at(got.len().min(want.len()));
             assert_eq!(got, want, "{raw}");
