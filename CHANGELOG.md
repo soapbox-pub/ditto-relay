@@ -107,7 +107,12 @@ it is tagged.
   queries take 11-15% less.
 - A stored event's text is checked to be UTF-8 only when it's read, not
   each time the event is, which was about 6% of a query's CPU.
-
+- `ditto-relay export --history` writes every version the store keeps of
+  each replaceable and addressable event's address, replaced ones too, in
+  the order stored. An export with a filter leaves replaced versions out,
+  as they're in no index the filter could match, so a database copied by
+  filter can have its history added after with this, imported: the
+  current versions are here already, and the rest are kept as history.
 - A write's time is split, in metrics, into reading ahead what storing it
   reads (`write_prefetch_seconds`), waiting in the queue
   (`write_queue_wait_seconds`), and its batch (`write_batch_seconds`). A

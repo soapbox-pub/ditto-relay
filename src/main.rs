@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         } => delete(&config, filter.as_deref(), age, dry_run),
         Command::Deletions { json } => deletions(&config, json),
         Command::Cancel { id } => cancel(&config, id),
-        Command::Export { filter } => export(&config, filter.as_deref()),
+        Command::Export { filter, history } => export(&config, filter.as_deref(), history),
         Command::Salvage { dir, from } => salvage(&config, dir, from),
         Command::Import { file, no_verify } => import(&config, file, !no_verify).await,
         Command::Compact {
@@ -417,7 +417,7 @@ fn salvage(config: &Config, dir: Option<PathBuf>, from: u64) -> anyhow::Result<(
     Ok(())
 }
 
-fn export(config: &Config, json: Option<&str>) -> anyhow::Result<()> {
+fn export(config: &Config, json: Option<&str>, history: bool) -> anyhow::Result<()> {
     let store = open_read_only(config)?;
     let filter = match json {
         Some(json) => Some(delete::filter(
@@ -437,7 +437,11 @@ fn export(config: &Config, json: Option<&str>) -> anyhow::Result<()> {
         }
     };
     let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
-    match ditto_relay::export::export(&store, filter.as_ref(), &mut out, progress) {
+    let exported = match history {
+        true => ditto_relay::export::export_history(&store, &mut out, progress),
+        false => ditto_relay::export::export(&store, filter.as_ref(), &mut out, progress),
+    };
+    match exported {
         Ok(written) => {
             eprintln!("exported {written} events");
             Ok(())
@@ -980,6 +984,10 @@ How it's going is said on stderr.",
         /// Only what this NIP-01 filter matches, as JSON
         #[arg(long, value_name = "JSON")]
         filter: Option<String>,
+        /// Only every version of each replaceable and addressable event's
+        /// address kept, replaced ones too, which a filter leaves out
+        #[arg(long, conflicts_with = "filter")]
+        history: bool,
     },
 
     /// Write the events in a records file to stdout, as JSON lines,
@@ -1228,7 +1236,10 @@ mod tests {
         let args = parse("export --filter {}").unwrap();
         assert!(matches!(
             args.command,
-            Some(Command::Export { filter: Some(_) })
+            Some(Command::Export {
+                filter: Some(_),
+                history: false
+            })
         ));
         let Some(Command::Import { file, no_verify }) =
             parse("import --no-verify a.jsonl").unwrap().command

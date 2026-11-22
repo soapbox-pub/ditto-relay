@@ -7,6 +7,11 @@
 //! the store, old versions kept as history too; with one, what it matches,
 //! or picks, as `ditto-relay delete` would find it.
 //!
+//! With `--history`, it's every version of each replaceable or addressable
+//! event's address the store keeps, current and replaced, still in the
+//! order they were stored: what a filter leaves out, as replaced versions
+//! are in no index but `history`.
+//!
 //! It only reads, from a store opened [only to read](Store::open_read_only),
 //! so it never holds up the relay, and it reads in transactions of
 //! [`CHUNK`] events at most, so that a long export doesn't keep the relay's
@@ -19,13 +24,62 @@ use crate::delete;
 use crate::filter::Filter;
 use crate::lmdb::{DbFlags, Env};
 use crate::record::EventView;
-use crate::store::Store;
+use crate::store::{STAMP_LEN, Store, stamp_seq};
 
 /// The most events read in a transaction.
 const CHUNK: usize = 10_000;
 
 /// How far ahead of the records being read the kernel is asked to read.
 const READ_AHEAD: usize = 64 << 20;
+
+/// Write to `out` every version of every address the store keeps history
+/// of, current and replaced, in the order stored, telling `progress` how
+/// many so far after each chunk. Returns how many were written.
+pub fn export_history(
+    store: &Store,
+    out: &mut impl Write,
+    mut progress: impl FnMut(u64),
+) -> anyhow::Result<u64> {
+    let mut seqs = Vec::new();
+    {
+        let txn = store.read()?;
+        let mut cursor = txn.cursor(store.tables.history)?;
+        let mut entry = cursor.first()?;
+        while let Some((_, stamp)) = entry {
+            if stamp.len() >= STAMP_LEN {
+                seqs.push(stamp_seq(stamp));
+            }
+            entry = cursor.next()?;
+        }
+    }
+    seqs.sort_unstable();
+    seqs.dedup();
+    let written = write_seqs(store, &seqs, out, &mut progress)?;
+    out.flush()?;
+    Ok(written)
+}
+
+/// Write the events stored under `seqs` to `out`, a chunk at a time.
+fn write_seqs(
+    store: &Store,
+    seqs: &[u64],
+    out: &mut impl Write,
+    progress: &mut impl FnMut(u64),
+) -> anyhow::Result<u64> {
+    let mut written = 0;
+    for chunk in seqs.chunks(CHUNK) {
+        store.read_ahead(chunk);
+        let txn = store.read()?;
+        for &seq in chunk {
+            if let Some(view) = store.load(&txn, seq)? {
+                writeln!(out, "{}", view.to_json())?;
+                written += 1;
+            }
+        }
+        progress(written);
+    }
+    Ok(written)
+}
 
 /// Write to `out` what `filter` matches, or everything, telling `progress`
 /// how many so far after each chunk. Returns how many were written.
@@ -39,17 +93,7 @@ pub fn export(
     match filter {
         Some(filter) => {
             let seqs: Vec<u64> = delete::pick(store, filter)?.into_iter().collect();
-            for chunk in seqs.chunks(CHUNK) {
-                store.read_ahead(chunk);
-                let txn = store.read()?;
-                for &seq in chunk {
-                    if let Some(view) = store.load(&txn, seq)? {
-                        writeln!(out, "{}", view.to_json())?;
-                        written += 1;
-                    }
-                }
-                progress(written);
-            }
+            written = write_seqs(store, &seqs, out, &mut progress)?;
         }
         None => {
             let mut from = 0u64;
@@ -248,6 +292,38 @@ mod tests {
 
         let line = &export_all(&store, Some(json!({"ids": [second.id]})))[0];
         assert_eq!(line, &serde_json::to_value(&second).unwrap());
+    }
+
+    /// Every version of each address, replaced ones too, in the order
+    /// stored, and nothing else.
+    #[test]
+    fn exports_history() {
+        let (_dir, store) = open();
+        let note = signed(1, 300, 1, vec![], "note");
+        let profile = signed(1, 100, 0, vec![], "old profile");
+        let newer = signed(1, 200, 0, vec![], "new profile");
+        let list = signed(2, 100, 30000, vec![vec!["d", "x"]], "old list");
+        let later = signed(2, 150, 30000, vec![vec!["d", "x"]], "new list");
+        for event in [&note, &profile, &list, &newer, &later] {
+            put(&store, event);
+        }
+        let mut out = Vec::new();
+        let written = export_history(&store, &mut out, |_| {}).unwrap();
+        let ids: Vec<String> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(written, 4);
+        assert_eq!(
+            ids,
+            [&profile.id, &list.id, &newer.id, &later.id].map(String::clone)
+        );
     }
 
     /// More than a chunk, read across transactions.
