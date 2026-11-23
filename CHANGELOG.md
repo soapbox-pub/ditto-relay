@@ -6,12 +6,15 @@ it is tagged.
 
 ## [2.5.2]
 
-- The landing page is redone, with live numbers: events stored,
-  connections open, the average time to answer a query over the last
-  minute or two, queries answered, and uptime, read every 5 seconds from
-  the new `/stats`, as JSON. It lists the NIPs the relay supports and its
-  limits, shows the operator's npub, and sets a `theme-color`, which
-  browsers that heed it paint their frame in.
+- The landing page is redone: the relay's name, large and centered over
+  rippling purple silk drawn with WebGL, its address to copy, and live
+  numbers: events stored, connections open, the average time to answer a
+  query over the last minute or two, queries answered, and uptime, read
+  every 5 seconds from the new `/stats`, as JSON. The operator is shown
+  by the name and picture of their profile, looked for on the relay, then
+  on relay.ditto.pub and purplepag.es unless it's an onion, linked to it
+  on Ditto. It sets a `theme-color`, which browsers that heed it paint
+  their frame in.
 
 - `ditto-relay salvage` writes every event in a database's records file as
   JSON lines, reading nothing else of the database: for a database whose
