@@ -98,8 +98,13 @@ impl Pages {
     /// For the relay at `url`, whose images are at `public_url`.
     fn new(config: &Config, keypair: &Keypair, url: &str, public_url: &str) -> Self {
         let info = nip11(config, keypair, public_url);
+        // A banner of the operator's own previews the page, else the silk.
+        let og_image = match &config.banner {
+            Image::Url(url) => url.clone(),
+            _ => landing::asset_url(public_url, "/og.jpg"),
+        };
         Self {
-            landing: landing::render(&info, url).into(),
+            landing: landing::render(&info, url, Some(&og_image)).into(),
             nip11: info.to_string().into(),
         }
     }
@@ -216,6 +221,7 @@ pub fn router(state: AppState) -> Router {
         .route("/favicon.ico", asset("image/x-icon", landing::FAVICON))
         .route("/icon.png", asset("image/png", landing::ICON))
         .route("/banner.jpg", asset("image/jpeg", landing::BANNER))
+        .route("/og.jpg", asset("image/jpeg", landing::OG_IMAGE))
         .with_state(Arc::new(state))
 }
 

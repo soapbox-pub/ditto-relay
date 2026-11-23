@@ -173,8 +173,10 @@ async fn request_path(
         "{method} {path} HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    // Lossy, for the images.
+    let response = String::from_utf8_lossy(&response);
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
     (head.to_ascii_lowercase(), body.into())
 }
@@ -756,6 +758,12 @@ async fn serves_stats() {
 
     let (_, body) = get(relay.addr, "text/html").await;
     assert!(body.contains(r#"<meta name="theme-color""#), "{body}");
+    assert!(
+        body.contains(r#"<meta property="og:image" content="http://relay.test/og.jpg">"#),
+        "{body}"
+    );
+    let (head, _) = request_path(relay.addr, "GET", "/og.jpg", "*/*").await;
+    assert!(head.contains("content-type: image/jpeg"), "{head}");
 }
 
 /// An onion service's clients are told the onion, and may authenticate

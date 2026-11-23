@@ -6,6 +6,8 @@ use serde_json::Value;
 pub const FAVICON: &[u8] = include_bytes!("../assets/favicon.ico");
 pub const ICON: &[u8] = include_bytes!("../assets/icon.png");
 pub const BANNER: &[u8] = include_bytes!("../assets/banner.jpg");
+/// What a link to the page is previewed with: the silk, with the name.
+pub const OG_IMAGE: &[u8] = include_bytes!("../assets/og.jpg");
 
 /// The URL of an asset served at `path` on the host at `public_url`.
 pub fn asset_url(public_url: &str, path: &str) -> String {
@@ -150,8 +152,9 @@ fn operator_html(info: &Value, relay_url: &str) -> String {
     )
 }
 
-/// The landing page for the relay at `relay_url`, described by `info`.
-pub fn render(info: &Value, relay_url: &str) -> String {
+/// The landing page for the relay at `relay_url`, described by `info`, its
+/// links previewed with `og_image`, else its banner, else its icon.
+pub fn render(info: &Value, relay_url: &str, og_image: Option<&str>) -> String {
     let field = |key: &str| info[key].as_str().filter(|v| !v.is_empty());
     let name = esc(field("name").unwrap_or("Nostr Relay"));
     let description = field("description").map(esc);
@@ -176,14 +179,15 @@ pub fn render(info: &Value, relay_url: &str) -> String {
   <link rel="apple-touch-icon" href="{icon}">"#
         );
     }
-    if let Some(image) = banner.as_ref().or(icon.as_ref()) {
+    let og_image = og_image.and_then(|url| safe_url(url, HTTP));
+    if let Some(image) = og_image.as_ref().or(banner.as_ref()).or(icon.as_ref()) {
         head += &format!(
             r#"
   <meta property="og:image" content="{image}">
   <meta name="twitter:image" content="{image}">"#
         );
     }
-    let card = if banner.is_some() {
+    let card = if og_image.is_some() || banner.is_some() {
         "summary_large_image"
     } else {
         "summary"
@@ -670,6 +674,7 @@ mod tests {
         let html = render(
             &json!({"name": "<script>alert(1)</script>", "description": "\"quoted\" & more"}),
             "wss://relay.example/\"><script>",
+            None,
         );
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
@@ -683,6 +688,7 @@ mod tests {
         let html = render(
             &json!({"icon": "javascript:alert(1)", "banner": "https://x.example/b.jpg"}),
             "wss://x.example",
+            None,
         );
         assert!(!html.contains("javascript:"));
         assert!(html.contains(r#"content="https://x.example/b.jpg""#));
@@ -691,32 +697,42 @@ mod tests {
 
     #[test]
     fn shows_the_version() {
-        let html = render(&json!({"version": "2.0.0"}), "wss://x.example");
+        let html = render(&json!({"version": "2.0.0"}), "wss://x.example", None);
         assert!(html.contains(r#"<span class="version">v2.0.0</span>"#));
-        assert!(!render(&json!({}), "wss://x.example").contains(r#"class="version""#));
+        assert!(!render(&json!({}), "wss://x.example", None).contains(r#"class="version""#));
     }
 
     #[test]
     fn sets_a_theme_color() {
-        let html = render(&json!({}), "wss://x.example");
+        let html = render(&json!({}), "wss://x.example", None);
         assert!(html.contains(&format!(
             r#"<meta name="theme-color" content="{THEME_COLOR}">"#
         )));
     }
 
     #[test]
+    fn previews_links_with_the_og_image() {
+        let info = json!({"banner": "https://x.example/b.jpg"});
+        let html = render(&info, "wss://x.example", Some("https://x.example/og.jpg"));
+        assert!(html.contains(r#"<meta property="og:image" content="https://x.example/og.jpg">"#));
+        assert!(html.contains("summary_large_image"));
+        let html = render(&info, "wss://x.example", None);
+        assert!(html.contains(r#"<meta property="og:image" content="https://x.example/b.jpg">"#));
+    }
+
+    #[test]
     fn links_the_operator() {
         let pubkey = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
         let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
-        let html = render(&json!({"pubkey": pubkey}), "wss://x.example");
+        let html = render(&json!({"pubkey": pubkey}), "wss://x.example", None);
         assert!(html.contains(&format!(r#"href="https://ditto.pub/{npub}""#)));
         assert!(html.contains(&format!(r#"data-pubkey="{pubkey}""#)));
         assert!(html.contains(r#"<span class="op-name">npub180cvv07…yjh6w6</span>"#));
         assert!(html.contains("relay.ditto.pub"));
         // Over the onion, it's looked for on the onion alone.
-        let onion = render(&json!({"pubkey": pubkey}), "ws://x.onion");
+        let onion = render(&json!({"pubkey": pubkey}), "ws://x.onion", None);
         assert!(!onion.contains("relay.ditto.pub"));
-        assert!(!render(&json!({}), "wss://x.example").contains(r#"id="op""#));
+        assert!(!render(&json!({}), "wss://x.example", None).contains(r#"id="op""#));
         assert_eq!(bech32("npub", "zz"), None);
     }
 

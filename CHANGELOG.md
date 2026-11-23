@@ -14,7 +14,8 @@ it is tagged.
   by the name and picture of their profile, looked for on the relay, then
   on relay.ditto.pub and purplepag.es unless it's an onion, linked to it
   on Ditto. It sets a `theme-color`, which browsers that heed it paint
-  their frame in.
+  their frame in. Links to it are previewed with the silk and the name, at
+  `/og.jpg`, unless `banner` is a URL of the operator's own.
 
 - `ditto-relay salvage` writes every event in a database's records file as
   JSON lines, reading nothing else of the database: for a database whose
