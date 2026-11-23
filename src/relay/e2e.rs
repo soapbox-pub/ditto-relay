@@ -158,10 +158,20 @@ async fn get(addr: SocketAddr, accept: &str) -> (String, String) {
 }
 
 async fn request(addr: SocketAddr, method: &str, accept: &str) -> (String, String) {
+    request_path(addr, method, "/", accept).await
+}
+
+async fn request_path(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    accept: &str,
+) -> (String, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    let request =
-        format!("{method} / HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nConnection: close\r\n\r\n");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nConnection: close\r\n\r\n"
+    );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).await.unwrap();
@@ -723,6 +733,29 @@ async fn nip11_links_the_configured_images() {
     assert!(info.get("banner").is_none() && info.get("software").is_none());
     let (_, body) = get(relay.addr, "text/html").await;
     assert!(body.contains("https://img.example/i.png"), "{body}");
+}
+
+/// The landing page's live numbers.
+#[tokio::test]
+async fn serves_stats() {
+    let relay = Relay::start().await;
+    let mut client = Client::connect(relay.addr).await;
+    let ev = signed(1, event::now().into(), 1, vec![], "counted");
+    assert!(client.publish(&ev).await.0);
+
+    let (head, body) = request_path(relay.addr, "GET", "/stats", "*/*").await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-type: application/json"), "{head}");
+    assert!(head.contains("access-control-allow-origin: *"), "{head}");
+    let stats: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(stats["events"], 1, "{stats}");
+    assert!(stats["connections"].as_u64().unwrap() >= 1, "{stats}");
+    assert!(stats["answer_ms"].is_number(), "{stats}");
+    assert!(stats["requests"].is_u64(), "{stats}");
+    assert!(stats["uptime_secs"].is_u64(), "{stats}");
+
+    let (_, body) = get(relay.addr, "text/html").await;
+    assert!(body.contains(r#"<meta name="theme-color""#), "{body}");
 }
 
 /// An onion service's clients are told the onion, and may authenticate

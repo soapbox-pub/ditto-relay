@@ -81,7 +81,15 @@ impl Timer {
         self.count.inc();
         self.micros.add(start.elapsed().as_micros() as u64);
     }
+
+    /// How many it's recorded, and how long they took in all.
+    pub fn totals(&self) -> (u64, Duration) {
+        (self.count.get(), Duration::from_micros(self.micros.get()))
+    }
 }
+
+/// When the relay started, for its uptime: forced as it does.
+pub static STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 pub struct Metrics {
     pub connections: Gauge,

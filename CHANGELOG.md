@@ -6,6 +6,13 @@ it is tagged.
 
 ## [2.5.2]
 
+- The landing page is redone, with live numbers: events stored,
+  connections open, the average time to answer a query over the last
+  minute or two, queries answered, and uptime, read every 5 seconds from
+  the new `/stats`, as JSON. It lists the NIPs the relay supports and its
+  limits, shows the operator's npub, and sets a `theme-color`, which
+  browsers that heed it paint their frame in.
+
 - `ditto-relay salvage` writes every event in a database's records file as
   JSON lines, reading nothing else of the database: for a database whose
   main file is lost or damaged, which can then be stored anew by importing

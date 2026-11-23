@@ -41,6 +41,7 @@ mod counts;
 mod monitors;
 mod preparers;
 mod queue;
+mod stats;
 mod ws;
 
 #[derive(Clone)]
@@ -83,6 +84,8 @@ pub struct AppState {
     onion: Option<Arc<Pages>>,
     /// Where Tor Browser is told to find the onion.
     onion_location: Option<HeaderValue>,
+    /// The live numbers the landing page shows.
+    stats: Arc<stats::Stats>,
 }
 
 /// The NIP-11 information document, and the landing page made from it.
@@ -117,6 +120,7 @@ impl AppState {
         onion: Option<String>,
     ) -> Self {
         let (search, indexer) = search.unzip();
+        std::sync::LazyLock::force(&crate::metrics::STARTED);
         let clearnet = Pages::new(&config, &keypair, &config.url, &config.public_url);
         // Images on the onion come from the onion, not from clearnet.
         let onion_http = onion.as_ref().map(|url| url.replacen("ws", "http", 1));
@@ -166,6 +170,7 @@ impl AppState {
             queries: Arc::new(Semaphore::new(cores())),
             counts: Counts::default(),
             quick_budget: query::QUICK_BUDGET,
+            stats: Arc::default(),
         }
     }
 
@@ -207,6 +212,7 @@ pub fn router(state: AppState) -> Router {
     };
     Router::new()
         .route("/", get(root).options(|| async { CORS }))
+        .route("/stats", get(stats).options(|| async { CORS }))
         .route("/favicon.ico", asset("image/x-icon", landing::FAVICON))
         .route("/icon.png", asset("image/png", landing::ICON))
         .route("/banner.jpg", asset("image/jpeg", landing::BANNER))
@@ -299,6 +305,28 @@ async fn root(
             .insert("onion-location", onion.clone());
     }
     response
+}
+
+/// The live numbers the landing page shows: events stored, connections
+/// open, queries answered and how long they've lately taken, and uptime.
+async fn stats(State(state): State<Arc<AppState>>) -> Response {
+    let (stats, store) = (state.stats.clone(), state.store.clone());
+    match tokio::task::spawn_blocking(move || stats.json(&store)).await {
+        Ok(Ok(json)) => (
+            CORS,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            json,
+        )
+            .into_response(),
+        Ok(Err(err)) => {
+            tracing::error!("reading stats failed: {err:#}");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// The client's IP: from the configured header if it's set and makes sense,
