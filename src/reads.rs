@@ -13,6 +13,13 @@
 //! seconds, to tell how long the oldest read has held pages back (since the
 //! commit after the one it reads); warns while one has for long; and every
 //! minute frees the slots of processes that died.
+//!
+//! And a command run beside the relay, `export` or `delete` say, is stopped
+//! if one of its reads stays open for [`COMMAND_READ_LIMIT`]: see
+//! [`limit_command_reads`]. What those commands read is read a little at a
+//! time, each in a read of its own, so none needs to be open long; the
+//! limit is there so that one that would be anyway can't hold pages back
+//! for hours, as a search of every event's text in one read once did.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +42,47 @@ const KEPT: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 /// A read holding pages back this long is warned of, at most this often
 /// while it lasts.
 const LONG_READ: Duration = Duration::from_secs(10 * 60);
+
+/// The longest a read of a command other than `serve`, `import`, `compact`
+/// and `repack` may stay open before the command is stopped.
+pub const COMMAND_READ_LIMIT: Duration = Duration::from_secs(60);
+
+/// How often [`limit_command_reads`] looks at the reads.
+const LIMIT_CHECK_EVERY: Duration = Duration::from_secs(1);
+
+/// Stop this process, saying why, if any read it opens from now on stays
+/// open for [`COMMAND_READ_LIMIT`]. LMDB reuses no page freed since the
+/// oldest open read of any process began, the relay's included, so a long
+/// read anywhere makes everything the relay writes meanwhile go on the end
+/// of its files, which never shrink, and holds up its writes. There's no
+/// way to let one run longer: a command that needs to read more reads it in
+/// pieces, each in a read of its own. Its slot in the reader table is freed
+/// by the relay within a minute (see [`CLEAR_EVERY`]).
+pub fn limit_command_reads() {
+    crate::lmdb::time_reads();
+    let spawned = std::thread::Builder::new()
+        .name("read-limit".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(LIMIT_CHECK_EVERY);
+                if let Some(age) = crate::lmdb::oldest_read()
+                    && age >= COMMAND_READ_LIMIT
+                {
+                    eprintln!(
+                        "ditto-relay: stopped: a read has been open for {}s, and a command's may be open for {}s at most. While a read is open, LMDB reuses no page freed since it began, so every page the relay writes goes on the end of its files, which never shrink, and its writes slow down. Narrow what's asked, with since and until, or kinds, authors or tags rather than search text alone.",
+                        age.as_secs(),
+                        COMMAND_READ_LIMIT.as_secs()
+                    );
+                    std::process::exit(3);
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        // Without the watch, the command mustn't run at all.
+        eprintln!("ditto-relay: couldn't start the watch on its reads: {err}");
+        std::process::exit(3);
+    }
+}
 
 /// The environments watched, by the names metrics and the log give them.
 pub const ENVS: [&str; 2] = ["main", "bodies"];
@@ -182,6 +230,17 @@ fn run(store: &Store) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_a_process_s_reads_once_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::lmdb::Env::open(dir.path(), 1 << 20, 1, 4).unwrap();
+        crate::lmdb::time_reads();
+        let txn = env.read_txn().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(crate::lmdb::oldest_read().unwrap() >= Duration::from_millis(20));
+        drop(txn);
+    }
 
     #[test]
     fn tells_how_long_a_read_has_held_pages_back() {

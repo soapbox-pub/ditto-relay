@@ -38,6 +38,7 @@
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use secp256k1::Keypair;
 use tokio_util::sync::CancellationToken;
@@ -437,6 +438,65 @@ pub fn every_match(store: &Store, txn: &Txn, filter: &Filter) -> Result<Vec<u64>
         .into_iter()
         .map(|(seq, _)| seq)
         .collect())
+}
+
+/// How long each read of [`each_match_windowed`] aims to take.
+const WINDOW_READ: Duration = Duration::from_secs(1);
+
+/// The first window of [`each_match_windowed`], in seconds of created_at.
+const FIRST_WINDOW: u32 = 60 * 60;
+
+/// What [`every_match_kinded`] finds, found a window of created_at at a
+/// time, newest first, each in a read of its own that `each` is handed with
+/// the window's matches: for a filter that may match, or have to read, much
+/// of the store, as one of search text alone does, reading every event.
+///
+/// LMDB reuses no page freed since the oldest open read began, so one read
+/// held for all of that would make everything the relay writes meanwhile
+/// go on the end of its files, for hours. Each window is sized by how long
+/// the last took, to about [`WINDOW_READ`]: halved when one took longer,
+/// doubled when one took under a quarter of it, so the spans of the store
+/// with few events are crossed quickly. Each window's matches are as of
+/// its read, and an event is in only one, by its created_at.
+///
+/// A filter with ids is looked up in one read, as there's nothing to scan.
+pub fn each_match_windowed(
+    store: &Store,
+    filter: &Filter,
+    mut each: impl FnMut(&Txn, Vec<(u64, Option<u16>)>) -> Result<()>,
+) -> Result<()> {
+    if filter.never {
+        return Ok(());
+    }
+    if filter.ids.is_some() {
+        let txn = store.read()?;
+        let found = every_match_kinded(store, &txn, filter)?;
+        return each(&txn, found);
+    }
+    let mut window = filter.clone();
+    let mut until = filter.until;
+    let mut span = FIRST_WINDOW;
+    loop {
+        let since = until.saturating_sub(span - 1).max(filter.since);
+        window.since = since;
+        window.until = until;
+        let started = Instant::now();
+        {
+            let txn = store.read()?;
+            let found = every_match_kinded(store, &txn, &window)?;
+            each(&txn, found)?;
+        }
+        if since <= filter.since {
+            return Ok(());
+        }
+        until = since - 1;
+        let took = started.elapsed();
+        if took > WINDOW_READ {
+            span = (span / 2).max(1);
+        } else if took < WINDOW_READ / 4 {
+            span = span.saturating_mul(2);
+        }
+    }
 }
 
 /// [`every_match`], with each match's kind when it's known without reading

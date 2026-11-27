@@ -4,6 +4,22 @@ Release notes, one section per version. `ngit release publish` takes the
 section matching the tag it publishes, so every release needs one here before
 it is tagged.
 
+## [Unreleased]
+
+- No command run beside the relay holds a read open for long any more. A
+  filter's matches, for `delete`, `delete --dry-run` and `export
+  --filter`, and for the relay planning a queued filter deletion, are
+  found a window of created_at at a time, each in a read of about a second;
+  `delete --ids` looks ids up 10,000 a read, and `salvage` reads 10,000
+  records a read. A filter of search text alone reads every event, and
+  `delete --dry-run --filter '{"search":"aepiot.com"}'` held one read for
+  over two and a half hours, so that LMDB reused no page meanwhile: the
+  relay's files grew by everything it wrote, and its writes stalled for
+  seconds at a time.
+- `check`, `deletions`, `export`, `salvage` and the dry runs of `delete`
+  stop, saying why, if any read of theirs stays open for a minute. There's
+  no way to let one run longer.
+
 ## [2.5.2]
 
 - The landing page is redone: the relay's name, large and centered over

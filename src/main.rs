@@ -14,6 +14,7 @@ use ditto_relay::import::{Importer, Tally};
 use ditto_relay::pending::Target;
 use ditto_relay::purge::Purger;
 use ditto_relay::rank::Rank;
+use ditto_relay::reads;
 use ditto_relay::relay::AppState;
 use ditto_relay::search::SearchIndex;
 use ditto_relay::store::{BODIES_DIR, History, IndexedTags, Store, Writer, Written};
@@ -64,7 +65,10 @@ async fn main() -> anyhow::Result<()> {
             // runtime would wait on, or panic in.
             std::process::exit(0)
         }
-        Command::Check { json } => check(&config, json),
+        Command::Check { json } => {
+            reads::limit_command_reads();
+            check(&config, json)
+        }
         Command::Config { command } => match command {
             ConfigCommand::Path => unreachable!("said before the file was read"),
             ConfigCommand::Show => {
@@ -90,10 +94,19 @@ async fn main() -> anyhow::Result<()> {
             ids: None,
             dry_run,
         } => delete(&config, filter.as_deref(), age, dry_run),
-        Command::Deletions { json } => deletions(&config, json),
+        Command::Deletions { json } => {
+            reads::limit_command_reads();
+            deletions(&config, json)
+        }
         Command::Cancel { id } => cancel(&config, id),
-        Command::Export { filter, history } => export(&config, filter.as_deref(), history),
-        Command::Salvage { dir, from } => salvage(&config, dir, from),
+        Command::Export { filter, history } => {
+            reads::limit_command_reads();
+            export(&config, filter.as_deref(), history)
+        }
+        Command::Salvage { dir, from } => {
+            reads::limit_command_reads();
+            salvage(&config, dir, from)
+        }
         Command::Import { file, no_verify } => import(&config, file, !no_verify).await,
         Command::Compact {
             from,
@@ -270,6 +283,7 @@ fn delete(
     // Checked here, so a mistake is told before anything's asked.
     let filter = delete::filter(json, age, ditto_relay::event::now(), &indexed_tags)?;
     if dry_run {
+        reads::limit_command_reads();
         let store = open_read_only(config)?;
         println!("would delete {} events", delete::count(&store, &filter)?);
         return Ok(());
@@ -337,6 +351,7 @@ fn delete_ids(config: &Config, file: PathBuf, dry_run: bool) -> anyhow::Result<(
         ))?,
     };
     if dry_run {
+        reads::limit_command_reads();
         let store = open_read_only(config)?;
         println!(
             "would delete {} events",
@@ -954,8 +969,9 @@ nothing stops them from being published again.",
         /// stdin
         #[arg(long, value_name = "FILE", conflicts_with_all = ["filter", "age"])]
         ids: Option<PathBuf>,
-        /// Only count what would be deleted. It only reads, so it never
-        /// holds up the relay
+        /// Only count what would be deleted. It only reads, a little at a
+        /// time, and is stopped if a read stays open for a minute, so it
+        /// never holds up the relay
         #[arg(long)]
         dry_run: bool,
     },

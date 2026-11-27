@@ -11,6 +11,12 @@
 //! trust or other ranking parameters, the store rebuilds them. Counting what
 //! would go, for `--dry-run`, only reads, which LMDB never makes wait.
 //!
+//! Reads are short all the same: what a filter matches is found a window of
+//! created_at at a time (see [`query::each_match_windowed`]), and a list of
+//! ids looked up [`IDS_PER_READ`] at a time, each in a read of its own. A
+//! read held open for long keeps LMDB from reusing pages, so everything the
+//! relay writes meanwhile goes on the end of its files.
+//!
 //! A filter matches as a REQ's does, search text and extensions too. One
 //! that picks events rather than matching them, with a limit or
 //! `distinct:author`, picks them once, when it's asked, by its sort, so
@@ -90,20 +96,24 @@ pub fn target(
 /// the best that many, or the newest; with `distinct:author`, the first of
 /// each author's.
 pub fn pick(store: &Store, filter: &Filter) -> anyhow::Result<RoaringTreemap> {
-    let txn = store.read()?;
     let ranked = filter
         .search
         .as_ref()
         .is_some_and(|search| search.sort.is_ranked());
     if ranked && let Some(limit) = filter.limit {
+        // Ranking takes one read: it's as quick as a REQ's.
+        let txn = store.read()?;
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let found = crate::rank::run(store, &txn, filter, limit, &CancellationToken::new())?;
         return Ok(found.into_iter().map(|(seq, _)| seq).collect());
     }
     if !filter.distinct_author() {
-        return Ok(query::every_match(store, &txn, filter)?
-            .into_iter()
-            .collect());
+        let mut picked = RoaringTreemap::new();
+        query::each_match_windowed(store, filter, |_, found| {
+            picked.extend(found.into_iter().map(|(seq, _)| seq));
+            Ok(())
+        })?;
+        return Ok(picked);
     }
     // Each author's newest, then the newest of those.
     let every = Filter {
@@ -111,13 +121,16 @@ pub fn pick(store: &Store, filter: &Filter) -> anyhow::Result<RoaringTreemap> {
         ..filter.every_event()
     };
     let mut newest: HashMap<[u8; 32], (u32, u64)> = HashMap::new();
-    for seq in query::every_match(store, &txn, &every)? {
-        if let Some(header) = store.header(&txn, seq)? {
-            let at = (header.created_at(), seq);
-            let kept = newest.entry(*header.pubkey()).or_insert(at);
-            *kept = (*kept).max(at);
+    query::each_match_windowed(store, &every, |txn, found| {
+        for (seq, _) in found {
+            if let Some(header) = store.header(txn, seq)? {
+                let at = (header.created_at(), seq);
+                let kept = newest.entry(*header.pubkey()).or_insert(at);
+                *kept = (*kept).max(at);
+            }
         }
-    }
+        Ok(())
+    })?;
     let mut picked: Vec<(u32, u64)> = newest.into_values().collect();
     picked.sort_unstable_by(|a, b| b.cmp(a));
     if let Some(limit) = filter.limit {
@@ -147,14 +160,19 @@ pub fn parse_id(text: &str) -> anyhow::Result<[u8; 32]> {
         .with_context(|| format!("{text:?} isn't an event id: 64 hex digits"))
 }
 
+/// The most ids [`pick_ids`] looks up in a read.
+const IDS_PER_READ: usize = 10_000;
+
 /// The events of `ids` stored now, to be deleted as picked; an id of one
 /// that isn't stored is passed over.
 pub fn pick_ids(store: &Store, ids: &[[u8; 32]]) -> anyhow::Result<RoaringTreemap> {
-    let txn = store.read()?;
     let mut seqs = RoaringTreemap::new();
-    for id in ids {
-        if let Some(seq) = store.seq_of(&txn, id)? {
-            seqs.insert(seq);
+    for chunk in ids.chunks(IDS_PER_READ) {
+        let txn = store.read()?;
+        for id in chunk {
+            if let Some(seq) = store.seq_of(&txn, id)? {
+                seqs.insert(seq);
+            }
         }
     }
     Ok(seqs)
@@ -167,16 +185,19 @@ pub fn count(store: &Store, filter: &Filter) -> anyhow::Result<usize> {
     if picks(filter) {
         return Ok(pick(store, filter)?.len() as usize);
     }
-    let txn = store.read()?;
-    let mut alone = 0;
-    let mut versioned = Vec::new();
-    for (seq, kind) in query::every_match_kinded(store, &txn, filter)? {
-        match kind.map(KindClass::of) {
-            Some(KindClass::Regular | KindClass::Ephemeral) => alone += 1,
-            _ => versioned.push(seq),
+    let mut count = 0;
+    query::each_match_windowed(store, filter, |txn, found| {
+        let mut versioned = Vec::new();
+        for (seq, kind) in found {
+            match kind.map(KindClass::of) {
+                Some(KindClass::Regular | KindClass::Ephemeral) => count += 1,
+                _ => versioned.push(seq),
+            }
         }
-    }
-    Ok(alone + store.count_matching(&txn, &versioned, filter)?)
+        count += store.count_matching(txn, &versioned, filter)?;
+        Ok(())
+    })?;
+    Ok(count)
 }
 
 /// Delete what `target` covers from a store no running relay has open, and
@@ -299,6 +320,31 @@ mod tests {
         }
         assert_eq!(del(&store, json!({"search": "pills -candy"})), 1);
         assert!(!has(&store, &a) && has(&store, &b) && has(&store, &c));
+    }
+
+    /// Matches found a window of created_at at a time are what one read
+    /// finds, however far apart in time they are, future-dated ones too.
+    #[test]
+    fn finds_matches_across_windows() {
+        let (_dir, store) = open();
+        let times = [0, 100, 3_599, 3_600, 90_000, 1_700_000_000, 4_000_000_000];
+        let spam: Vec<Event> = times
+            .iter()
+            .map(|&at| signed(1, at, 1, vec![], "claim https://ai.solhub.cc/?ref=x"))
+            .collect();
+        for event in &spam {
+            put(&store, event);
+        }
+        put(&store, &signed(2, 1_700_000_000, 1, vec![], "hello"));
+        let filter = json!({"search": "solhub"});
+        assert_eq!(found(&store, filter.clone()), times.len());
+        assert_eq!(count(&store, &parse(filter.clone())).unwrap(), times.len());
+        let picked = pick(&store, &parse(json!({"search": "solhub distinct:author"})));
+        assert_eq!(picked.unwrap().len(), 1);
+        let bounded = json!({"search": "solhub", "since": 100, "until": 90_000});
+        assert_eq!(count(&store, &parse(bounded)).unwrap(), 4);
+        assert_eq!(del(&store, filter.clone()), times.len());
+        assert_eq!(found(&store, filter), 0);
     }
 
     #[test]

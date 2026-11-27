@@ -150,37 +150,49 @@ pub fn salvage(
 ) -> anyhow::Result<(u64, u64)> {
     let env = Env::open_read_only(dir, map_size, 2, 16)?;
     let events = env.create_db("events", DbFlags::INTEGER_KEY)?;
-    let txn = env.read_txn()?;
-    let mut cursor = txn.cursor(events)?;
     let (mut written, mut unreadable) = (0, 0);
     let mut read_ahead = 0usize;
-    let mut last = None;
-    let mut entry = cursor.set_range(&from.to_ne_bytes())?;
-    while let Some((key, record)) = entry {
-        let seq = u64::from_ne_bytes(key.try_into()?);
-        if last.is_some_and(|last| seq <= last) {
-            anyhow::bail!(
-                "the records are damaged: after {} came {seq}, having written {written}",
-                last.unwrap_or_default()
-            );
-        }
-        last = Some(seq);
-        let at = record.as_ptr() as usize;
-        if at.abs_diff(read_ahead) > READ_AHEAD / 2 {
-            env.will_need(0, record, READ_AHEAD);
-            read_ahead = at;
-        }
-        match EventView::new(record) {
-            Some(view) => {
-                writeln!(out, "{}", view.to_json())?;
-                written += 1;
-                if written % CHUNK as u64 == 0 {
-                    progress(written, seq);
-                }
+    let mut last: Option<u64> = None;
+    // A chunk of records a read, as the file may be a running relay's.
+    loop {
+        let txn = env.read_txn()?;
+        let mut cursor = txn.cursor(events)?;
+        let start = last.map_or(from, |last| last + 1);
+        let mut entry = cursor.set_range(&start.to_ne_bytes())?;
+        let mut read = 0;
+        while let Some((key, record)) = entry {
+            let seq = u64::from_ne_bytes(key.try_into()?);
+            if last.is_some_and(|last| seq <= last) {
+                anyhow::bail!(
+                    "the records are damaged: after {} came {seq}, having written {written}",
+                    last.unwrap_or_default()
+                );
             }
-            None => unreadable += 1,
+            last = Some(seq);
+            let at = record.as_ptr() as usize;
+            if at.abs_diff(read_ahead) > READ_AHEAD / 2 {
+                env.will_need(0, record, READ_AHEAD);
+                read_ahead = at;
+            }
+            match EventView::new(record) {
+                Some(view) => {
+                    writeln!(out, "{}", view.to_json())?;
+                    written += 1;
+                    if written % CHUNK as u64 == 0 {
+                        progress(written, seq);
+                    }
+                }
+                None => unreadable += 1,
+            }
+            read += 1;
+            if read == CHUNK {
+                break;
+            }
+            entry = cursor.next()?;
         }
-        entry = cursor.next()?;
+        if read < CHUNK {
+            break;
+        }
     }
     out.flush()?;
     Ok((written, unreadable))

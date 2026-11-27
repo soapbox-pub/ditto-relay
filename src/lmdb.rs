@@ -26,7 +26,7 @@
 //!
 //! All the `unsafe` in the crate lives here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::marker::PhantomData;
@@ -36,6 +36,7 @@ use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
@@ -1030,13 +1031,13 @@ impl Env {
     }
 
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
-        Ok(RoTxn(self.begin(ffi::MDB_RDONLY, None)?))
+        Ok(RoTxn(self.begin(ffi::MDB_RDONLY, None)?, timed()))
     }
 
     /// A read transaction in environment `env` alone: reading a table of
     /// another in it panics. It pins nothing of the others.
     pub fn read_txn_in(&self, env: usize) -> Result<RoTxn<'_>> {
-        Ok(RoTxn(self.begin(ffi::MDB_RDONLY, Some(env))?))
+        Ok(RoTxn(self.begin(ffi::MDB_RDONLY, Some(env))?, timed()))
     }
 
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
@@ -1301,7 +1302,58 @@ impl Drop for Txn<'_> {
     }
 }
 
-pub struct RoTxn<'env>(Txn<'env>);
+/// A read transaction, and its number among [`OPEN_READS`] if this
+/// process [times its reads](time_reads).
+pub struct RoTxn<'env>(Txn<'env>, Option<u64>);
+
+impl Drop for RoTxn<'_> {
+    fn drop(&mut self) {
+        if let Some(n) = self.1 {
+            OPEN_READS.lock().expect("unpoisoned").remove(&n);
+        }
+    }
+}
+
+/// Whether this process notes when each of its reads began.
+static READS_TIMED: AtomicBool = AtomicBool::new(false);
+/// When each read transaction this process has open began, by a number of
+/// its own, once it [times its reads](time_reads).
+static OPEN_READS: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new());
+static NEXT_READ: AtomicU64 = AtomicU64::new(0);
+
+/// Note when each read transaction this process opens from now on begins,
+/// for [`oldest_read`]. LMDB reuses no page freed since the oldest open
+/// read of any process began, so a command that reads for long makes every
+/// page the relay writes meanwhile go on the end of its file: see
+/// [`crate::reads::limit_command_reads`], which uses this to stop one.
+pub fn time_reads() {
+    READS_TIMED.store(true, Ordering::SeqCst);
+}
+
+/// How long the oldest read transaction this process has open has been
+/// open, if it [times its reads](time_reads) and has one open.
+pub fn oldest_read() -> Option<Duration> {
+    OPEN_READS
+        .lock()
+        .expect("unpoisoned")
+        .values()
+        .min()
+        .map(Instant::elapsed)
+}
+
+/// A number for a read beginning now, noted among [`OPEN_READS`], if this
+/// process times its reads.
+fn timed() -> Option<u64> {
+    if !READS_TIMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let n = NEXT_READ.fetch_add(1, Ordering::Relaxed);
+    OPEN_READS
+        .lock()
+        .expect("unpoisoned")
+        .insert(n, Instant::now());
+    Some(n)
+}
 
 // SAFETY: the environments are opened with MDB_NOTLS, so a read-only
 // transaction belongs to no thread and may move to another; not being Sync,

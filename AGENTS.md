@@ -1,6 +1,15 @@
 # Agent instructions
 
 - **Always commit after making changes.**
+- **Never hold an LMDB read transaction open for long**, in the relay or in a
+  command. While any read is open, LMDB reuses no page freed since it began,
+  so every page the relay writes goes on the end of its files, which never
+  shrink, and its writes stall. Anything that may read much of the store (a
+  filter's matches, a list of ids, a walk of a table) reads it in pieces,
+  each in a read of its own of about a second: see
+  `query::each_match_windowed` and `src/reads.rs`. A read-only command calls
+  `reads::limit_command_reads()` first, which stops it if a read lasts a
+  minute; don't add a way around it.
 
 ## Releasing
 

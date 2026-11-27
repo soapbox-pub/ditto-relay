@@ -4,7 +4,11 @@
 //!
 //! What a deletion removes is found once, against a snapshot of the store,
 //! as the events it covers below its watermark, with, for a filter, the old
-//! versions it matches of an address whose current version it matches.
+//! versions it matches of an address whose current version it matches. A
+//! filter's is found a window of created_at at a time, each against a
+//! snapshot of its own (see [`query::each_match_windowed`]), as one of
+//! search text alone reads every event, and a read open that long would
+//! keep LMDB from reusing pages for hours.
 //! Their sequence numbers are kept as its *plan*, and only those are
 //! removed: found again after some of their index entries had gone, they
 //! wouldn't all be. Plans that may be slow to find, a filter's or a request
@@ -56,7 +60,7 @@ use roaring::RoaringTreemap;
 use crate::compact::TableAhead;
 use crate::event::KindClass;
 use crate::filter::Filter;
-use crate::lmdb::{Db, DbFlags, Result, RwTxn, Txn};
+use crate::lmdb::{Db, DbFlags, Result, RwTxn};
 use crate::pending::{Pending, Progress, Target, counted};
 use crate::query;
 use crate::record::EventView;
@@ -111,12 +115,16 @@ const SWEEPS_HELD: Duration = Duration::from_secs(1);
 const SAY_EVERY: Duration = Duration::from_secs(30);
 
 /// What a deletion removes: the sequence numbers of the events it covers
-/// below its watermark, as of a snapshot of the store.
+/// below its watermark, as of a snapshot of the store, or for a filter, of
+/// one for each window of it.
 pub fn plan(store: &Store, pending: &Pending) -> anyhow::Result<RoaringTreemap> {
-    let txn = store.read()?;
     let watermark = pending.watermark;
+    if let Target::Filter { filter, .. } = &pending.target {
+        return Ok(plan_filter(store, filter, watermark)?);
+    }
+    let txn = store.read()?;
     Ok(match &pending.target {
-        Target::Filter { filter, .. } => plan_filter(store, &txn, filter, watermark)?,
+        Target::Filter { .. } => unreachable!("planned above"),
         Target::Seqs(seqs) => (**seqs).clone(),
         Target::Deletion(deletion) => store.deleting(&txn, deletion, watermark)?,
         Target::Vanish { author, until } => store.vanishing(&txn, author, *until, watermark)?,
@@ -127,30 +135,28 @@ pub fn plan(store: &Store, pending: &Pending) -> anyhow::Result<RoaringTreemap> 
 /// and the old versions it matches of an address whose current version it
 /// matches. Matches of kinds without old versions, as the index says, are
 /// taken without reading them.
-fn plan_filter(
-    store: &Store,
-    txn: &Txn,
-    filter: &Filter,
-    watermark: u64,
-) -> Result<RoaringTreemap> {
+fn plan_filter(store: &Store, filter: &Filter, watermark: u64) -> Result<RoaringTreemap> {
     let mut plan = RoaringTreemap::new();
-    for (seq, kind) in query::every_match_kinded(store, txn, filter)? {
-        if seq >= watermark {
-            continue;
-        }
-        match kind.map(KindClass::of) {
-            Some(KindClass::Regular | KindClass::Ephemeral) => {
-                plan.insert(seq);
+    query::each_match_windowed(store, filter, |txn, found| {
+        for (seq, kind) in found {
+            if seq >= watermark {
+                continue;
             }
-            _ => plan.extend(
-                store
-                    .matching_versions(txn, seq, filter)?
-                    .0
-                    .into_iter()
-                    .filter(|&seq| seq < watermark),
-            ),
+            match kind.map(KindClass::of) {
+                Some(KindClass::Regular | KindClass::Ephemeral) => {
+                    plan.insert(seq);
+                }
+                _ => plan.extend(
+                    store
+                        .matching_versions(txn, seq, filter)?
+                        .0
+                        .into_iter()
+                        .filter(|&seq| seq < watermark),
+                ),
+            }
         }
-    }
+        Ok(())
+    })?;
     Ok(plan)
 }
 
